@@ -143,4 +143,12 @@ WorldInfo {
 }
 ```
 
+## If something does not move
+
+The controller prints a startup block in the Webots console listing every layer
+as `ON`/`OFF`, then a status line every 100 frames saying in plain language what
+the legs are doing and why (`legs: holding: centre of mass not yet over the
+stance foot`, `lift-cue=none` when your legs are out of frame, and so on). Start
+there — it names the cause in one line.
+
 See [`docs/RUN_INSTRUCTIONS.md`](docs/RUN_INSTRUCTIONS.md) for Webots configuration and troubleshooting.

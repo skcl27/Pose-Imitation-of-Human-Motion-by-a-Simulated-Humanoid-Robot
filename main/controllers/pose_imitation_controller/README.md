@@ -92,6 +92,24 @@ by `AnklePitch = −(θ_hip + θ_knee)` and `AnkleRoll = −φ`. Segment referen
 lengths are learned from the stream by a peak-hold tracker normalized by torso
 length, so there is **no calibration step** and the result is scale-invariant.
 
+#### When the camera crops your legs
+
+Lift detection needs no knowledge of where the floor is: whichever of your two
+**feet** is lower defines the ground line, so the other foot's rise above it is
+the lift. That needs both feet in frame — and standing close to a webcam usually
+crops you at the shins, which made the lift signal read exactly zero however
+high you lifted a leg. So the same relative trick falls back to the **knees**,
+which are in frame whenever the hips are (it is also the signal the Python-side
+gait detector uses, for the same reason). The status line reports which cue is
+live as `lift-cue=feet|knees|none`.
+
+With no ankle in view the knee *bend* is genuinely unobservable, so a lift then
+shows as hip flexion — a raised straight leg rather than a folded knee. That is
+the honest reading of what the camera can see. Segment lengths self-calibrate the
+same way: if an ankle is never seen, the shank borrows the thigh (they are within
+a few percent in both the human and NAO) rather than declaring the subject
+uncalibrated and discarding the whole lower body.
+
 | Human motion | NAO joints | Notes |
 |---|---|---|
 | Squat | `HipPitch`, `KneePitch`, `AnklePitch` (symmetric) | full authority — symmetric crouch is statically stable by construction |
@@ -176,6 +194,24 @@ If no clips are found on disk the controller says so in the log and falls back
 to the **march engine** (`gait.py`), which tracks your cadence, phase and stop
 but marches in place.
 
+### Playback can never hold the body
+
+Because a clip owns the *whole* body, anything that stops it from reporting
+"over" would freeze the entire robot, not just the legs. Three guards make that
+impossible:
+
+| Guard | Effect |
+|---|---|
+| **Watchdog** (`MOTION_WATCHDOG_S`, and the clip's own `getDuration()` when Webots reports it) | Suspension is always time-bounded. On expiry the body is taken back and that clip is never used again. |
+| **Failure backoff** (`MOTION_MAX_FAILURES`) | A clip that trips the watchdog, hits the tilt abort, or finishes with the robot tipped counts as a failure. After a few, clips are abandoned for the session and the controller says so — falling over repeatedly is worse than never walking. |
+| **Settled-start check** (`MOTION_START_MAX_TILT_RAD`) | A clip is only started from an upright, calm robot. Starting one mid-wobble is how a walk becomes a fall. |
+
+Likewise, a raised exception in a control step no longer ends the loop: it is
+logged, the body is forced back under our control, and the loop carries on
+(`MAX_CONSECUTIVE_ERRORS` bounds how long that can go on). Before this, one
+transient error broke out of `run()` into cleanup, which zeroed every motor
+velocity — a permanently dead robot from a single bad frame.
+
 ---
 
 ## 5. Turning: a heading servo, not a gesture
@@ -240,6 +276,10 @@ At the top of `pose_imitation_controller.py`:
 | `WALK_TIER` | march engine tier (`"march"` / `"step"` / `"stand"`) |
 | `TURN_SIGN` | flip the turn direction |
 | `TILT_ABORT_RAD`, `TILT_RATE_LEAD_S` | fall detection (the gyro term predicts ahead) |
+| `MOTION_WATCHDOG_S` | hard ceiling on how long a clip may own the body |
+| `MOTION_MAX_FAILURES` | bad locomotion attempts before clips are abandoned |
+| `MOTION_START_MAX_TILT_RAD` | how upright the robot must be to start a clip |
+| `MAX_CONSECUTIVE_ERRORS` | failed control steps tolerated before giving up |
 | `LOCOMOTION` | `LocomotionParams`: yaw gates, overshoot guard, walk thresholds |
 | `MOTION_SEARCH_DIRS_EXTRA` | extra folders to search for `.motion` clips |
 
@@ -366,21 +406,73 @@ the real-time loop. `logs/` is git-ignored.
 
 ## 11. Reading the controller log
 
+### At startup — check this block first
+
+```
+====================================================================
+NAO pose imitation controller ready
+  timestep          : 20 ms
+  motors / sensors  : 24 / 24  (12 leg joints)
+  leg control       : auto
+  arms + head       : ON
+  leg pose imitation: ON (squat, single-leg lift)
+  CoM balance       : ON
+  march engine      : ON
+  locomotion clips  : forward, turn_left, turn_right
+  heading feedback  : ON (InertialUnit)
+  foot force sensors: 2
+====================================================================
+```
+
+Every "the robot does not move" report so far has had a cause that was visible
+here — a missing device, a missing NumPy, no motion clips, a coarse timestep —
+just buried further down the log. Anything reading `OFF` or `NONE FOUND` is
+flagged inline with what it costs you.
+
+### Per 100 frames
+
 ```
 Frame 400 | sim 49.8 Hz | tracking | legs=pose | 8 joints applied
-  pose-legs mode=single stance=R shift=1.00 lift=0.73 gate=0.77 margin=+0.0145m crouch=0.10
+  legs: stepping (73% of the requested lift)
+        mode=single stance=R shift=1.00 lift=0.73 gate=0.77 margin=+0.0145m crouch=0.10 lift-cue=feet
   heading error  -8 deg (servo latched)
 ```
 
 - `legs=` — which layer is commanding: `pose`, `march:march`, `motion:forward`, `stand`
+- `legs:` — **plain-language reason** for what the legs are (not) doing. "The legs
+  are not moving" has half a dozen legitimate causes — nobody in frame, legs
+  cropped, low confidence, the CoM not yet over the stance foot — and they are
+  indistinguishable from a bug unless the controller names the one in play.
 - `mode` — `double` / `load` / `single` (§3)
 - `gate` — how much lift the CoM model currently permits (0 = do not unload)
 - `margin` — signed distance of the CoM inside the stance foot; must be positive to step
+- `lift-cue` — `feet` / `knees` / `none`: which landmarks the lift is read from
 - `heading error` — what the turn servo still wants to rotate
 
 ---
 
 ## 12. Troubleshooting
+
+**The robot is completely frozen (nothing moves, not even the arms)**
+
+Arms and head are driven independently of the legs, so *nothing* moving means
+per-joint commanding is not reaching the motors at all. In order of likelihood:
+
+1. **Read the startup block** (§11). If it never printed, the controller failed
+   before its first step — look for a Python traceback in the Webots console. The
+   usual cause is Webots' Python interpreter missing a package; set
+   `Tools → Preferences → Python command` to the interpreter that has NumPy.
+2. **Is a motion clip playing?** The status line shows `legs=motion:…` and
+   `0 joints applied` while a clip owns the body. That is normal and bounded by
+   the watchdog (§4); if you see it permanently, the watchdog message will say
+   so and clips will be dropped.
+3. **Is the simulation actually running?** Webots must be playing, not paused,
+   and not in fast-forward-without-rendering if you are judging by eye.
+4. **Are packets arriving?** The status line says `tracking` when frames are
+   arriving and `STALE (holding)` when they are not. `STALE` plus a stationary
+   robot means the pipeline is not reaching the controller — check the pipeline
+   log for `Webots bridge sending to 127.0.0.1:8765` and that both processes are
+   on the same machine.
 
 **Legs do not move at all**
 1. `WorldInfo.contactProperties` missing → §7. This is the usual cause.
@@ -390,10 +482,17 @@ Frame 400 | sim 49.8 Hz | tracking | legs=pose | 8 joints applied
 4. Legs out of camera frame: watch `Visible: nn/33` in the pipeline HUD.
 
 **Raised leg produces only a small response**
-Check `gate` and `margin` in the log. `gate=0.00` means the CoM model refuses to
-unload the foot — usually the robot has not finished leaning yet (`shift < 0.75`),
-or the foot sensors disagree. This is working as designed; it is the difference
-between a step and a fall.
+Read the `legs:` line — it names the limiting factor. `gate=0.00` means the CoM
+model refuses to unload the foot: usually the robot has not finished leaning yet
+(`shift < 0.75`), or the foot sensors disagree. That is working as designed; it
+is the difference between a step and a fall.
+
+**Raised leg produces nothing at all**
+Check `lift-cue` in the log. `none` means neither your feet nor your knees are in
+frame, so a leg lift is literally invisible — step back from the camera until at
+least your knees are visible. `knees` means the feet are cropped: the lift is
+detected, but it comes out as a raised straight leg rather than a folded knee
+(§2), because the knee bend cannot be seen without an ankle.
 
 **Robot marches instead of walking across the floor**
 No `.motion` clips found. Check the startup log for `Locomotion clips found: …`.
@@ -406,7 +505,8 @@ Set `$WEBOTS_HOME`, or drop clips into
 
 **Robot falls while walking** → confirm `basicTimeStep` is 20 ms and the contact
 properties are present; then lower `LOCOMOTION.walk_conf_min` so it walks less
-eagerly, or use `LEG_CONTROL = "engine"` to keep it in place.
+eagerly, or use `LEG_CONTROL = "engine"` to keep it in place. After a few bad
+attempts the controller abandons clips by itself and tells you.
 
 **Robot not moving at all**
 1. Is the simulation playing, and the controller running?
@@ -434,3 +534,4 @@ pytest -q
 | `tests/test_walk_motion.py` | clip discovery, overshoot guard, hysteresis, yaw servo latch/relatch/wrapping |
 | `tests/test_gait_cues.py` | cadence/phase/stop, and torso yaw sign, monotonicity and magnitude |
 | `tests/test_gait.py`, `tests/test_balance.py` | march engine invariants, CoM model and Fibonacci search |
+| `tests/test_controller_integration.py` | the real controller against a mocked Webots over real UDP: device setup, leg arbitration, motion hand-off, **freeze resistance** (a clip that never ends, a step that raises, repeated bad locomotion) and leg response with the feet cropped out of frame |

@@ -87,9 +87,17 @@ class FakeVector3:
 
 
 class FakeMotion:
-    """Stand-in for Webots' Motion: finishes after ``STEPS`` polls."""
+    """Stand-in for Webots' Motion: finishes after ``STEPS`` polls.
+
+    ``NEVER_OVER`` reproduces the failure mode that matters most: a clip that
+    plays but never reports being over. Because playback suspends per-joint
+    commanding for the WHOLE body, that used to freeze the entire robot
+    indefinitely with no diagnostic.
+    """
 
     STEPS = 20
+    NEVER_OVER = False
+    DURATION_MS = 1200.0
     played = []
 
     def __init__(self, path):
@@ -118,7 +126,12 @@ class FakeMotion:
     def stop(self):
         self._remaining = 0
 
+    def getDuration(self):  # noqa: N802
+        return self.DURATION_MS
+
     def isOver(self):  # noqa: N802
+        if FakeMotion.NEVER_OVER:
+            return False
         if self._remaining > 0:
             self._remaining -= 1
             return False
@@ -215,7 +228,9 @@ def controller_module(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "ENABLE_TRAJECTORY_LOG", False)
     monkeypatch.setattr(mod, "UDP_PORT", _free_port())
     FakeMotion.played = []
+    FakeMotion.NEVER_OVER = False
     yield mod
+    FakeMotion.NEVER_OVER = False
     sys.modules.pop("pose_imitation_controller", None)
 
 
@@ -562,3 +577,153 @@ def test_only_one_layer_commands_the_legs_per_step(harness) -> None:
     motor.commands = 0
     harness.spin(10, LEFT_LEG_UP, IDLE_GAIT, every=1)
     assert motor.commands == 10
+
+
+# ---------------------------------------------------------------------------
+# Freeze resistance
+#
+# Motion playback suspends per-joint commanding for the WHOLE body, so anything
+# that stops a clip from ending stops the entire robot -- which is exactly how
+# "the robot is completely frozen" happens. These tests assert that no single
+# failure can hold the body indefinitely.
+# ---------------------------------------------------------------------------
+def test_a_clip_that_never_ends_cannot_freeze_the_robot(harness) -> None:
+    mod = harness.mod
+    FakeMotion.NEVER_OVER = True
+    harness.spin(60, STANDING, IDLE_GAIT)
+    harness.spin(10, STANDING, MARCH_GAIT)
+    assert harness.ctl.driver.suspended is True      # clip took the body
+
+    # Spin well past the watchdog budget.
+    steps = int((mod.MOTION_WATCHDOG_S + 2.0) / (TIMESTEP_MS / 1000.0))
+    mode = harness.spin(steps, STANDING, IDLE_GAIT)
+
+    assert harness.ctl.driver.suspended is False     # ... and gave it back
+    assert mode == "pose"
+    # The offending clip is not tried again.
+    assert "forward" not in harness.ctl.motion.available
+
+
+def test_the_watchdog_uses_the_clips_own_duration(harness) -> None:
+    """A 1.2 s clip must not be able to hold the body for the full hard cap."""
+    mod = harness.mod
+    FakeMotion.NEVER_OVER = True
+    harness.spin(60, STANDING, IDLE_GAIT)
+    harness.spin(4, STANDING, MARCH_GAIT)
+    assert harness.ctl.driver.suspended is True
+    budget = harness.ctl._motion_deadline - harness.ctl._motion_started_at
+    assert budget < mod.MOTION_WATCHDOG_S
+    assert budget == pytest.approx(FakeMotion.DURATION_MS / 1000.0 * 1.5 + 1.0)
+
+
+def test_repeated_bad_locomotion_gives_up_on_clips(harness) -> None:
+    """Falling over again and again is worse than never walking."""
+    mod = harness.mod
+    harness.spin(60, STANDING, IDLE_GAIT)
+    for _ in range(mod.MOTION_MAX_FAILURES):
+        harness.spin(6, STANDING, MARCH_GAIT)
+        harness.ctl.imu.rpy = [0.6, 0.0, 0.0]        # tilt abort
+        harness.spin(4, STANDING, MARCH_GAIT)
+        harness.ctl.imu.rpy = [0.0, 0.0, 0.0]
+    assert harness.ctl.motion.available == {}
+    mode = harness.spin(60, STANDING, IDLE_GAIT)
+    assert mode == "pose"                            # still imitating
+    assert harness.ctl.driver.suspended is False
+
+
+def test_a_clip_is_not_started_while_the_robot_is_wobbling(harness) -> None:
+    harness.spin(60, STANDING, IDLE_GAIT)
+    harness.ctl.gyro.values = [3.0, 0.0, 0.0]        # tipping fast
+    mode = harness.spin(20, STANDING, MARCH_GAIT)
+    assert not FakeMotion.played
+    assert mode == "pose"
+    harness.ctl.gyro.values = [0.0, 0.0, 0.0]
+    harness.spin(20, STANDING, MARCH_GAIT)
+    assert "Forwards.motion" in FakeMotion.played    # ... and once calm, it goes
+
+
+def test_a_failing_step_does_not_end_the_loop_or_limp_the_robot(harness) -> None:
+    """One transient error used to break run(), which then zeroed every motor
+    velocity -- a permanently dead robot from a single bad frame."""
+    c = harness.ctl
+    calls = {"n": 0}
+    real = c.driver.lower_body_tick
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] in (3, 4, 5):
+            raise RuntimeError("synthetic sensor glitch")
+        return real(*a, **kw)
+
+    c.driver.lower_body_tick = flaky
+    for i in range(40):
+        if i % 2 == 0:
+            harness.send(STANDING, IDLE_GAIT)
+        c.robot.step(c.timestep)
+        try:
+            c.tick()
+        except Exception:
+            c._errors += 1
+            c._recover_from_error()
+
+    assert calls["n"] > 5                 # kept going past the failures
+    assert c.driver.suspended is False    # recovery forced control back
+    for motor in c.robot.motors.values():
+        assert motor.velocity > 0.0       # never left limp
+
+
+def test_recovery_forces_the_body_back_if_a_step_fails_mid_clip(harness) -> None:
+    harness.spin(60, STANDING, IDLE_GAIT)
+    harness.spin(4, STANDING, MARCH_GAIT)
+    assert harness.ctl.driver.suspended is True
+    harness.ctl._recover_from_error()
+    assert harness.ctl.driver.suspended is False
+    assert not harness.ctl.motion.active
+
+
+# ---------------------------------------------------------------------------
+# Legs must respond even when the camera crops the lower body
+# ---------------------------------------------------------------------------
+def _crop(keypoints, *names):
+    out = dict(keypoints)
+    for name in names:
+        out[name] = list(out[name][:3]) + [0.05]
+    return out
+
+
+def test_a_leg_lift_is_seen_with_the_feet_out_of_frame(harness) -> None:
+    """Standing close to a webcam crops the shins. The feet-based ground line is
+    then unavailable, and without the knee fallback the lift reads as exactly
+    zero however high the leg goes -- i.e. "leg movement is not working"."""
+    standing = _crop(STANDING, "left_ankle", "right_ankle")
+    lifted = _crop(LEFT_LEG_UP, "left_ankle", "right_ankle")
+    harness.spin(150, standing, IDLE_GAIT)
+    assert harness.ctl.driver.lower_body_meta["lift_source"] == "knees"
+    harness.spin(250, lifted, IDLE_GAIT)
+    meta = harness.ctl.driver.lower_body_meta
+    assert meta["lift_source"] == "knees"
+    assert meta["stance_side"] == "R"
+    assert meta["lift"] > 0.2
+    # With no ankle in view the knee bend is genuinely unobservable, so the lift
+    # shows up as hip flexion (a raised straight leg) rather than a knee fold.
+    # That is the honest reading of what the camera can see -- and it is still a
+    # clearly raised leg, which is the point.
+    assert harness.angle("LHipPitch") < harness.angle("RHipPitch") - 0.3
+    assert harness.angle("LKneePitch") <= harness.angle("RKneePitch") + 0.05
+
+
+def test_legs_without_knees_or_feet_say_so_instead_of_failing_silently(harness) -> None:
+    blind = _crop(LEFT_LEG_UP, "left_ankle", "right_ankle",
+                  "left_knee", "right_knee")
+    harness.spin(120, blind, IDLE_GAIT)
+    meta = harness.ctl.driver.lower_body_meta
+    assert meta["lift"] == 0.0
+    assert "out of frame" in str(meta["why"]) or "landmarks" in str(meta["why"])
+
+
+def test_the_status_line_always_explains_itself(harness) -> None:
+    harness.spin(120, STANDING, IDLE_GAIT)
+    why = harness.ctl.driver.lower_body_meta["why"]
+    assert isinstance(why, str) and why
+    harness.spin(200, LEFT_LEG_UP, IDLE_GAIT)
+    assert "stepping" in harness.ctl.driver.lower_body_meta["why"]

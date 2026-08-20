@@ -247,6 +247,8 @@ class LowerBodyController:
         targets = self._compose(obs, swing, yaw_bias if mode == MODE_DOUBLE else 0.0)
         clamped = {n: self.limiter.clamp_angle(n, v) for n, v in targets.items()}
         meta: Dict[str, object] = {
+            "why": self._explain(obs, tilt_ok, swing, gate, human_lift),
+            "lift_source": obs.lift_source,
             "mode": mode,
             "single_support": mode == MODE_SINGLE,
             "balance_ok": mode == MODE_DOUBLE and st.shift < 0.05,
@@ -264,6 +266,35 @@ class LowerBodyController:
         return clamped, meta
 
     # ------------------------------------------------------------- internals
+    def _explain(self, obs: LowerBodyObservation, tilt_ok: bool, swing: str,
+                 gate: float, human_lift: float) -> str:
+        """One short phrase naming the current limiting factor.
+
+        Worth its keep: "the legs are not moving" has half a dozen legitimate
+        causes (nobody in frame, legs cropped, low confidence, the CoM not yet
+        over the stance foot) and they are indistinguishable from a bug unless
+        the controller says which one it is.
+        """
+        p = self.params
+        st = self.state
+        if not obs.valid:
+            return "no lower-body landmarks in frame"
+        if obs.confidence < p.conf_min:
+            return f"lower-body confidence {obs.confidence:.2f} < {p.conf_min:.2f}"
+        if not tilt_ok:
+            return "torso tilted past the safety limit; standing down"
+        if obs.lift_source == "none":
+            return "knees and feet both out of frame; leg lift cannot be seen"
+        if not swing:
+            if human_lift <= 0.0 and st.lift <= 1e-3:
+                return "tracking (no leg lift requested)"
+            return "returning the foot to the ground"
+        if st.shift < p.shift_ready:
+            return f"transferring weight onto the {st.stance or '?'} foot"
+        if gate <= 0.0:
+            return "holding: centre of mass not yet over the stance foot"
+        return f"stepping ({st.lift * 100:.0f}% of the requested lift)"
+
     def _crouch_u(self, obs: LowerBodyObservation) -> float:
         p = self.params
         u = obs.crouch_u if obs.valid else 0.0

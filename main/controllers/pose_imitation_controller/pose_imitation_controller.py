@@ -124,6 +124,26 @@ MOTION_SEARCH_DIRS_EXTRA = [os.path.join(os.path.dirname(__file__), "motions")]
 TILT_ABORT_RAD = 0.40
 TILT_RATE_LEAD_S = 0.25
 
+# HARD WATCHDOG on motion playback. While a clip runs it owns the whole body, so
+# per-joint commanding is suspended -- which means anything that stops the clip
+# from ever reporting "over" freezes the ENTIRE robot, not just the legs. Webots'
+# walk clips are a few seconds long, so any suspension beyond this is a bug, not
+# a long clip: we take the body back and stop trusting clips.
+MOTION_WATCHDOG_S = 8.0
+# Consecutive locomotion attempts that end badly (watchdog trip, tilt abort, or
+# the robot still tipped when the clip finishes) before clips are abandoned for
+# this session. Falling over repeatedly is worse than never walking.
+MOTION_MAX_FAILURES = 3
+# A clip is only started from a settled, upright robot: starting one mid-wobble
+# is how a walk turns into a fall.
+MOTION_START_MAX_TILT_RAD = 0.15
+
+# The control loop must survive a bad step. An exception used to end run(),
+# which then called driver.stop() and set every motor velocity to zero -- a
+# permanently dead robot from one transient error. Now each step is contained:
+# we log, force the body back under control, and carry on.
+MAX_CONSECUTIVE_ERRORS = 20
+
 # --- Sensors ---------------------------------------------------------------
 GYRO_NAME = "gyro"
 ACCELEROMETER_NAME = "accelerometer"
@@ -240,6 +260,27 @@ class MotionPlayer:
             return False
         return True
 
+    def duration_s(self) -> Optional[float]:
+        """Clip length in seconds, or None if Webots will not tell us."""
+        if self._motion is None:
+            return None
+        try:
+            ms = float(self._motion.getDuration())
+        except Exception:  # noqa: BLE001
+            return None
+        return ms / 1000.0 if math.isfinite(ms) and ms > 0.0 else None
+
+    def drop(self, action: Optional[str] = None) -> None:
+        """Stop using ``action`` (or every clip) for the rest of the session."""
+        target = action or self.action
+        self.abort()
+        if target is None:
+            self._files.clear()
+            self._cache.clear()
+        else:
+            self._files.pop(target, None)
+            self._cache.pop(target, None)
+
     def abort(self) -> None:
         """Stop mid-clip. Only for a safety abort -- see the class docstring."""
         if self._motion is None:
@@ -312,7 +353,59 @@ class PoseImitationController:
         # boundaries on purpose: that is what lets plan_action use its tighter
         # gate to finish a turn instead of stalling one clip short.
         self._turning = False
-        logger.info("Leg control: %s; waiting for pose commands...", self.leg_control)
+        # Motion-playback watchdog state. Suspension hands the WHOLE body to a
+        # clip, so it must always be bounded in time and in failure count.
+        self._motion_started_at: Optional[float] = None
+        self._motion_deadline: Optional[float] = None
+        self._motion_failures = 0
+        self._errors = 0
+        self._report_startup()
+
+    def _report_startup(self) -> None:
+        """Print one block saying exactly what will and will not work.
+
+        This exists because every "the robot does not move" report so far has had
+        a cause that was visible at startup -- a missing device, a missing NumPy,
+        no motion clips, a coarse timestep -- but was buried in the log. Saying
+        it plainly up front turns a debugging session into a glance.
+        """
+        d = self.driver
+        n_legs = sum(1 for n in d.motors if n.endswith(
+            ("HipYawPitch", "HipRoll", "HipPitch", "KneePitch", "AnklePitch", "AnkleRoll")))
+        logger.info("=" * 68)
+        logger.info("NAO pose imitation controller ready")
+        logger.info("  timestep          : %d ms%s", self.timestep,
+                    "" if self.timestep <= 20 else "   <-- TOO COARSE, use 20 ms")
+        logger.info("  motors / sensors  : %d / %d  (%d leg joints)",
+                    len(d.motors), len(d.sensors), n_legs)
+        logger.info("  leg control       : %s", self.leg_control)
+        logger.info("  arms + head       : ON")
+        logger.info("  leg pose imitation: %s",
+                    "ON (squat, single-leg lift)" if d.lower_body is not None
+                    else "OFF  <-- legs will only hold a posture")
+        logger.info("  CoM balance       : %s",
+                    "ON" if d.balance is not None
+                    else "OFF  <-- needs NumPy in Webots' Python")
+        logger.info("  march engine      : %s",
+                    "ON" if d.gait_engine is not None else "OFF")
+        if self.leg_control == "auto":
+            clips = sorted(self.motion.available)
+            logger.info("  locomotion clips  : %s",
+                        ", ".join(clips) if clips
+                        else "NONE FOUND  <-- will march in place, not walk")
+        logger.info("  heading feedback  : %s",
+                    "ON (InertialUnit)" if self.imu is not None
+                    else "OFF  <-- turning disabled")
+        logger.info("  foot force sensors: %d",
+                    len(self.fsr["L"]) + len(self.fsr["R"]))
+        if d.lower_body is None or d.balance is None:
+            logger.warning(
+                "A layer is OFF above. If that was not intended, check that "
+                "Webots' Python interpreter has NumPy: Tools > Preferences > "
+                "Python command."
+            )
+        logger.info("Waiting for pose commands on %s:%d ...", UDP_HOST, UDP_PORT)
+        logger.info("=" * 68)
 
     # ---------------------------------------------------------------- devices
     def _init_imu(self) -> None:
@@ -497,18 +590,32 @@ class PoseImitationController:
         falling = self._falling(roll, pitch)
 
         # (1) A clip is playing: it owns the whole body until it ends, unless the
-        #     robot is about to go over.
+        #     robot is about to go over or the watchdog fires.
         if self.motion.active:
+            action = self.motion.action
             if falling:
                 logger.warning("Tilt abort (%.2f, %.2f rad): stopping motion '%s'",
-                               roll, pitch, self.motion.action)
-                self.motion.abort()
-                self._reclaim()
+                               roll, pitch, action)
+                self._end_motion(action, ok=False, reason="tilt abort")
+            elif self._motion_overran(now):
+                # A clip that never reports "over" would keep the whole body
+                # suspended forever, which reads as a totally dead robot.
+                logger.error(
+                    "Motion '%s' overran its watchdog (%.1fs); taking the body "
+                    "back. This clip will not be used again.",
+                    action, now - (self._motion_started_at or now),
+                )
+                self.motion.drop(action)
+                self._end_motion(action, ok=False, reason="watchdog")
             elif self.motion.poll():
-                self.leg_mode = f"motion:{self.motion.action}"
+                self.leg_mode = f"motion:{action}"
                 return
             else:
-                self._reclaim()
+                # Finished normally -- but only counts as a success if the robot
+                # is still upright, otherwise we are walking ourselves over.
+                upright = abs(roll) < MOTION_START_MAX_TILT_RAD * 2.0 and \
+                    abs(pitch) < MOTION_START_MAX_TILT_RAD * 2.0
+                self._end_motion(action, ok=upright, reason="clip finished")
 
         if self.leg_control == "off":
             self.leg_mode = "stand"
@@ -527,9 +634,13 @@ class PoseImitationController:
             if plan.action is None:
                 # Nothing left to correct: the rotation (if any) has converged.
                 self._turning = False
+            elif not self._settled(roll, pitch):
+                # Starting a clip mid-wobble is how a walk becomes a fall; wait.
+                self.leg_mode = "pose"
             elif self.motion.start(plan.action):
                 logger.info("Locomotion: %s (%s)", plan.action, plan.reason)
                 self._turning = plan.is_turn
+                self._begin_motion(now)
                 self.driver.release_to_motion()
                 self.leg_mode = f"motion:{plan.action}"
                 return
@@ -566,6 +677,48 @@ class PoseImitationController:
         self.leg_mode = "stand"
         self.driver.balance_tick(torso_rp)
 
+    def _settled(self, roll: float, pitch: float) -> bool:
+        """Is the robot upright and calm enough to hand over to a clip?"""
+        if abs(roll) > MOTION_START_MAX_TILT_RAD or abs(pitch) > MOTION_START_MAX_TILT_RAD:
+            return False
+        d_roll, d_pitch = self._tilt_rate()
+        return abs(d_roll) < 1.0 and abs(d_pitch) < 1.0
+
+    def _begin_motion(self, now: float) -> None:
+        """Arm the watchdog for a clip we are about to hand the body to."""
+        self._motion_started_at = now
+        # Prefer the clip's own length (plus slack for Webots' interpolation);
+        # fall back to the hard cap when the API will not tell us.
+        duration = self.motion.duration_s()
+        budget = min(duration * 1.5 + 1.0, MOTION_WATCHDOG_S) if duration else \
+            MOTION_WATCHDOG_S
+        self._motion_deadline = now + budget
+
+    def _motion_overran(self, now: float) -> bool:
+        return self._motion_deadline is not None and now > self._motion_deadline
+
+    def _end_motion(self, action: Optional[str], *, ok: bool, reason: str) -> None:
+        """Take the body back from a clip and update the locomotion health count."""
+        self.motion.abort()
+        self._motion_started_at = None
+        self._motion_deadline = None
+        self._reclaim()
+        if ok:
+            self._motion_failures = 0
+            return
+        self._motion_failures += 1
+        logger.warning("Locomotion attempt '%s' ended badly (%s): failure %d/%d",
+                       action, reason, self._motion_failures, MOTION_MAX_FAILURES)
+        if self._motion_failures >= MOTION_MAX_FAILURES:
+            logger.error(
+                "Disabling locomotion clips for this session after %d bad "
+                "attempts. The robot will keep imitating your pose and will "
+                "march in place instead of walking. Check WorldInfo "
+                "contactProperties and basicTimeStep (see the controller README).",
+                self._motion_failures,
+            )
+            self.motion.drop(None)
+
     def _reclaim(self) -> None:
         """Take the body back after a clip and reset the leg sequencers."""
         self.driver.reclaim_from_motion()
@@ -587,12 +740,14 @@ class PoseImitationController:
         )
         if self.leg_mode == "pose":
             m = self.driver.lower_body_meta
+            logger.info("  legs: %s", m.get("why", "?"))
             logger.info(
-                "  pose-legs mode=%s stance=%s shift=%.2f lift=%.2f gate=%.2f "
-                "margin=%+.4fm crouch=%.2f",
+                "        mode=%s stance=%s shift=%.2f lift=%.2f gate=%.2f "
+                "margin=%+.4fm crouch=%.2f lift-cue=%s",
                 m.get("mode"), m.get("stance_side") or "-", float(m.get("shift", 0.0)),
                 float(m.get("lift", 0.0)), float(m.get("gate", 0.0)),
                 float(m.get("stance_margin", 0.0)), float(m.get("crouch_u", 0.0)),
+                m.get("lift_source", "?"),
             )
         elif self.leg_mode.startswith("march"):
             m = self.driver.gait_meta
@@ -658,16 +813,55 @@ class PoseImitationController:
         self.frame_count += 1
 
     def run(self) -> None:
+        """Step the simulation, containing errors so one bad step cannot end it.
+
+        A raised exception used to break out of this loop straight into
+        :meth:`_cleanup`, which sets every motor velocity to zero -- a single
+        transient error left a permanently dead robot with no obvious cause. Now
+        a failed step is logged, the body is forced back under our control (in
+        case the failure happened mid-handover to a motion clip), and the loop
+        carries on. Only a sustained run of failures gives up, and even then the
+        robot is left standing rather than limp.
+        """
         logger.info("Starting control loop...")
         try:
             while self.robot.step(self.timestep) != -1:
-                self.tick()
+                try:
+                    self.tick()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self._errors += 1
+                    logger.exception(
+                        "Control step %d failed (%d consecutive): %s",
+                        self.frame_count, self._errors, exc,
+                    )
+                    self._recover_from_error()
+                    if self._errors >= MAX_CONSECUTIVE_ERRORS:
+                        logger.error(
+                            "Giving up after %d consecutive failed steps.",
+                            self._errors,
+                        )
+                        break
+                    self.frame_count += 1
+                else:
+                    self._errors = 0
         except KeyboardInterrupt:
             logger.info("Interrupt received, shutting down")
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Unexpected error in control loop: %s", exc)
         finally:
             self._cleanup()
+
+    def _recover_from_error(self) -> None:
+        """Best-effort return to a known-good state after a failed step."""
+        try:
+            if self.motion.active or self.driver.suspended:
+                self._end_motion(self.motion.action, ok=False, reason="step error")
+        except Exception:  # noqa: BLE001 - recovery must never raise
+            logger.exception("Recovery itself failed; forcing control back")
+            try:
+                self.driver.reclaim_from_motion()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _cleanup(self) -> None:
         logger.info("Cleaning up...")

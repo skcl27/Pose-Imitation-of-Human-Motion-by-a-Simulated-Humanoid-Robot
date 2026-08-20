@@ -821,11 +821,17 @@ class NaoPoseDriver:
         self.stats.stale = stale
         return stale
 
+    # Velocity used by :meth:`stop`. Deliberately NOT zero: a zero-velocity motor
+    # cannot move at all, so if anything ever calls stop() while the controller
+    # keeps running, the robot is bricked with no diagnostic. A small positive
+    # value holds position just as well and stays recoverable.
+    HOLD_VELOCITY = 0.2
+
     def stop(self) -> None:
-        """Hold current position with zero velocity (graceful shutdown)."""
+        """Hold the current position (graceful shutdown)."""
         for name, motor in self.motors.items():
             try:
-                motor.setVelocity(0.0)
+                motor.setVelocity(self.HOLD_VELOCITY)
                 if name in self.measured:
                     motor.setPosition(self.measured[name])
             except Exception:  # noqa: BLE001

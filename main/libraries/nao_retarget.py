@@ -99,6 +99,10 @@ HEAD_PITCH_BASELINE = 0.9  # nose sits ~0.9 shoulder-widths above shoulder line
 # lift, and how much clearance counts as a *full* lift (knee-high march).
 LIFT_DEADBAND = 0.030
 LIFT_FULL = 0.260
+# Same thing measured on the KNEES instead, for when the feet are out of frame.
+# A raised knee travels less than the foot it carries, so full scale is reached
+# sooner. See LowerBodyRetargeter._lifts for why this fallback exists at all.
+LIFT_FULL_KNEE = 0.190
 # Squat: hip height (above the ground line, in reference-leg-length units) has
 # to drop by this fraction for a full crouch, and the knees must agree.
 CROUCH_FULL_DROP = 0.28
@@ -149,6 +153,11 @@ def _angle_between(a: Vec, b: Vec) -> float:
 def _hypot2(a: Landmark, b: Landmark) -> float:
     """In-image-plane distance between two landmarks (depth ignored)."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _lift_fraction(rise: float, leg_length: float, full: float) -> float:
+    """Normalize a landmark's rise above the reference into a [0, 1] lift."""
+    return _clamp((rise / leg_length - LIFT_DEADBAND) / full, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +335,10 @@ class LowerBodyObservation:
     stance_side: str = ""        # "L" / "R" / "" (both feet down)
     confidence: float = 0.0      # 0..1 overall lower-body confidence
     valid: bool = False
+    # Which landmarks produced the lift signal: "feet", "knees" or "none".
+    # Surfaced so the controller can tell the user *why* a leg lift is being
+    # ignored instead of silently doing nothing.
+    lift_source: str = "none"
 
     def leg(self, side: str) -> Optional[LegTarget]:
         return self.left if side == "L" else self.right
@@ -363,7 +376,16 @@ class BodyGeometry:
 
     @property
     def shank(self) -> float:
-        return max((self.shank_ratio.value or 0.0) * self.torso, 1e-4)
+        ratio = self.shank_ratio.value
+        if ratio is None:
+            # No ankle has ever been seen -- the usual case for someone standing
+            # close to a webcam, cropped at the shins. Thigh and shank are within
+            # a few percent of each other in both the human and NAO (0.100 m vs
+            # 0.1029 m), so borrowing the thigh keeps the leg scale usable. The
+            # alternative, which this replaces, was to declare the subject
+            # uncalibrated and discard the entire lower body.
+            ratio = self.thigh_ratio.value
+        return max((ratio or 0.0) * self.torso, 1e-4)
 
     @property
     def leg_length(self) -> float:
@@ -371,11 +393,10 @@ class BodyGeometry:
 
     @property
     def calibrated(self) -> bool:
-        return (
-            self.torso > 1e-4
-            and self.thigh_ratio.value is not None
-            and self.shank_ratio.value is not None
-        )
+        # Only the torso scale and the thigh are required: the shank falls back
+        # to the thigh (see above), and the shank length is only ever used on
+        # frames where the ankle IS visible.
+        return self.torso > 1e-4 and self.thigh_ratio.value is not None
 
 
 def _solve_segment(
@@ -444,10 +465,11 @@ class LowerBodyRetargeter:
             return LowerBodyObservation()
 
         ground_y = self._ground_line(kps)
-        left = self._leg(kps, "L", ground_y)
-        right = self._leg(kps, "R", ground_y)
+        lifts, lift_source = self._lifts(kps)
+        left = self._leg(kps, "L", lifts["L"])
+        right = self._leg(kps, "R", lifts["R"])
         if left is None and right is None:
-            return LowerBodyObservation()
+            return LowerBodyObservation(lift_source=lift_source)
 
         legs = [lg for lg in (left, right) if lg is not None]
         confidence = sum(lg.confidence for lg in legs) / len(legs)
@@ -470,6 +492,7 @@ class LowerBodyRetargeter:
             stance_side=stance,
             confidence=_clamp(confidence, 0.0, 1.0),
             valid=True,
+            lift_source=lift_source,
         )
 
     # -- internals ---------------------------------------------------------
@@ -507,8 +530,41 @@ class LowerBodyRetargeter:
         ys = [y for y in (self._foot_y(kps, "L"), self._foot_y(kps, "R")) if y is not None]
         return max(ys) if ys else None
 
+    def _lifts(self, kps: Dict[str, Landmark]) -> Tuple[Dict[str, float], str]:
+        """Per-side foot-lift fraction in [0, 1], and which landmarks gave it.
+
+        The trick that makes this calibration-free is that we never need to know
+        where the floor is in the image: whichever of the two feet is *lower*
+        defines the ground line, so the other foot's rise above it is the lift.
+
+        The catch is that it needs both feet in frame -- and someone standing
+        close to a webcam is usually cropped at the shins, which made the lift
+        signal identically zero however high they lifted a leg, so the robot
+        never stepped. So the same relative trick falls back to the **knees**,
+        which are in frame whenever the hips are. Knees are also the signal the
+        Python-side gait detector uses, for the same robustness reason.
+        """
+        leg_len = max(self.geom.leg_length, 1e-4)
+
+        feet = {side: self._foot_y(kps, side) for side in ("L", "R")}
+        if all(v is not None for v in feet.values()):
+            ground = max(feet.values())          # image y grows downward
+            return ({s: _lift_fraction(ground - feet[s], leg_len, LIFT_FULL)
+                     for s in ("L", "R")}, "feet")
+
+        knees: Dict[str, Optional[float]] = {}
+        for side in ("L", "R"):
+            pre = "left_" if side == "L" else "right_"
+            knees[side] = kps[pre + "knee"][1] if _visible(kps, pre + "knee") else None
+        if all(v is not None for v in knees.values()):
+            ref = max(knees.values())
+            return ({s: _lift_fraction(ref - knees[s], leg_len, LIFT_FULL_KNEE)
+                     for s in ("L", "R")}, "knees")
+
+        return ({"L": 0.0, "R": 0.0}, "none")
+
     def _leg(
-        self, kps: Dict[str, Landmark], side: str, ground_y: Optional[float]
+        self, kps: Dict[str, Landmark], side: str, lift: float
     ) -> Optional[LegTarget]:
         pre = "left_" if side == "L" else "right_"
         if not _visible(kps, pre + "hip", pre + "knee"):
@@ -557,12 +613,6 @@ class LowerBodyRetargeter:
         # NAO roll signs: LHipRoll positive = left leg outward, RHipRoll negative
         # = right leg outward. AnkleRoll cancels it so the sole stays level.
         hip_roll = roll_mag if side == "L" else -roll_mag
-
-        lift = 0.0
-        foot_y = self._foot_y(kps, side)
-        if ground_y is not None and foot_y is not None:
-            raw = (ground_y - foot_y) / max(self.geom.leg_length, 1e-4)
-            lift = _clamp((raw - LIFT_DEADBAND) / LIFT_FULL, 0.0, 1.0)
 
         names = [pre + "hip", pre + "knee"] + ([pre + "ankle"] if ankle else [])
         conf = sum(kps[n][3] for n in names) / len(names)

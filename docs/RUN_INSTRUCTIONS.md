@@ -232,6 +232,22 @@ pose_imitation_controller
   the clips from `<webots>/projects/robots/softbank/nao/motions/` into
   `main/controllers/pose_imitation_controller/motions/`.
 
+### If nothing moves at all
+Read the startup block the controller prints in the Webots console — it lists
+every layer as `ON` or `OFF`, and flags anything that is off with what it costs
+you. If that block never appeared, the controller died before its first step;
+look for a Python traceback (usually Webots' Python interpreter is missing NumPy:
+`Tools → Preferences → Python command`).
+
+The per-100-frame status line then says in plain language what the legs are
+doing, e.g. `legs: holding: centre of mass not yet over the stance foot` or
+`legs: knees and feet both out of frame; leg lift cannot be seen`.
+
+### If a raised leg does nothing
+Check `lift-cue` in that status line. `none` means neither your feet nor your
+knees are in frame, so the lift is literally invisible — step back from the
+camera until at least your knees show.
+
 ### If the legs do not move at all
 The most common cause is a world file missing the NAO foot/floor contact pair —
 the feet then slide on the floor and absorb every leg command. The committed
