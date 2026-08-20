@@ -896,18 +896,10 @@ def _sensor_magnitude(device: object) -> float:
     if getter is not None:
         try:
             values = getter()
-        except Exception:  # noqa: BLE001
-            values = None
-        if values is not None and len(values) >= 3:
             fz = float(values[2])
             return abs(fz) if math.isfinite(fz) else 0.0
-        if values is not None:
-            total = 0.0
-            for v in values:
-                f = float(v)
-                if math.isfinite(f):
-                    total += f * f
-            return math.sqrt(total)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         value = float(device.getValue())  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
