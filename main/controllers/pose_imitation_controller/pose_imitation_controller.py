@@ -210,11 +210,11 @@ class PoseImitationController:
             total = 0.0
             for dev in self.fsr[side]:
                 try:
-                    v = dev.getValue()
+                    v = dev.getValues()
                 except Exception:  # noqa: BLE001
                     continue
-                if v is not None and not math.isnan(v):
-                    total += abs(float(v))
+                if v is not None and len(v) >= 3 and not math.isnan(v[2]):
+                    total += abs(float(v[2]))
             out[side] = total
         return out
 
