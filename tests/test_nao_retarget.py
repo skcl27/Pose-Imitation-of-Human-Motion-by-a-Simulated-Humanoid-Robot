@@ -208,9 +208,26 @@ def test_symmetric_squat_reports_a_crouch() -> None:
     warm(r)
     shallow = r.observe(figure(left=(0.0, -0.3, 0.6), right=(0.0, -0.3, 0.6)))
     deep = r.observe(figure(left=(0.0, -0.7, 1.4), right=(0.0, -0.7, 1.4)))
-    assert 0.0 < shallow.crouch_u <= deep.crouch_u
+    assert 0.0 < shallow.crouch_u < deep.crouch_u
     from nao_retarget import MAX_CROUCH
     assert deep.crouch_u <= MAX_CROUCH
+
+
+def test_the_crouch_keeps_the_ankle_under_the_hip_at_any_depth() -> None:
+    """This is why the crouch cap is a joint-range limit and not a safety one:
+    NAO's thigh and shank are within 3 mm of the same length, so the hip stays
+    over the ankle however deep the squat goes."""
+    from balance import THIGH_LENGTH, TIBIA_LENGTH
+    for u in (0.0, 0.35, 0.70, 1.0):
+        p = crouch_posture(u)
+        # Forward offset of the ankle from the hip, from the two segment pitches.
+        offset = (THIGH_LENGTH * math.sin(u)
+                  + TIBIA_LENGTH * math.sin(-(u)))
+        assert abs(offset) < 0.004
+        for side in ("L", "R"):
+            total = (p[f"{side}HipPitch"] + p[f"{side}KneePitch"]
+                     + p[f"{side}AnklePitch"])
+            assert abs(total) < 1e-12          # torso vertical, sole flat
 
 
 def test_lift_ignores_the_subject_moving_away_from_the_camera() -> None:

@@ -108,7 +108,14 @@ LIFT_FULL_KNEE = 0.190
 CROUCH_FULL_DROP = 0.28
 KNEE_STRAIGHT_DEADZONE = 0.20  # rad of knee bend treated as "standing straight"
 KNEE_BEND_RANGE = 1.30         # rad of human knee bend mapped to full crouch
-MAX_CROUCH = 0.35              # rad; symmetric crouch amplitude u in [0, MAX_CROUCH]
+# Deepest symmetric crouch we ask for (hip 40 deg, knee 80 deg). Not a stability
+# limit: because NAO's thigh and shank are within 3 mm of the same length, the
+# Hip = -u / Knee = +2u / Ankle = -u posture keeps the ankle under the hip -- and
+# so the CoM over the foot -- at ANY depth, with the torso vertical and the soles
+# flat throughout. The real ceiling is the knee's own 121 deg range. The old
+# 0.35 was a guess made before that geometry was checked, and it made a human
+# squat read as a barely visible dip.
+MAX_CROUCH = 0.70
 
 # Depth (``z``) is the least reliable MediaPipe channel, so it is used only to
 # pick the SIGN of the unobservable sagittal axis, and only past a deadband.

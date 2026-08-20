@@ -34,14 +34,41 @@ there are no discrete jumps and no state to get stuck in: the controller can
 always ramp back to the exact symmetric crouch that is the project's proven
 no-fall baseline.
 
-Symmetric / asymmetric split
-----------------------------
+Symmetric / antisymmetric split
+-------------------------------
 The commanded posture is ``crouch_posture(u)`` -- the statically-balanced squat
 whose ``Hip + Knee + Ankle == 0`` keeps the torso vertical and the soles flat --
-plus the human's *deviation from* that posture, per leg, authority-weighted. The
-symmetric part therefore always stays inside the proven-stable family, and only
-the asymmetric detail is gated. Standing still yields a deviation of exactly
-zero, so the controller degrades to the old baseline rather than to noise.
+plus the human's *deviation from* that posture, per leg, authority-weighted.
+
+The weight is not one number, because two very different things live in those
+deviations. Splitting each channel into its mirror-symmetric and antisymmetric
+parts separates them exactly:
+
+* **Mirror-symmetric** -- both legs abducting outward by the same amount (a wider
+  stance), or both flexing equally (a squat). By symmetry these move the centre of
+  mass *not at all*, and a wider stance makes the support polygon **bigger**. They
+  are therefore safer than standing, and get full authority. Gating them was a
+  plain mistake: it turned a 40 deg human stance into a 12 deg robot one.
+* **Antisymmetric** -- both legs rolled the same way (a lean), or one leg forward
+  and one back (a split stance). These do move the centre of mass over the feet,
+  so they stay gated.
+
+While a foot is genuinely off the ground the split is dropped: the swing leg is
+unloaded and therefore free to take its own pose at whatever authority the safety
+gate allows, and the stance leg is left near the balanced crouch because it is
+carrying the whole robot.
+
+Standing still yields a deviation of exactly zero either way, so the controller
+degrades to the proven baseline rather than to noise.
+
+What actually limits a wide stance
+----------------------------------
+Not the hip. NAO's ``HipRoll`` reaches 45.3 deg, but ``AnkleRoll`` only reaches
+22.8 deg -- and the ankle is what levels the sole against the hip's abduction.
+Past 22.8 deg the sole can no longer be kept flat and the robot ends up standing
+on the inner edges of its feet, which tips it. So ``max_abduction`` is set by the
+*ankle* range, and it is still a very visible stance widening (the feet end up
+~2.5x further apart than they start).
 
 Pure Python + the (optional) NumPy CoM model, no Webots import, so all of the
 sequencing and gating logic is unit-testable off-simulation.
@@ -81,30 +108,49 @@ class LowerBodyParams:
     # -- posture -----------------------------------------------------------
     base_crouch_u: float = 0.10     # knees never fully locked: leaves the
                                     # balance loop some authority to work with
-    max_crouch_u: float = 0.35      # deep squats are where NAO goes marginal
+    # Deepest squat commanded. See nao_retarget.MAX_CROUCH: the crouch posture is
+    # statically balanced at any depth, so this is a range limit, not a safety one.
+    max_crouch_u: float = 0.70
 
-    # -- how much asymmetric human detail we allow, per channel ------------
-    max_hip_pitch_dev: float = 0.90
+    # -- how much human detail we allow through, per channel ---------------
+    max_hip_pitch_dev: float = 1.25
     max_hip_roll_dev: float = 0.7906  # rad ~ 45.3 deg, NAO HipRoll hardware limit
-    max_knee_dev: float = 1.10
+    max_knee_dev: float = 1.45
     max_ankle_dev: float = 0.60
-    # Authority given to per-leg deviations while BOTH feet are loaded. Small on
-    # purpose: an asymmetric double-support pose moves the CoM but cannot be
-    # verified against a single-foot support polygon.
-    double_support_gain: float = 0.30
+    # Mirror-symmetric poses (wider stance, deeper squat) are CoM-neutral and
+    # widen the support polygon, so they pass at full authority.
+    symmetric_gain: float = 1.0
+    # Largest both-legs-outward abduction we ask for. Set by the ANKLE range, not
+    # the hip: beyond 22.8 deg the ankle can no longer level the sole and the
+    # robot stands on the inner edges of its feet. See the module docstring.
+    max_abduction: float = 0.398
+    # Antisymmetric poses (a lean, a split stance) do move the CoM, and in double
+    # support there is no single-foot polygon to verify them against, so they are
+    # deliberately limited.
+    asymmetric_gain: float = 0.35
 
     # -- weight transfer ---------------------------------------------------
     shift_rad: float = 0.16         # lean amplitude that loads the stance foot
     shift_rate: float = 1.1         # 1/s ramp of the shift blend
     shift_ready: float = 0.75       # shift blend required before lifting starts
     lift_rate: float = 1.8          # 1/s ramp of the lift blend
-    lift_start: float = 0.22        # human lift fraction that requests a step
-    lift_stop: float = 0.10         # hysteresis: below this the foot comes down
+    lift_start: float = 0.15        # human lift fraction that requests a step
+    lift_stop: float = 0.07         # hysteresis: below this the foot comes down
 
     # -- safety gates ------------------------------------------------------
-    margin_min: float = 0.003       # m; stance margin needed to begin lifting
-    margin_full: float = 0.018      # m; margin at which full lift is allowed
-    fsr_load_frac: float = 0.55     # stance foot's share of total foot load
+    margin_min: float = 0.002       # m; stance margin needed to begin lifting
+    # Margin at which the full requested lift is allowed. A completed weight
+    # transfer yields ~0.015 m, so anything larger silently caps the lift below
+    # the human's -- which read as "the leg only moves a little".
+    margin_full: float = 0.012
+    fsr_load_frac: float = 0.55     # stance share at which the FSRs fully confirm
+    # Authority retained when the foot sensors do NOT confirm the transfer. The
+    # FSRs are a *confirmation*, never a veto: a sensor that reads a constant
+    # 50/50 (uncalibrated, or a proto whose soles barely redistribute) would
+    # otherwise forbid every step forever, which is exactly how a leg lift ends
+    # up doing nothing at all. The CoM model has already agreed by this point and
+    # the tilt abort is the real safety net.
+    fsr_min_gain: float = 0.40
     fsr_total_min: float = 1.0      # N; below this the FSR reading is ignored
     tilt_abort_rad: float = 0.28    # |IMU roll/pitch| beyond this -> stand down
     conf_min: float = 0.50          # min lower-body landmark confidence
@@ -162,6 +208,7 @@ class LowerBodyController:
         self.state = LowerBodyState()
         self._probe: Dict[str, Tuple[float, float]] = {}  # stance -> (dir, t)
         self._last_obs = LowerBodyObservation()
+        self._fsr_share: Optional[float] = None
 
     # ------------------------------------------------------------------ API
     def reset(self) -> None:
@@ -258,8 +305,11 @@ class LowerBodyController:
             "lift": round(st.lift, 4),
             "gate": round(gate, 4),
             "stance_margin": round(margin, 5),
+            "fsr_share": (None if self._fsr_share is None
+                          else round(self._fsr_share, 3)),
             "human_lift": round(human_lift, 4),
             "crouch_u": round(self._crouch_u(obs), 4),
+            "crouch_cue": round(obs.crouch_u, 4),
             "tilt_ok": tilt_ok,
             "tracking": usable,
         }
@@ -293,12 +343,44 @@ class LowerBodyController:
             return f"transferring weight onto the {st.stance or '?'} foot"
         if gate <= 0.0:
             return "holding: centre of mass not yet over the stance foot"
+        if self._fsr_share is not None and self._fsr_share < p.fsr_load_frac:
+            return (f"stepping at reduced authority: foot sensors report only "
+                    f"{self._fsr_share * 100:.0f}% of the load on the "
+                    f"{st.stance} foot")
         return f"stepping ({st.lift * 100:.0f}% of the requested lift)"
 
     def _crouch_u(self, obs: LowerBodyObservation) -> float:
+        """Symmetric squat depth to command, in radians.
+
+        A squat has exactly ONE degree of freedom: the crouch posture ties
+        ``Hip = -d``, ``Knee = +2d``, ``Ankle = -d`` together so the torso stays
+        vertical and the soles flat. So the depth is read off the leg solve as a
+        single number and the three joints are rebuilt from it, rather than
+        letting three independently-clamped channels drift out of that relation
+        (and rather than adding the squat twice -- once here and again as a
+        "symmetric pitch deviation", which is what it used to do).
+
+        The depth is the SMALLEST reading available, across two axes and both
+        legs, because every other reading can be inflated by something that is
+        not a squat:
+
+        * hip vs. knee -- bending at the WAIST flexes the hip relative to the
+          torso while the knees stay straight, and NAO has no torso joint to
+          render that with. Requiring the knee to agree turns a waist hinge into
+          no squat, correctly.
+        * left vs. right -- a raised leg is deeply flexed at both hip and knee,
+          so averaging the two legs made lifting one knee also squat the robot.
+          The straighter leg is the one bearing the weight, and it is the one
+          that says how low the body actually is.
+        """
         p = self.params
-        u = obs.crouch_u if obs.valid else 0.0
-        return _clamp(max(u, p.base_crouch_u), 0.0, p.max_crouch_u)
+        legs = [lg for lg in (obs.left, obs.right) if lg is not None] if obs.valid else []
+        depth = 0.0
+        if legs:
+            depth = min(min(-lg.hip_pitch, 0.5 * lg.knee_pitch) for lg in legs)
+        # base_crouch_u is a floor, not a target: fully locked knees leave the
+        # balance loop nothing to work with (KneePitch bottoms out at -5.3 deg).
+        return _clamp(max(depth, p.base_crouch_u), 0.0, p.max_crouch_u)
 
     def _requested_swing(self, obs: LowerBodyObservation) -> str:
         """Which foot (if any) the human is asking the robot to lift."""
@@ -331,26 +413,33 @@ class LowerBodyController:
         the step degrades smoothly instead of snapping on and off.
         """
         p = self.params
+        self._fsr_share = None
         if not stance:
             return 0.0, 0.0
 
-        # Foot force sensors, when the robot has them, must confirm the transfer.
+        # --- model gate: is the CoM over the stance foot? ------------------
+        margin = 0.0
+        if self.com_model is None or measured is None:
+            gate = p.ungated_lift_cap   # nothing to prove safety with; move a little
+        else:
+            try:
+                margin = float(self.com_model.stance_margin(measured, stance))
+            except Exception:  # noqa: BLE001 - no stance_margin / bad state
+                gate = p.ungated_lift_cap
+            else:
+                span = max(p.margin_full - p.margin_min, 1e-6)
+                gate = _clamp((margin - p.margin_min) / span, 0.0, 1.0)
+
+        # --- foot sensors: a confirmation, scaled -- never a veto ----------
         if fsr:
             total = float(fsr.get("L", 0.0)) + float(fsr.get("R", 0.0))
             if total > p.fsr_total_min:
                 share = float(fsr.get(stance, 0.0)) / total
-                if share < p.fsr_load_frac:
-                    return 0.0, 0.0
-
-        if self.com_model is None or measured is None:
-            # No model to prove safety with: move, but only a little.
-            return p.ungated_lift_cap, 0.0
-        try:
-            margin = float(self.com_model.stance_margin(measured, stance))
-        except Exception:  # noqa: BLE001 - model without stance_margin / bad state
-            return p.ungated_lift_cap, 0.0
-        span = max(p.margin_full - p.margin_min, 1e-6)
-        return _clamp((margin - p.margin_min) / span, 0.0, 1.0), margin
+                self._fsr_share = share
+                span = max(p.fsr_load_frac - 0.5, 1e-6)
+                confirm = _clamp((share - 0.5) / span, 0.0, 1.0)
+                gate *= p.fsr_min_gain + (1.0 - p.fsr_min_gain) * confirm
+        return gate, margin
 
     def _shift_direction(self, stance: str, measured: Optional[Dict[str, float]],
                          now_s: float) -> float:
@@ -395,15 +484,29 @@ class LowerBodyController:
         u = self._crouch_u(obs)
         targets = dict(crouch_posture(u))
 
-        for side in ("L", "R"):
-            leg = obs.leg(side) if obs.valid else None
-            if leg is None:
-                continue
-            weight = st.lift if side == swing else p.double_support_gain
-            if weight <= 1e-4:
-                continue
-            for name, value in self._deviation(leg, side, u).items():
-                targets[name] = targets.get(name, 0.0) + weight * value
+        left = obs.leg("L") if obs.valid else None
+        right = obs.leg("R") if obs.valid else None
+        dev_l = self._deviation(left, "L", u) if left is not None else None
+        dev_r = self._deviation(right, "R", u) if right is not None else None
+
+        stepping = bool(swing) and st.lift > 1e-4
+        if stepping:
+            # A foot that is off the ground is unloaded, so it is free to take the
+            # human's own pose at whatever authority the safety gate allows. The
+            # stance leg is carrying the robot, so it stays near the balanced
+            # crouch -- sharing the swing leg's pose onto it would move the very
+            # foot the CoM is standing on.
+            stance = "R" if swing == "L" else "L"
+            for side, dev, weight in (
+                (swing, dev_l if swing == "L" else dev_r, st.lift),
+                (stance, dev_l if stance == "L" else dev_r, p.asymmetric_gain),
+            ):
+                if dev is None or weight <= 1e-4:
+                    continue
+                for name, value in dev.items():
+                    targets[name] = targets.get(name, 0.0) + weight * value
+        else:
+            self._apply_symmetric(targets, dev_l, dev_r)
 
         if st.shift > 1e-4 and st.stance:
             lean = p.shift_rad * st.shift * self._shift_dir_cached(st.stance)
@@ -417,6 +520,68 @@ class LowerBodyController:
             targets["LHipYawPitch"] = targets.get("LHipYawPitch", 0.0) + bias
             targets["RHipYawPitch"] = targets.get("RHipYawPitch", 0.0) + bias
         return targets
+
+    # NAO's left/right sign conventions differ per axis: the ROLL channels are
+    # mirrored (LHipRoll positive and RHipRoll negative both mean "outward"), the
+    # PITCH channels are not. So a mirror-symmetric human pose shows up as
+    # numerically opposite roll values and numerically equal pitch values.
+    _MIRRORED_CHANNELS = ("HipRoll", "AnkleRoll")
+    _ALIGNED_CHANNELS = ("HipPitch", "KneePitch", "AnklePitch")
+
+    def _apply_symmetric(
+        self,
+        targets: Dict[str, float],
+        dev_l: Optional[Dict[str, float]],
+        dev_r: Optional[Dict[str, float]],
+    ) -> None:
+        """Add the human's double-support deviation, split by symmetry.
+
+        The mirror-symmetric half (wider stance, deeper squat) is CoM-neutral and
+        enlarges the support polygon, so it passes at full authority; the
+        antisymmetric half (a lean, a split stance) moves the CoM and stays
+        limited. See the module docstring.
+        """
+        p = self.params
+        for channel, mirrored in (
+            *((c, True) for c in self._MIRRORED_CHANNELS),
+            *((c, False) for c in self._ALIGNED_CHANNELS),
+        ):
+            left = dev_l.get("L" + channel) if dev_l else None
+            right = dev_r.get("R" + channel) if dev_r else None
+            if left is None or right is None:
+                # Only one leg in view: there is no way to tell a symmetric pose
+                # from a lean, so read the whole thing as antisymmetric, which is
+                # the conservative interpretation.
+                for side, value in (("L", left), ("R", right)):
+                    if value is not None:
+                        targets[side + channel] = (
+                            targets.get(side + channel, 0.0)
+                            + p.asymmetric_gain * value
+                        )
+                continue
+
+            if mirrored:
+                symmetric = 0.5 * (left - right)   # both legs outward by this much
+                antisym = 0.5 * (left + right)     # both rolled the same way = lean
+                symmetric = _clamp(symmetric, -p.max_abduction, p.max_abduction)
+                l_sym, r_sym = symmetric, -symmetric
+            else:
+                # The symmetric part of a pitch channel IS the squat, and the
+                # crouch posture already carries it (see _crouch_u). Adding it
+                # again double-counted the squat and let a straight-legged human
+                # cancel the base crouch entirely, locking the knees.
+                antisym = 0.5 * (left - right)     # one forward, one back
+                l_sym = r_sym = 0.0
+
+            targets["L" + channel] = (
+                targets.get("L" + channel, 0.0)
+                + p.symmetric_gain * l_sym + p.asymmetric_gain * antisym
+            )
+            targets["R" + channel] = (
+                targets.get("R" + channel, 0.0)
+                + p.symmetric_gain * r_sym
+                + p.asymmetric_gain * (antisym if mirrored else -antisym)
+            )
 
     def _shift_dir_cached(self, stance: str) -> float:
         cached = self._probe.get(stance)

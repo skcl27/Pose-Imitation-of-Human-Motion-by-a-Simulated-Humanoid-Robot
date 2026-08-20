@@ -110,13 +110,51 @@ same way: if an ankle is never seen, the shank borrows the thigh (they are withi
 a few percent in both the human and NAO) rather than declaring the subject
 uncalibrated and discarding the whole lower body.
 
-| Human motion | NAO joints | Notes |
+#### How much of your pose gets through
+
+Two very different things live in "the legs are at different angles", and gating
+them the same way was wrong:
+
+* **Mirror-symmetric** — both legs abducting outward (a wider stance), or both
+  flexing equally (a squat). By symmetry these move the centre of mass *not at
+  all*, and a wider stance makes the support polygon **bigger**. They are safer
+  than standing, so they pass at **full authority, 1:1 with you**.
+* **Antisymmetric** — both legs rolled the same way (a lean), or one leg forward
+  and one back. These do move the CoM over the feet, so they stay limited
+  (`asymmetric_gain`).
+
+While a foot is genuinely off the ground the split is dropped: the swing leg is
+unloaded and free to take your pose at whatever the safety gate allows, and the
+stance leg stays near the balanced crouch because it is carrying the robot.
+
+| You do | Robot does | Limited by |
 |---|---|---|
-| Squat | `HipPitch`, `KneePitch`, `AnklePitch` (symmetric) | full authority — symmetric crouch is statically stable by construction |
-| Leg out sideways | `HipRoll`, `AnkleRoll` | bounded authority in double support |
-| **Raise one leg** | that leg's whole chain | gated: weight transfers to the stance foot first (§3) |
+| Squat | 1:1 to 40° hip / 80° knee | knee range, not balance — see below |
+| Spread your legs | 1:1 to 22.8° per leg | **the ankle**, not the hip — see below |
+| Lean sideways | ~35% of your lean | moves the CoM; gated on purpose |
+| Split stance (one leg fwd) | ~35% | same |
+| **Raise one leg** | full lift once the weight has transferred | the CoM model (§3) |
 | Walk / march | walk clips, or the march engine | §4 |
 | **Turn your body** | stepping turn (heading servo) | §5 |
+
+**The squat cap is a joint-range limit, not a stability one.** NAO's thigh and
+shank are within 3 mm of the same length, so the crouch posture
+(`Hip = −d`, `Knee = +2d`, `Ankle = −d`) keeps the ankle under the hip — and the
+CoM over the foot — at *any* depth, with the torso vertical and the soles flat
+throughout. The real ceiling is the knee's own 121° range.
+
+**A wide stance is capped by the ankle.** `HipRoll` reaches 45.3° but `AnkleRoll`
+only 22.8°, and the ankle is what levels the sole against the hip's abduction.
+Past 22.8° the sole cannot be kept flat and the robot ends up standing on the
+inner edges of its feet, which tips it. So the usable stance width is set by the
+*ankle* range — still about 2.5× the feet's resting separation.
+
+**The squat is one degree of freedom, read off the solve.** Depth is the smallest
+reading across two axes and both legs: hip vs. knee (bending at the *waist* also
+flexes the hip while the knees stay straight, and NAO has no torso joint for
+that), and left vs. right (a raised leg is deeply flexed at both, so averaging
+the legs made lifting one knee also squat the robot — the straighter leg is the
+one bearing the weight).
 
 ---
 
@@ -156,14 +194,42 @@ the human's per-leg *deviation from* that posture, authority-weighted. So the
 symmetric part never leaves the proven-stable family, only the asymmetric detail
 is gated, and a subject standing still produces a deviation of exactly zero.
 
-Safety gates, all of which stand the robot down: torso tilt past
-`tilt_abort_rad`, lower-body landmark confidence below `conf_min`, "both feet
-up" (a jump, or bad tracking — never a step), and foot force sensors reporting
-the weight has *not* transferred. Without a CoM model (no NumPy) the lift is
-hard-capped by `ungated_lift_cap` rather than cancelled — the tilt abort remains
-the safety net.
+Safety gates that stand the robot down: torso tilt past `tilt_abort_rad`,
+lower-body landmark confidence below `conf_min`, and "both feet up" (a jump, or
+bad tracking — never a step).
+
+The **foot force sensors are a confirmation, not a veto**. They scale the lift
+between `fsr_min_gain` and 1.0 as the stance foot's load share rises to
+`fsr_load_frac`. They used to veto outright, which meant a sensor reading a
+constant 50/50 — uncalibrated, or a proto whose soles barely redistribute —
+forbade every step forever: a silent, permanent "raising my leg does nothing".
+By the time this gate runs the CoM model has already agreed the weight is over
+the stance foot, and the tilt abort is the real safety net. Likewise, without a
+CoM model at all (no NumPy) the lift is hard-capped by `ungated_lift_cap` rather
+than cancelled.
+
+`margin_full` matters more than it looks: a completed weight transfer yields
+about 0.015 m of stance margin, so setting it any higher silently caps the lift
+below what you asked for and reads as "the leg only moves a little".
 
 Tuning lives in `LowerBodyParams` in [`lower_body.py`](../../libraries/lower_body.py).
+
+### Tuning for more pose fidelity
+
+If you want the robot to follow you harder, these are the knobs, most useful
+first — each trades stability margin for faithfulness:
+
+| Knob | Raise it to… | Cost |
+|---|---|---|
+| `asymmetric_gain` (0.35) | follow leans and split stances more closely | moves the CoM with no single-foot polygon to verify it against |
+| `max_crouch_u` (0.70) | squat deeper | approaches the knee's 121° limit |
+| `max_abduction` (0.398) | spread wider | past the ankle's range the soles tilt onto their inner edges |
+| `fsr_min_gain` (0.40) | trust the CoM model over the foot sensors | loses the load-transfer cross-check |
+| `margin_min` (0.002) | start lifting sooner | starts unloading a foot with less margin |
+
+Still **not** driven from the camera: `ElbowYaw` (forearm twist) and `WristYaw`
+are held at their rest angles, so arm *rotation* is not imitated — only the arm's
+direction and elbow bend. That is a known gap, not a fault.
 
 ---
 
@@ -447,6 +513,7 @@ Frame 400 | sim 49.8 Hz | tracking | legs=pose | 8 joints applied
 - `gate` — how much lift the CoM model currently permits (0 = do not unload)
 - `margin` — signed distance of the CoM inside the stance foot; must be positive to step
 - `lift-cue` — `feet` / `knees` / `none`: which landmarks the lift is read from
+- `fsr_share` (in the reason text) — the stance foot's measured share of the load
 - `heading error` — what the turn servo still wants to rotate
 
 ---
@@ -484,8 +551,15 @@ per-joint commanding is not reaching the motors at all. In order of likelihood:
 **Raised leg produces only a small response**
 Read the `legs:` line — it names the limiting factor. `gate=0.00` means the CoM
 model refuses to unload the foot: usually the robot has not finished leaning yet
-(`shift < 0.75`), or the foot sensors disagree. That is working as designed; it
-is the difference between a step and a fall.
+(`shift < 0.75`). If it says *"stepping at reduced authority: foot sensors report
+only 50% of the load…"*, the FSRs are not seeing the transfer; raise
+`fsr_min_gain` toward 1.0 to trust the CoM model instead.
+
+**Spreading my legs barely widens the stance**
+It saturates at 22.8° per leg, which is the ankle's limit for keeping the soles
+flat, not a safety gate (see §2). If it stops well short of that, check the
+`legs:` reason — a one-sided spread is partly antisymmetric and therefore partly
+gated.
 
 **Raised leg produces nothing at all**
 Check `lift-cue` in the log. `none` means neither your feet nor your knees are in

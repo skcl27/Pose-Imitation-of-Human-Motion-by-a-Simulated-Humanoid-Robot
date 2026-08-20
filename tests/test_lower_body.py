@@ -15,6 +15,8 @@ import math
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
 from balance import NaoCoMModel  # noqa: E402
@@ -46,6 +48,40 @@ def standing(crouch_u=0.0, conf=1.0):
     return LowerBodyObservation(
         left=leg, right=LegTarget(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, conf),
         crouch_u=crouch_u, stance_side="", confidence=conf, valid=True,
+    )
+
+
+def abducted(angle=0.35, conf=1.0):
+    """Both legs spread outward by ``angle`` -- a wider stance.
+
+    NAO's roll signs are mirrored, so "outward" is +angle on the left and
+    -angle on the right; the ankle cancels the hip to keep each sole flat.
+    """
+    return LowerBodyObservation(
+        left=LegTarget(0.0, +angle, 0.0, 0.0, -angle, lift=0.0, confidence=conf),
+        right=LegTarget(0.0, -angle, 0.0, 0.0, +angle, lift=0.0, confidence=conf),
+        crouch_u=0.0, stance_side="", confidence=conf, valid=True,
+        lift_source="feet",
+    )
+
+
+def leaning(angle=0.35, conf=1.0):
+    """Both legs rolled the SAME way -- a lean, which moves the centre of mass."""
+    leg = LegTarget(0.0, +angle, 0.0, 0.0, -angle, lift=0.0, confidence=conf)
+    return LowerBodyObservation(
+        left=leg, right=LegTarget(0.0, +angle, 0.0, 0.0, -angle, 0.0, conf),
+        crouch_u=0.0, stance_side="", confidence=conf, valid=True,
+        lift_source="feet",
+    )
+
+
+def split_stance(angle=0.5, conf=1.0):
+    """One leg forward, one back -- antisymmetric pitch."""
+    return LowerBodyObservation(
+        left=LegTarget(-angle, 0.0, 0.0, +angle, 0.0, lift=0.0, confidence=conf),
+        right=LegTarget(+angle, 0.0, 0.0, -angle, 0.0, lift=0.0, confidence=conf),
+        crouch_u=0.0, stance_side="", confidence=conf, valid=True,
+        lift_source="feet",
     )
 
 
@@ -98,13 +134,59 @@ def test_no_observation_still_commands_a_safe_posture() -> None:
     assert abs(targets["LKneePitch"] - base["LKneePitch"]) < 1e-9
 
 
-def test_squat_follows_the_human_but_stays_bounded() -> None:
+def squatting(depth, conf=1.0):
+    """Both legs in the crouch posture at ``depth`` radians."""
+    leg = LegTarget(-depth, 0.0, 2.0 * depth, -depth, 0.0, lift=0.0, confidence=conf)
+    return LowerBodyObservation(
+        left=leg, right=LegTarget(-depth, 0.0, 2 * depth, -depth, 0.0, 0.0, conf),
+        crouch_u=0.0, stance_side="", confidence=conf, valid=True,
+        lift_source="feet",
+    )
+
+
+def test_squat_follows_the_human_one_to_one_within_range() -> None:
+    p = LowerBodyParams()
+    for depth in (0.20, 0.35, 0.60):
+        ctl = LowerBodyController(com_model=NaoCoMModel())
+        targets, meta, _, _ = run(ctl, squatting(depth), 2.0)
+        assert meta["crouch_u"] == pytest.approx(depth, abs=1e-6)
+        assert targets["LHipPitch"] == pytest.approx(-depth, abs=0.01)
+        assert targets["LKneePitch"] == pytest.approx(2 * depth, abs=0.01)
+
+    # Below the floor the knees stay softly bent: fully locked knees leave the
+    # balance loop nothing to work with.
     ctl = LowerBodyController(com_model=NaoCoMModel())
-    _, shallow, _, _ = run(ctl, standing(crouch_u=0.05), 1.0)
+    _, standing_meta, _, _ = run(ctl, squatting(0.0), 2.0)
+    assert standing_meta["crouch_u"] == p.base_crouch_u
+
+    # And an absurd request is capped.
     ctl2 = LowerBodyController(com_model=NaoCoMModel())
-    _, deep, _, _ = run(ctl2, standing(crouch_u=10.0), 1.0)   # absurd request
-    assert shallow["crouch_u"] == ctl.params.base_crouch_u    # below the floor
-    assert deep["crouch_u"] == ctl2.params.max_crouch_u       # capped
+    _, deep, _, _ = run(ctl2, squatting(3.0), 2.0)
+    assert deep["crouch_u"] == p.max_crouch_u
+
+
+def test_a_waist_hinge_is_not_read_as_a_squat() -> None:
+    """Flexing the hip with straight knees is a bend at the waist, which NAO has
+    no torso joint to render -- it must not become a squat."""
+    p = LowerBodyParams()
+    leg = LegTarget(-0.5, 0.0, 0.0, 0.5, 0.0, lift=0.0, confidence=1.0)
+    obs = LowerBodyObservation(
+        left=leg, right=LegTarget(-0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0),
+        confidence=1.0, valid=True, lift_source="feet",
+    )
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    _, meta, _, _ = run(ctl, obs, 2.0)
+    assert meta["crouch_u"] == p.base_crouch_u
+
+
+def test_lifting_one_knee_does_not_make_the_robot_squat() -> None:
+    """A raised leg is deeply flexed at hip and knee, so averaging both legs made
+    a knee-lift also squat the robot. The straighter leg carries the weight and
+    is the one that says how low the body is."""
+    p = LowerBodyParams()
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    _, meta, _, _ = run(ctl, lifting("L"), 3.0)
+    assert meta["crouch_u"] == p.base_crouch_u
 
 
 # ------------------------------------------------------- the step sequence
@@ -190,16 +272,34 @@ def test_both_feet_up_is_refused() -> None:
     assert meta["mode"] == MODE_DOUBLE
 
 
-def test_foot_sensors_veto_a_lift_when_the_load_is_not_transferred() -> None:
+def test_foot_sensors_scale_the_lift_rather_than_forbidding_it() -> None:
+    """The FSRs are a confirmation, not a veto.
+
+    They used to veto outright, which meant a sensor reading a constant 50/50 --
+    uncalibrated, or a proto whose soles barely redistribute load -- forbade every
+    step forever. That is exactly how a leg lift ends up doing nothing at all, and
+    it is a silent failure. By the time this gate runs the CoM model has already
+    agreed the weight is over the stance foot, and the tilt abort is the real
+    safety net, so a disagreeing sensor reduces authority instead of removing it.
+    """
+    p = LowerBodyParams()
+    # Load clearly on the WRONG foot: authority is cut, but not to zero.
     ctl = LowerBodyController(com_model=NaoCoMModel())
-    # The stance foot (R) is carrying almost nothing -> refuse to unload the other.
-    _, meta, _, _ = run(ctl, lifting("L"), 3.0, fsr={"L": 25.0, "R": 2.0})
-    assert meta["gate"] == 0.0
-    assert meta["lift"] == 0.0
-    # ... and it goes ahead once the sensors agree with the model.
+    _, unconfirmed, _, _ = run(ctl, lifting("L"), 3.0, fsr={"L": 25.0, "R": 2.0})
+    assert unconfirmed["gate"] == pytest.approx(p.fsr_min_gain, abs=0.05)
+    assert 0.0 < unconfirmed["lift"] < 0.6
+    assert unconfirmed["fsr_share"] < 0.5
+
+    # A static 50/50 reading is uninformative, not a refusal.
+    ctl_flat = LowerBodyController(com_model=NaoCoMModel())
+    _, flat, _, _ = run(ctl_flat, lifting("L"), 3.0, fsr={"L": 26.0, "R": 26.0})
+    assert flat["lift"] > 0.0
+
+    # Once the load really has transferred, the full lift is allowed.
     ctl2 = LowerBodyController(com_model=NaoCoMModel())
-    _, meta2, _, _ = run(ctl2, lifting("L"), 3.0, fsr={"L": 2.0, "R": 25.0})
-    assert meta2["gate"] > 0.0
+    _, confirmed, _, _ = run(ctl2, lifting("L"), 3.0, fsr={"L": 2.0, "R": 25.0})
+    assert confirmed["gate"] > unconfirmed["gate"]
+    assert confirmed["lift"] > unconfirmed["lift"]
 
 
 def test_negligible_total_foot_load_is_ignored_not_trusted() -> None:
@@ -251,3 +351,111 @@ def test_yaw_bias_is_capped_and_only_applied_while_standing() -> None:
     targets2, meta2, _, _ = run(ctl2, lifting("L"), 3.0, yaw_bias=5.0)
     assert meta2["mode"] == MODE_SINGLE
     assert abs(targets2["LHipYawPitch"]) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Symmetric / antisymmetric authority split
+#
+# Spreading your legs and leaning are both "asymmetric per-leg roll" to a naive
+# reader, but one enlarges the support polygon and the other moves the centre of
+# mass off it. Gating them equally is what turned a 40 deg human stance into a
+# 12 deg robot one.
+# ---------------------------------------------------------------------------
+def test_a_wider_stance_passes_through_at_full_authority() -> None:
+    p = LowerBodyParams()
+    for angle in (0.10, 0.20, 0.35):
+        ctl = LowerBodyController(com_model=NaoCoMModel())
+        targets, meta, _, _ = run(ctl, abducted(angle), 2.0)
+        assert meta["mode"] == MODE_DOUBLE
+        want = min(angle, p.max_abduction)
+        assert targets["LHipRoll"] == pytest.approx(+want, abs=0.02)
+        assert targets["RHipRoll"] == pytest.approx(-want, abs=0.02)
+
+
+def test_a_wider_stance_keeps_both_soles_flat() -> None:
+    """The ankle must cancel the hip, or the robot stands on its inner edges."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, abducted(0.35), 2.0)
+    for side in ("L", "R"):
+        assert targets[f"{side}HipRoll"] + targets[f"{side}AnkleRoll"] == \
+            pytest.approx(0.0, abs=1e-6)
+
+
+def test_abduction_is_capped_by_the_ankle_not_the_hip() -> None:
+    """NAO's HipRoll reaches 45 deg but AnkleRoll only 22.8, and past that the
+    sole cannot be levelled -- so the ankle sets the usable stance width."""
+    p = LowerBodyParams()
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, abducted(1.5), 2.0)      # absurd request
+    assert targets["LHipRoll"] == pytest.approx(p.max_abduction, abs=0.02)
+    assert p.max_abduction < CONFIGS["LHipRoll"].max_angle   # hip could go further
+    assert p.max_abduction == pytest.approx(
+        abs(CONFIGS["LAnkleRoll"].min_angle), abs=0.005)     # ankle is the limit
+
+
+def test_a_lean_is_still_gated() -> None:
+    """Same-sign roll moves the CoM, so it must NOT get the symmetric pass."""
+    p = LowerBodyParams()
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, leaning(0.35), 2.0)
+    expected = p.asymmetric_gain * 0.35
+    assert targets["LHipRoll"] == pytest.approx(expected, abs=0.02)
+    assert targets["RHipRoll"] == pytest.approx(expected, abs=0.02)
+    assert abs(targets["LHipRoll"]) < 0.35 * 0.6            # clearly limited
+
+
+def test_a_split_stance_is_still_gated() -> None:
+    p = LowerBodyParams()
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, split_stance(0.5), 2.0)
+    spread = targets["LHipPitch"] - targets["RHipPitch"]
+    assert spread == pytest.approx(-2 * p.asymmetric_gain * 0.5, abs=0.05)
+
+
+def test_a_deeper_squat_is_symmetric_and_torso_stays_vertical() -> None:
+    obs = LowerBodyObservation(
+        left=LegTarget(-0.4, 0.0, 0.8, -0.4, 0.0, 0.0, 1.0),
+        right=LegTarget(-0.4, 0.0, 0.8, -0.4, 0.0, 0.0, 1.0),
+        crouch_u=0.30, stance_side="", confidence=1.0, valid=True,
+        lift_source="feet",
+    )
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, obs, 2.0)
+    assert targets["LHipPitch"] == pytest.approx(targets["RHipPitch"], abs=1e-9)
+    for side in ("L", "R"):
+        total = (targets[f"{side}HipPitch"] + targets[f"{side}KneePitch"]
+                 + targets[f"{side}AnklePitch"])
+        assert total == pytest.approx(0.0, abs=1e-9)
+
+
+def test_only_one_visible_leg_is_read_conservatively() -> None:
+    """With one leg out of view a symmetric pose and a lean are indistinguishable,
+    so the whole deviation must be treated as the risky (antisymmetric) one."""
+    p = LowerBodyParams()
+    obs = LowerBodyObservation(
+        left=LegTarget(0.0, 0.35, 0.0, 0.0, -0.35, 0.0, 1.0),
+        right=None, crouch_u=0.0, confidence=0.6, valid=True, lift_source="feet",
+    )
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, obs, 2.0)
+    assert targets["LHipRoll"] == pytest.approx(p.asymmetric_gain * 0.35, abs=0.02)
+    assert targets["RHipRoll"] == pytest.approx(0.0, abs=0.02)
+
+
+def test_a_lifted_leg_does_not_drag_the_stance_leg_with_it() -> None:
+    """The swing foot is unloaded and free; the stance leg is carrying the robot,
+    so the swing leg's pose must not be shared onto it."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, meta, _, _ = run(ctl, lifting("L"), 3.0)
+    assert meta["mode"] == MODE_SINGLE
+    assert targets["LKneePitch"] > 0.9              # swing leg clearly folded
+    assert abs(targets["RKneePitch"]) < 0.35        # stance leg near the crouch
+
+
+def test_a_full_weight_transfer_allows_the_full_requested_lift() -> None:
+    """A completed transfer yields ~0.015 m of margin; if margin_full sat above
+    that, the lift silently capped below the human's and read as "barely moves"."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    _, meta, _, _ = run(ctl, lifting("L", lift=1.0), 4.0)
+    assert meta["gate"] == pytest.approx(1.0, abs=1e-6)
+    assert meta["lift"] > 0.95

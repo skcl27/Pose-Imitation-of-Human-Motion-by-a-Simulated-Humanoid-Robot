@@ -16,15 +16,23 @@ A Linux-first, real-time pipeline that:
 |---|---|
 | Move your arms | Follows both arms (shoulder pitch **and** roll, elbow) |
 | Turn / nod your head | Follows head yaw and pitch |
-| Squat | Squats — symmetric, statically balanced |
-| **Raise one leg** | Shifts its weight onto the other foot, *then* raises the matching leg — only as far as its own centre-of-mass model says is safe |
+| Squat | Squats 1:1 with you, to 40° hip / 80° knee |
+| **Spread your legs** | Widens its stance 1:1 with you, to 22.8° per leg (the ankle's limit for keeping the soles flat) |
+| **Raise one leg** | Shifts its weight onto the other foot, *then* raises the matching leg — as far as its own centre-of-mass model says is safe |
+| Lean, or split your stance | Follows partly — these move the centre of mass, so they stay limited |
 | **Walk / march** | Walks across the floor for real (its world coordinates change), using Webots' pre-balanced NAO walk clips; marches in place if no clips are installed |
 | **Turn your body** | Steps round to face the same way, closing the loop on the InertialUnit heading |
 
 The lower body is the interesting part: a single camera cannot see whether NAO's
 centre of mass is over a foot, so the camera only ever supplies the *desired* leg
 pose and the robot's own forward-kinematics CoM model decides how much of it is
-safe to execute. Details and the maths:
+safe to execute.
+
+How much gets through depends on the *symmetry* of the pose, not its size. A
+wider stance or a deeper squat is mirror-symmetric: it moves the centre of mass
+not at all, and a wider stance actually enlarges the support polygon — so those
+pass at full authority, 1:1 with you. A lean or a split stance does move the
+centre of mass, so it stays limited. Details and the maths:
 [`main/controllers/pose_imitation_controller/README.md`](main/controllers/pose_imitation_controller/README.md).
 
 > Full requirements specification: [`docs/PRD.md`](docs/PRD.md)

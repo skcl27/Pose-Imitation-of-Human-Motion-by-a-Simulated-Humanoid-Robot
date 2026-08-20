@@ -324,6 +324,9 @@ def _seg(origin, out, length, roll, pitch):
 STANDING = subject()
 LEFT_LEG_UP = subject(left_leg=(0.0, -1.0, 1.4))
 SQUAT = subject(left_leg=(0.0, -0.55, 1.1), right_leg=(0.0, -0.55, 1.1))
+# Legs spread outward: both hips abducted by the same amount.
+LEGS_APART = subject(left_leg=(0.35, 0.0, 0.0), right_leg=(0.35, 0.0, 0.0))
+LEGS_WIDE = subject(left_leg=(0.70, 0.0, 0.0), right_leg=(0.70, 0.0, 0.0))
 MARCH_GAIT = {"state": "march", "cadence_hz": 0.9, "phase": 0.5, "swing_side": 1,
               "intensity": 0.8, "turn": 0.0, "conf": 0.95,
               "body_yaw_rad": 0.0, "yaw_conf": 0.95}
@@ -386,6 +389,51 @@ def test_squat_reaches_the_knees(harness) -> None:
     assert harness.angle("LKneePitch") > straight + 0.15
     # Symmetric: a squat must not become a lean.
     assert abs(harness.angle("LKneePitch") - harness.angle("RKneePitch")) < 0.05
+
+
+def test_spreading_the_legs_actually_widens_the_stance(harness) -> None:
+    """A wider stance is CoM-neutral and *enlarges* the support polygon, so it is
+    safer than standing and must pass through at full authority. Gating it like a
+    lean turned a 20 deg human spread into a 6 deg robot one."""
+    harness.spin(150, STANDING, IDLE_GAIT)
+    assert abs(harness.angle("LHipRoll")) < 0.03      # feet together
+    harness.spin(200, LEGS_APART, IDLE_GAIT)
+    # NAO's roll signs are mirrored: +L and -R both mean outward.
+    assert harness.angle("LHipRoll") > 0.25
+    assert harness.angle("RHipRoll") < -0.25
+    # Both soles stay flat -- otherwise the robot stands on its inner edges.
+    for side in ("L", "R"):
+        assert harness.angle(f"{side}HipRoll") + harness.angle(f"{side}AnkleRoll") \
+            == pytest.approx(0.0, abs=0.02)
+
+
+def test_a_very_wide_spread_saturates_instead_of_tipping(harness) -> None:
+    harness.spin(150, STANDING, IDLE_GAIT)
+    harness.spin(200, LEGS_WIDE, IDLE_GAIT)
+    roll = harness.angle("LHipRoll")
+    # Capped by the ankle's ability to level the sole, not by the hip's range.
+    assert 0.35 < roll <= abs(CONFIGS["LAnkleRoll"].min_angle) + 1e-6
+    assert roll < CONFIGS["LHipRoll"].max_angle          # hip could go further
+
+
+def test_the_legs_come_back_together(harness) -> None:
+    harness.spin(150, STANDING, IDLE_GAIT)
+    harness.spin(200, LEGS_APART, IDLE_GAIT)
+    assert harness.angle("LHipRoll") > 0.25
+    harness.spin(200, STANDING, IDLE_GAIT)
+    assert abs(harness.angle("LHipRoll")) < 0.05
+
+
+def test_raising_one_leg_reaches_the_full_requested_lift(harness) -> None:
+    """The reported symptom was a leg lift doing nothing. Assert it goes all the
+    way: the CoM model permits it once the weight really has transferred."""
+    harness.spin(150, STANDING, IDLE_GAIT)
+    harness.spin(300, LEFT_LEG_UP, IDLE_GAIT)
+    meta = harness.ctl.driver.lower_body_meta
+    assert meta["gate"] == pytest.approx(1.0, abs=1e-6)
+    assert meta["lift"] > 0.9
+    assert harness.angle("LKneePitch") > 1.0             # knee clearly folded
+    assert harness.angle("LHipPitch") < -0.8             # thigh clearly raised
 
 
 def test_raising_one_leg_transfers_weight_then_lifts(harness) -> None:
@@ -727,3 +775,32 @@ def test_the_status_line_always_explains_itself(harness) -> None:
     assert isinstance(why, str) and why
     harness.spin(200, LEFT_LEG_UP, IDLE_GAIT)
     assert "stepping" in harness.ctl.driver.lower_body_meta["why"]
+
+
+def test_unresponsive_foot_sensors_reduce_the_lift_but_do_not_block_it(
+        controller_module, monkeypatch) -> None:
+    """A proto whose FSRs read a constant 50/50 used to forbid every step
+    forever -- a silent, permanent "leg lift does nothing"."""
+    class StaticFsr(FakeVector3):
+        def getValues(self):  # noqa: N802
+            return [0.0, 0.0, 26.0]
+
+    original = FakeRobot.__init__
+
+    def patched(self, *, with_fsr=True):
+        original(self, with_fsr=with_fsr)
+        self.devices["LFsr"] = StaticFsr()
+        self.devices["RFsr"] = StaticFsr()
+
+    monkeypatch.setattr(FakeRobot, "__init__", patched)
+    h = Harness(controller_module)
+    try:
+        h.spin(150, STANDING, IDLE_GAIT)
+        h.spin(300, LEFT_LEG_UP, IDLE_GAIT)
+        meta = h.ctl.driver.lower_body_meta
+        assert meta["fsr_share"] == pytest.approx(0.5, abs=0.01)
+        assert 0.0 < meta["lift"] < 0.8            # reduced, not refused
+        assert h.angle("LKneePitch") > h.angle("RKneePitch") + 0.2
+        assert "reduced authority" in str(meta["why"])
+    finally:
+        h.close()
