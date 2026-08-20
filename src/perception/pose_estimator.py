@@ -65,7 +65,7 @@ class PoseEstimator:
             # or incompatible wheels (e.g. for Python 3.13) may import but not
             # expose `solutions` — provide a clearer error in that case.
             self._mp_pose = mp.solutions.pose
-        except AttributeError as exc:
+        except AttributeError as exc: 
             msg = (
                 "Imported `mediapipe` module does not expose `solutions` (mp.solutions).\n"
                 "This commonly happens when MediaPipe is not compatible with the current Python\n"
