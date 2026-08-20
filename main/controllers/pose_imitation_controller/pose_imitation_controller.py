@@ -23,6 +23,15 @@ Exactly ONE of those four commands the legs on any given step -- two of them at
 once means the layers fight and the robot falls, which is the single most common
 way a humanoid imitation controller breaks.
 
+A fifth, always-on layer runs underneath the arbiter every tick regardless of
+which of the four is active: a continuous tilt-risk EMA (_update_tilt_risk)
+that makes _settled() progressively stricter about starting the next
+locomotion clip after a wobble. It never touches an in-progress clip -- see
+the MotionPlayer docstring for why -- only whether the *next* one is allowed
+to start, so a rough patch degrades to march-in-place/pose-imitation (both
+fall-safe by design) for a while instead of only reacting once a clip is
+already failing.
+
 Protocol (UDP, port 8765, JSON):
     {
       "timestamp_s": 1234567890.123,
@@ -135,8 +144,16 @@ MOTION_WATCHDOG_S = 8.0
 # this session. Falling over repeatedly is worse than never walking.
 MOTION_MAX_FAILURES = 3
 # A clip is only started from a settled, upright robot: starting one mid-wobble
-# is how a walk turns into a fall.
+# is how a walk turns into a fall. This ceiling is not fixed: it shrinks
+# continuously (see _tilt_risk / _settled) toward MOTION_START_MIN_TILT_RAD as
+# recent tilt trends upward, so the controller keeps declining to start another
+# clip for a while after a wobble instead of only reacting once mid-clip.
 MOTION_START_MAX_TILT_RAD = 0.15
+MOTION_START_MIN_TILT_RAD = 0.05
+# EMA time constant for the continuous tilt-risk signal, updated every control
+# step (independent of which leg-control layer is active) from the same
+# predicted-tilt formula the hard abort below already trusts.
+TILT_RISK_TAU_S = 1.5
 
 # The control loop must survive a bad step. An exception used to end run(),
 # which then called driver.stop() and set every motor velocity to zero -- a
@@ -359,6 +376,10 @@ class PoseImitationController:
         self._motion_deadline: Optional[float] = None
         self._motion_failures = 0
         self._errors = 0
+        # Continuous tilt-risk EMA (see _update_tilt_risk / _settled): runs every
+        # tick regardless of which leg-control layer is active.
+        self._tilt_risk = 0.0
+        self._last_risk_update: Optional[float] = None
         self._report_startup()
 
     def _report_startup(self) -> None:
@@ -567,12 +588,34 @@ class PoseImitationController:
             now_s=now,
         )
 
-    def _falling(self, roll: float, pitch: float) -> bool:
-        """Tilt (predicted a short time ahead by the gyro) past the abort limit."""
+    def _predicted_tilt_rad(self, roll: float, pitch: float) -> float:
+        """Worst-axis tilt magnitude, predicted a short time ahead by the gyro.
+
+        Shared by the hard mid-clip abort (_falling) and the continuous
+        pre-clip risk signal (_update_tilt_risk) so there is one formula, not
+        two definitions of "how tipped over are we" drifting apart.
+        """
         d_roll, d_pitch = self._tilt_rate()
         roll_pred = roll + TILT_RATE_LEAD_S * d_roll
         pitch_pred = pitch + TILT_RATE_LEAD_S * d_pitch
-        return abs(roll_pred) > TILT_ABORT_RAD or abs(pitch_pred) > TILT_ABORT_RAD
+        return max(abs(roll_pred), abs(pitch_pred))
+
+    def _falling(self, roll: float, pitch: float) -> bool:
+        """Tilt (predicted a short time ahead by the gyro) past the abort limit."""
+        return self._predicted_tilt_rad(roll, pitch) > TILT_ABORT_RAD
+
+    def _update_tilt_risk(self, now: float, roll: float, pitch: float) -> None:
+        """Advance the continuous tilt-risk EMA. Called once per tick, before
+        the arbiter picks a leg-control layer, so it tracks balance risk
+        regardless of which layer is currently driving the legs -- the
+        "always on" check that _settled() leans on to keep the robot from
+        launching a new locomotion clip too soon after a wobble.
+        """
+        mag = self._predicted_tilt_rad(roll, pitch)
+        dt = 0.0 if self._last_risk_update is None else max(0.0, now - self._last_risk_update)
+        self._last_risk_update = now
+        alpha = 1.0 - math.exp(-dt / TILT_RISK_TAU_S) if dt > 0 else 1.0
+        self._tilt_risk += alpha * (mag - self._tilt_risk)
 
     def _marching(self) -> bool:
         gait = self.gait_cmd or {}
@@ -678,8 +721,19 @@ class PoseImitationController:
         self.driver.balance_tick(torso_rp)
 
     def _settled(self, roll: float, pitch: float) -> bool:
-        """Is the robot upright and calm enough to hand over to a clip?"""
-        if abs(roll) > MOTION_START_MAX_TILT_RAD or abs(pitch) > MOTION_START_MAX_TILT_RAD:
+        """Is the robot upright and calm enough to hand over to a clip?
+
+        The allowed tilt window is not fixed: it shrinks continuously from
+        MOTION_START_MAX_TILT_RAD toward MOTION_START_MIN_TILT_RAD as recent
+        tilt risk (self._tilt_risk) climbs toward TILT_ABORT_RAD, so the
+        controller keeps declining to start another clip for a while after a
+        wobble instead of only reacting once mid-clip.
+        """
+        risk_frac = max(0.0, min(1.0, self._tilt_risk / TILT_ABORT_RAD))
+        ceiling = MOTION_START_MAX_TILT_RAD - risk_frac * (
+            MOTION_START_MAX_TILT_RAD - MOTION_START_MIN_TILT_RAD
+        )
+        if abs(roll) > ceiling or abs(pitch) > ceiling:
             return False
         d_roll, d_pitch = self._tilt_rate()
         return abs(d_roll) < 1.0 and abs(d_pitch) < 1.0
@@ -802,6 +856,7 @@ class PoseImitationController:
 
         self.driver.read_feedback()
         roll, pitch, yaw = self._imu_rpy()
+        self._update_tilt_risk(now, roll, pitch)
         self._update_yaw_servo(now, yaw)
         self._drive_legs(now, roll, pitch, yaw)
 

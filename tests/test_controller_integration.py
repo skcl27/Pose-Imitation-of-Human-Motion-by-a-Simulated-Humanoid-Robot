@@ -702,6 +702,28 @@ def test_a_clip_is_not_started_while_the_robot_is_wobbling(harness) -> None:
     assert "Forwards.motion" in FakeMotion.played    # ... and once calm, it goes
 
 
+def test_a_clip_stays_blocked_for_a_while_after_a_tilt_spike(harness) -> None:
+    """A wobble that never crosses TILT_ABORT_RAD (so it never mid-clip-aborts
+    anything, and nothing is even playing yet) should still make the
+    controller more cautious about STARTING the next clip for a while -- the
+    continuous tilt-risk EMA, not just the binary settle threshold."""
+    harness.spin(60, STANDING, IDLE_GAIT)
+    # A tilt spike under TILT_ABORT_RAD (0.40) but over the old fixed
+    # MOTION_START_MAX_TILT_RAD (0.15) ceiling, held long enough to build risk.
+    harness.ctl.imu.rpy = [0.35, 0.0, 0.0]
+    harness.spin(150, STANDING, IDLE_GAIT)          # ~3s, ~2 EMA time constants
+    # Settle back to a tilt that would have passed the OLD fixed ceiling...
+    harness.ctl.imu.rpy = [0.10, 0.0, 0.0]
+    mode = harness.spin(20, STANDING, MARCH_GAIT)
+    # ... but risk is still elevated right after the wobble, so no clip yet.
+    assert not FakeMotion.played
+    assert mode == "pose"
+    # Give risk time to decay back down toward the current (calmer) tilt.
+    harness.spin(400, STANDING, IDLE_GAIT)          # ~8s, several time constants
+    harness.spin(20, STANDING, MARCH_GAIT)
+    assert "Forwards.motion" in FakeMotion.played   # ... and once it has, it goes
+
+
 def test_a_failing_step_does_not_end_the_loop_or_limp_the_robot(harness) -> None:
     """One transient error used to break run(), which then zeroed every motor
     velocity -- a permanently dead robot from a single bad frame."""
