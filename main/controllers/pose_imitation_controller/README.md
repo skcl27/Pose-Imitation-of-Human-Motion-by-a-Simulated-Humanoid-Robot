@@ -1,153 +1,290 @@
 # Webots NAO Pose Imitation Controller
 
-Real-time control system for the simulated **NAO (H25)** humanoid robot based on
-human pose tracking.
+Real-time control of the simulated **NAO (H25)** humanoid from human pose
+tracking: arms, head, legs, and genuine locomotion — the robot squats when you
+squat, lifts the leg you lift, walks across the floor when you walk, and turns
+its whole body to face where you face.
 
-## Overview
+---
 
-This system enables the Webots NAO robot to imitate human movements in real-time by:
-1. Capturing human pose with MediaPipe (up to 33 landmarks per frame) — Python side
-2. Mapping human pose to generic joint angles — Python side (`src/retargeting/`)
-3. Sending joint commands via UDP (port 8765) to the Webots controller
-4. The controller **re-maps those angles to NAO's joint conventions**, smooths,
-   clamps to mechanical limits, and drives the motors while holding balance
+## 1. Architecture
 
-### Architecture
-
-The Python pipeline streams, per frame, **both** raw MediaPipe landmarks and a
-small set of pre-computed joint angles. The controller prefers the landmarks and
-does **full-body retargeting** itself; the joint angles are a fallback.
-
-- [`main/libraries/nao_retarget.py`](../../libraries/nao_retarget.py) — landmarks → NAO joints (shoulder pitch+roll, elbow, head, optional legs)
-- [`main/libraries/pose_control_utils.py`](../../libraries/pose_control_utils.py) — `NaoPoseDriver` (limits, smoothing, standing balance) + logging
-- the two controller files are thin Webots/UDP wrappers
+The Python pipeline is a generic *pose source*. Everything NAO-specific (joint
+axes, signs, limits, balance, gait) lives here, on the robot side.
 
 ```
-UDP frame ─► controller (socket loop)
-                 │  keypoints (preferred)         joint_angles_rad (fallback)
-                 ▼                                       │
-            retarget_full_body()  ◄──────────────────────┘ map_pipeline_angles()
-                 │  NAO joint targets
-                 ▼
-            NaoPoseDriver
-                 │  1. clamp to NAO limits     (FR-5)
-                 │  2. exponential smoothing   (FR-6)
-                 │  3. setPosition + capped velocity
-                 ▼
-            NAO motors  (+ standing posture held for balance — NFR-4)
+Python pipeline (src/)                    Webots controller (this folder)
+──────────────────────                    ────────────────────────────────
+MediaPipe 33 landmarks                    pose_imitation_controller.py
+  ├─ raw landmarks ───────── UDP 8765 ──►    ├─ arms + head
+  ├─ gait cues (cadence,                     │    nao_retarget.retarget_upper_body
+  │   phase, body_yaw_rad)                   └─ legs: EXACTLY ONE of ↓
+  └─ legacy joint angles                          1. locomotion  (motion clips)
+     (fallback)                                   2. march engine (in place)
+                                                  3. pose imitation (per-leg)
+                                                  4. stand (balance only)
+                                                        │
+                                                   NaoPoseDriver
+                                                   clamp → smooth → setPosition
 ```
 
-### What follows the human (full body)
+**Exactly one layer commands the 12 leg joints on any given simulation step.**
+Two at once means they fight each other and the robot falls; that single rule is
+what the arbiter in `pose_imitation_controller._drive_legs` exists to enforce.
+
+| Library | Responsibility | Webots-free? |
+|---|---|---|
+| [`nao_retarget.py`](../../libraries/nao_retarget.py) | landmarks → NAO angles (arms, head, and the closed-form per-leg solve) | ✅ |
+| [`lower_body.py`](../../libraries/lower_body.py) | *may* the robot execute this leg pose? weight-shift / lift sequencer | ✅ |
+| [`gait.py`](../../libraries/gait.py) | in-place march engine (gait command → leg motion) | ✅ |
+| [`balance.py`](../../libraries/balance.py) | model-based CoM balance (FK + link masses + Fibonacci search) | ✅ |
+| [`walk_motion.py`](../../libraries/walk_motion.py) | motion-clip discovery, yaw servo, locomotion planning | ✅ |
+| [`pose_control_utils.py`](../../libraries/pose_control_utils.py) | `NaoPoseDriver`: limits, smoothing, velocity caps, logging | ✅ |
+| `pose_imitation_controller.py` | Webots glue: sockets, devices, motion playback, arbitration | ❌ |
+
+Every library is Webots-free on purpose, so all of the maths is unit-tested on a
+dev machine that has no Webots installed (`pytest -q`).
+
+---
+
+## 2. What follows the human
+
+### Upper body
+
+| Human motion | NAO joints | How |
+|---|---|---|
+| Arm up / down | `ShoulderPitch` | vertical component of the upper-arm direction |
+| Arm out sideways | `ShoulderRoll` | lateral component of the same direction |
+| Elbow bend | `ElbowRoll` | angle between upper-arm and forearm |
+| Head turn / nod | `HeadYaw`, `HeadPitch` | nose vs. shoulder midline |
+
+NAO's 2-DOF shoulder is recovered from the single observed arm direction by
+splitting it into a vertical part (pitch) and a lateral part (roll). Depth-free,
+so it is robust for a frontal camera.
+
+### Legs — the closed-form per-leg solve
+
+For a thigh at hip roll `φ` and hip pitch `θ`, its direction in the torso frame is
+
+```
+R_x(φ) · R_y(θ) · (0,0,−1) = ( −sin θ , sin φ·cos θ , −cos φ·cos θ )
+                                ^forward  ^lateral      ^vertical
+```
+
+A frontal camera observes the **lateral** and **vertical** components directly —
+forward is the foreshortened, unobservable axis — which makes the system exactly
+solvable:
+
+```
+d  = −up_obs        = cos φ·cos θ
+φ  = atan2(lat_obs, d)                  ← abduction, fully observable
+θ  = ± acos(d / cos φ)                  ← magnitude from foreshortening
+```
+
+The only ambiguity a single frontal view leaves is the **sign** of `θ` (thigh
+forward or backward). That comes from the landmark depth `z` with a deadband and
+a documented bias toward *forward* — human knee lifts are forward, and NAO's
+`HipPitch` range (−88°…+27.7°) is mostly forward anyway.
+
+The shank shares the hip roll and adds `KneePitch` about the same axis, so the
+identical solve on knee→ankle yields `θ_hip + θ_knee`; the sole is then levelled
+by `AnklePitch = −(θ_hip + θ_knee)` and `AnkleRoll = −φ`. Segment reference
+lengths are learned from the stream by a peak-hold tracker normalized by torso
+length, so there is **no calibration step** and the result is scale-invariant.
 
 | Human motion | NAO joints | Notes |
 |---|---|---|
-| Arm up / down | `ShoulderPitch` | vertical component of the upper-arm |
-| Arm left / right (abduction) | `ShoulderRoll` | lateral component — **now working** |
-| Elbow bend | `ElbowRoll` | angle between upper-arm and forearm |
-| Head turn / nod | `HeadYaw`, `HeadPitch` | from nose vs. shoulder midline (`DRIVE_HEAD`) |
-| Legs (hip/knee/ankle) | `HipPitch`, `KneePitch`, `AnklePitch` | `DRIVE_LEGS` — **off by default**, no balance controller yet |
+| Squat | `HipPitch`, `KneePitch`, `AnklePitch` (symmetric) | full authority — symmetric crouch is statically stable by construction |
+| Leg out sideways | `HipRoll`, `AnkleRoll` | bounded authority in double support |
+| **Raise one leg** | that leg's whole chain | gated: weight transfers to the stance foot first (§3) |
+| Walk / march | walk clips, or the march engine | §4 |
+| **Turn your body** | stepping turn (heading servo) | §5 |
 
-The shoulder is the key part: NAO's 2-DOF shoulder is recovered from the single
-observed arm direction by splitting it into a vertical part (`ShoulderPitch`) and
-a lateral part (`ShoulderRoll`) — depth-free, so it is robust for a frontal
-camera. Every joint is gated on landmark **visibility**, so anything out of frame
-(usually the legs) is simply not commanded and the driver holds its last pose.
+---
 
-**Tunables** (top of each controller): `DRIVE_HEAD`, `DRIVE_LEGS`,
-`SWAP_SIDES` (mirror-image mapping), `SMOOTHING_ALPHA`, `VELOCITY_SCALE`.
-If left/right feels mirrored the wrong way, set `SWAP_SIDES = True`.
+## 3. Lifting one foot: LOAD → SINGLE → UNLOAD
 
-## Real-time walking (gait engine)
-
-The robot also **replicates the human's walk** — but it does *not* copy raw leg
-angles (monocular depth is unreliable and a direct leg-copy topples a
-free-standing NAO). Instead the Python side distils the human's lower body into a
-small **gait command** and an on-robot engine turns that into balance-stable leg
-motion that tracks your cadence, phase, swing side and stop.
+Raising a foot on a free-standing biped is three actions, not one. Skipping the
+first two is why a raised leg used to produce no visible response at all.
 
 ```
-human legs ─► GaitCueExtractor (src/perception/gait_cues.py, Python)
-                 │  {state, cadence_hz, phase, swing_side, intensity, conf}
-                 ▼  (added to the UDP packet as "gait")
-            controller ─► NaoPoseDriver.gait_tick()
-                 ▼
-            GaitEngine (main/libraries/gait.py)  ── own sim-time phase clock,
-                 │   phase-locked to the human, amp_gain ramps 0↔1
-                 ▼
-            12 leg-joint targets  +  symmetric CoM balance (double support)
+    human raises a foot
+            │
+            ▼
+   ┌──── LOAD ────┐   lean so the CoM moves over the STANCE foot.
+   │              │   The lean sign is PROBED against balance.NaoCoMModel,
+   │              │   not hard-coded — a wrong lean sign makes a balance
+   │              │   loop tip faster, and probing makes that impossible.
+   │              ▼
+   │      stance_margin > 0 ?   ← forward kinematics + link masses,
+   │              │               plus the foot force sensors when present
+   │              ▼
+   │  ┌─── SINGLE ───┐  the swing leg follows the human's leg, its
+   │  │              │  authority scaled CONTINUOUSLY by that margin
+   │  ▼              ▼
+   └── UNLOAD ◄──── human lowers the foot / margin lost / torso tilts
+            │
+            ▼
+     symmetric crouch (the proven no-fall baseline)
 ```
 
-**Two tiers** (set `WALK_TIER` at the top of `pose_imitation_controller.py`):
+Both `shift` and `lift` are rate-limited blends in `[0, 1]`, so there are no
+discrete jumps and no state that can get stuck: the controller can always ramp
+back to the exact symmetric crouch.
 
-| `WALK_TIER` | What it does | Stability |
-|---|---|---|
-| `"march"` *(default)* | **Tier A** double-support weight-shift march: alternating knee pump + small lateral CoM sway in time with your cadence/phase. **Never fully unloads a foot**, so the existing symmetric balance loop stays valid. Reads as marching / walking-in-place. | No-fall by design |
-| `"step"` | **Tier B** single-support stepping (real foot lift). Only lifts a foot when the CoM model (and foot-force sensors, if present) confirm it is safe, else collapses to double support. | **Experimental** — unproven on a free-standing NAO; opt-in |
-| `"stand"` | Legs held in the static crouch (walk engine idle). | — |
+The commanded posture is `crouch_posture(u)` — the squat whose
+`Hip + Knee + Ankle = 0` keeps the torso vertical and the soles flat — **plus**
+the human's per-leg *deviation from* that posture, authority-weighted. So the
+symmetric part never leaves the proven-stable family, only the asymmetric detail
+is gated, and a subject standing still produces a deviation of exactly zero.
 
-Safety invariants: the engine **always** decays smoothly back to the symmetric
-crouch on stop / low confidence / stale frames / excess torso tilt — it never
-freezes mid-step. With `ENABLE_WALK = False` the behaviour is byte-identical to
-the previous crouch + balance baseline. Master switch on the Python side:
-`walk.enabled` in `configs/default.yaml`.
+Safety gates, all of which stand the robot down: torso tilt past
+`tilt_abort_rad`, lower-body landmark confidence below `conf_min`, "both feet
+up" (a jump, or bad tracking — never a step), and foot force sensors reporting
+the weight has *not* transferred. Without a CoM model (no NumPy) the lift is
+hard-capped by `ungated_lift_cap` rather than cancelled — the tilt abort remains
+the safety net.
 
-**Walk tunables** (top of `pose_imitation_controller.py`): `ENABLE_WALK`,
-`WALK_TIER`, `GAIT_SMOOTHING_ALPHA`, `GAIT_LEG_VELOCITY_FACTOR`. Gait waveform
-amplitudes (knee bob, sway, step height, cadence cap, tilt abort) live in
-`GaitParams` in `main/libraries/gait.py`.
+Tuning lives in `LowerBodyParams` in [`lower_body.py`](../../libraries/lower_body.py).
 
-### Why a mapping layer is required
+---
 
-The Python pipeline emits angles in a neutral convention that does **not** match
-NAO's joints. The driver corrects this:
+## 4. Real locomotion
 
-| Issue | Pipeline sends | NAO expects | Correction |
-|---|---|---|---|
-| Left elbow | `LElbowRoll` **positive** when bent | **negative** (-1.54 … -0.03) | negate |
-| Right elbow | `RElbowRoll` **negative** when bent | **positive** (0.03 … 1.54) | negate |
-| Shoulder pitch | arm-down ≈ -1.57 | arm-down ≈ +1.57 | negate |
-| Torso | `TorsoPitch` | *no such motor on NAO* | dropped |
+The robot **actually translates across the floor** by playing Webots' own
+pre-balanced NAO `.motion` clips (`Forwards`, `TurnLeft60`, …). Those clips are
+tuned by Cyberbotics for this exact robot; an online gait good enough to walk a
+free-standing NAO is a research project in itself, and a Supervisor
+base-teleport explodes the physics.
 
-Without this layer `Motor.setPosition()` silently clamps the elbows straight and
-they never bend — which is the bug the previous controller hit.
+Two details make the difference between a walk and a stumble:
 
-## Controllers
+1. **Velocity caps must be lifted.** `Motion` playback works by calling
+   `setPosition` on every joint each step. A motor still limited to ~25 % of its
+   maximum velocity cannot reach those keyframes, so the pre-balanced gait
+   arrives late at every foot placement and the robot topples.
+   `NaoPoseDriver.release_to_motion()` raises the caps and suspends per-joint
+   commanding; `reclaim_from_motion()` reseeds the smoothers from the position
+   sensors so control returns without a jolt.
+2. **Clips play to completion.** A clip boundary is a balanced double-support
+   pose — the only safe place to hand control back. Clips are therefore never
+   looped and never cut short (except by the tilt abort), which also makes clip
+   length the latency of "stop walking". That is why the short
+   `Forwards.motion` is preferred over `Forwards50.motion`.
 
-### 1. `pose_imitation_controller.py` (Standard) — **recommended**
+If no clips are found on disk the controller says so in the log and falls back
+to the **march engine** (`gait.py`), which tracks your cadence, phase and stop
+but marches in place.
 
-- Re-maps pipeline angles to NAO conventions and clamps to limits
-- Exponential smoothing + per-joint velocity caps for smooth motion
-- Holds a stable standing posture (legs straight & stiff) so NAO does not fall
-- Drains the UDP backlog each step and applies only the freshest frame (low latency)
-- Holds the last pose if commands stop arriving (stale detection)
-- Position-sensor feedback + stuck-motor warnings
-- This is the controller wired into the world file's `Nao { controller ... }`
+---
 
-### 2. `pose_imitation_controller_advanced.py` (Advanced)
+## 5. Turning: a heading servo, not a gesture
 
-Same `NaoPoseDriver` core, tuned for experimentation:
-- Smoother (laggier) motion settings
-- Optional **leg driving** (`DRIVE_LEGS = True`) for lower-body experiments —
-  off by default because NAO has no balance controller yet and will fall
-- Verbose per-joint diagnostics (commanded vs. measured, average error, stuck flags)
+NAO has no torso-yaw joint, so "the human turned round" cannot be imitated by a
+joint angle — the robot has to step round. And it cannot be done open-loop
+("turned left → play one left-turn clip"), because clip and human turn by
+different amounts and the error accumulates.
 
-**Both controllers require** the shared `pose_control_utils.py` library (auto-added
-to `sys.path`).
+```
+ human torso yaw  ──┐
+ (gait_cues: atan2  │   desired = robot_yaw_at_latch
+  of the shoulder   ├──►           + (human_yaw − human_yaw_at_latch)
+  line's depth      │   error   = wrap_pi(desired − InertialUnit yaw)
+  spread over its   │                    │
+  lateral extent)   │                    ▼
+ robot IMU yaw ─────┘        plan_action → turn_left / turn_right clip
+```
 
-### Output: joint-trajectory log (FR-7 / US-3)
+Because the error is measured against the robot's **real** heading every step,
+the rotation converges despite coarse clips and noisy tracking, and it works
+while standing perfectly still. `plan_action` also refuses a clip that would
+overshoot (a 60° clip is not fired at a 15° error), so the residual heading error
+is bounded by half a clip. Aligning the heading takes priority over walking
+forward: walking off along the wrong heading is much harder to undo.
 
-With `ENABLE_TRAJECTORY_LOG = True` (default), each run writes a CSV to
-`<project>/logs/webots_joint_trajectory_<epoch>.csv` containing, per simulation
-frame: `wall_time_s, sim_time_s, frame_index`, and for every driven joint a
-`<joint>_cmd_rad` (commanded) and `<joint>_meas_rad` (achieved, from the position
-sensor) column. This is the data the evaluation step uses to compute per-joint
-MAE (target vs. achieved) and timing. Logging is fully defensive — any I/O error
-disables it without disturbing the real-time loop. The `logs/` directory is
-git-ignored.
+While the stepping turn has not fired yet, a small capped `HipYawPitch` bias
+gives immediate visual feedback. It is deliberately tiny — NAO's `HipYawPitch`
+axis is canted 45°, so it splays the legs as well as yawing the pelvis — and it
+is suppressed mid-step.
 
-## Communication Protocol
+If the robot turns the *wrong way* for your camera setup, flip `TURN_SIGN` at the
+top of the controller. (One sign knob, rather than a sign buried in the geometry:
+with the pipeline's default mirrored selfie preview the robot mirrors the
+on-screen figure, which is consistent with how the arms are mapped.)
 
-The controllers receive JSON-formatted UDP packets on **port 8765**:
+---
+
+## 6. Configuration
+
+### `LEG_CONTROL` — the one knob that matters
+
+At the top of `pose_imitation_controller.py`:
+
+| Value | Behaviour |
+|---|---|
+| `"auto"` *(default)* | Full stack: motion clips for real walking/turning, march engine when no clips exist, per-leg pose imitation otherwise. |
+| `"pose"` | Per-leg pose imitation only. Squat and single-leg lift work; the robot never leaves its spot. |
+| `"engine"` | March engine + pose imitation, never the clips. Marches in place. |
+| `"off"` | Legs held in the standing posture. Upper body only. |
+
+### Other tunables
+
+| Name | Meaning |
+|---|---|
+| `DRIVE_HEAD` | head follows the human head |
+| `SWAP_SIDES` | mirror-image mapping (set `True` if left/right feels reversed) |
+| `SMOOTHING_ALPHA` | EMA on arm/head targets (higher = snappier) |
+| `VELOCITY_SCALE`, `LEG_VELOCITY_FACTOR` | fraction of hardware max velocity |
+| `GAIT_SMOOTHING_ALPHA`, `GAIT_LEG_VELOCITY_FACTOR` | the same, for legs while stepping/marching |
+| `ENABLE_BALANCE` | model-based CoM feedback |
+| `WALK_TIER` | march engine tier (`"march"` / `"step"` / `"stand"`) |
+| `TURN_SIGN` | flip the turn direction |
+| `TILT_ABORT_RAD`, `TILT_RATE_LEAD_S` | fall detection (the gyro term predicts ahead) |
+| `LOCOMOTION` | `LocomotionParams`: yaw gates, overshoot guard, walk thresholds |
+| `MOTION_SEARCH_DIRS_EXTRA` | extra folders to search for `.motion` clips |
+
+Deeper tuning: `LowerBodyParams` in `lower_body.py`, `GaitParams` in `gait.py`,
+`BalanceParams` in `balance.py`.
+
+Python side: `configs/default.yaml` (`walk.enabled` is the master switch for
+streaming gait/yaw cues at all).
+
+---
+
+## 7. World requirements (do not skip)
+
+`main/worlds/…​.wbt` **must** define the foot/floor contact pair:
+
+```
+WorldInfo {
+  basicTimeStep 20
+  contactProperties [
+    ContactProperties {
+      material2 "NAO foot material"
+      coulombFriction [ 8 ]
+      bounce 0
+      bounceVelocity 0.003
+    }
+  ]
+}
+```
+
+`Nao.proto` tags its soles with the contact material `"NAO foot material"`. With
+no matching `ContactProperties`, the sole/floor pair silently falls back to
+Webots' default contact (`coulombFriction 1`, bouncy) — the feet **slide and
+jitter**, the robot cannot load one foot or take a step, and the leg controller
+looks *frozen* because every leg command is absorbed by foot slip. This is the
+single most common cause of "the legs do not respond".
+
+`basicTimeStep` must be ≤ 20 ms. Webots' default of 32 ms is too coarse for NAO
+leg control and destabilises the pre-balanced walk clips; the controller logs a
+warning if it finds a larger value.
+
+---
+
+## 8. Communication protocol
+
+UDP JSON on **port 8765**:
 
 ```json
 {
@@ -155,245 +292,145 @@ The controllers receive JSON-formatted UDP packets on **port 8765**:
   "frame_index": 45,
   "joint_angles_rad": { "LShoulderPitch": 0.5, "RElbowRoll": -1.1 },
   "keypoints": {
-    "left_shoulder":  [0.40, 0.40, -0.1, 0.99],
-    "left_elbow":     [0.22, 0.40, -0.1, 0.98],
-    "left_wrist":     [0.06, 0.40, -0.1, 0.97],
-    "right_shoulder": [0.60, 0.40, -0.1, 0.99],
-    "nose":           [0.50, 0.22, -0.2, 0.99]
+    "left_shoulder": [0.40, 0.40, -0.1, 0.99],
+    "left_hip":      [0.46, 0.55, -0.1, 0.98],
+    "left_knee":     [0.46, 0.73, -0.1, 0.97],
+    "left_ankle":    [0.46, 0.91, -0.1, 0.95],
+    "left_heel":     [0.45, 0.93, -0.1, 0.93]
   },
   "gait": {
-    "state": "march", "cadence_hz": 0.95, "phase": 1.83,
-    "swing_side": 1, "intensity": 0.7, "turn": 0.0, "conf": 0.98
+    "state": "march", "cadence_hz": 0.95, "phase": 1.83, "swing_side": 1,
+    "intensity": 0.7, "turn": 0.4, "conf": 0.98,
+    "body_yaw_rad": 0.42, "yaw_conf": 0.99
   }
 }
 ```
 
-### Fields:
-- **timestamp_s**: Frame timestamp in seconds
-- **frame_index**: Frame number from pipeline
-- **keypoints** *(preferred)*: MediaPipe landmarks `name → [x, y, z, visibility]`
+- **`keypoints`** *(preferred)* — MediaPipe landmarks `name → [x, y, z, visibility]`
   in normalized image coordinates (`x` right, `y` down, both 0–1). The controller
-  retargets these to the full NAO pose. A curated subset (~17 landmarks: head,
-  shoulders, elbows, wrists, hips, knees, ankles) is streamed to keep packets small.
-- **joint_angles_rad** *(fallback)*: pre-computed joint angles, used only when no
-  `keypoints` are present.
-- **gait** *(optional, real-time walking)*: compact gait command for the on-robot
-  walk engine — `state` (`idle`/`march`), `cadence_hz`, `phase` (rad), `swing_side`
-  (±1), `intensity` (0–1), `turn` (−1…1), `conf` (0–1). Additive and
-  backward-compatible: controllers without the walk engine ignore it.
+  retargets these itself. ~21 landmarks are streamed (head, shoulders, elbows,
+  wrists, hips, knees, ankles, **heels and toes**) to keep packets small. The
+  heels matter: the controller finds the "ground line" as the lower of the two
+  feet, and averaging ankle with heel makes lift detection markedly steadier.
+- **`joint_angles_rad`** *(fallback)* — used only when no `keypoints` are present.
+- **`gait`** *(optional)* — cadence/phase/stop for the march engine, plus
+  `body_yaw_rad` (**an angle**, so the controller can close a heading loop on it)
+  and `yaw_conf`, which is independent of `conf` because the yaw needs only the
+  shoulders and hips and stays usable when the legs leave the frame.
 
-## Supported Joints (NAO H25 hardware ranges)
+Additive and backward compatible: an older controller ignores fields it does not
+know.
 
-These are the **actual NAO motor ranges** the driver clamps to. Note the elbow
-sign convention — it is the opposite of what the pipeline sends, which is why the
-driver negates those channels.
+---
 
-| Pipeline key | NAO motor | NAO range | Driven by default |
-|---|---|---|---|
-| LShoulderPitch | LShoulderPitch | -119.5° to +119.5° | ✅ (negated) |
-| RShoulderPitch | RShoulderPitch | -119.5° to +119.5° | ✅ (negated) |
-| LElbowRoll | LElbowRoll | **-88.5° to -2°** | ✅ (negated) |
-| RElbowRoll | RElbowRoll | **+2° to +88.5°** | ✅ (negated) |
-| LHipPitch | LHipPitch | -88° to +27.7° | ⛔ legs gated (balance) |
-| RHipPitch | RHipPitch | -88° to +27.7° | ⛔ legs gated (balance) |
-| TorsoPitch | — | *no NAO motor* | ❌ dropped |
+## 9. Sensors used
 
-Joints not driven by imitation (shoulder roll, elbow yaw, wrists, head, and the
-full leg chain) are held at a neutral standing posture so the robot keeps a
-natural pose and stays balanced. Leg driving can be enabled in the advanced
-controller via `DRIVE_LEGS = True`.
+| Device | Used for |
+|---|---|
+| `inertial unit` | gravity direction for balance **and** the robot's true heading for the turn servo |
+| `gyro` | tilt *rate*, as a lead term in fall detection |
+| `accelerometer` | enabled for completeness |
+| `LFsr`, `RFsr` | per-foot load, confirming a weight transfer before a lift |
+| `<joint>S` | position sensors: achieved angles, stuck-motor detection, trajectory log |
 
-## Configuration
+NAO's foot sensors are 3-axis (`force-3d`) touch sensors, so their value comes
+from **`getValues()`**, not `getValue()`. Reading them as scalars is why an
+earlier version silently got no load information and the step gate never saw a
+weight transfer. Both APIs are handled, so 1-axis protos work too.
 
-### UDP Settings
-- **Address**: `127.0.0.1` (localhost)
-- **Port**: `8765`
-- **Timeout**: `1.0 second`
-- **Buffer**: `65536 bytes`
+---
 
-### Motion Settings
-- **Max Velocity**: `2.0 rad/s` (smooth but responsive)
-- **Position Tolerance**: `0.01 rad`
-- **Update Rate**: Same as Webots timestep (typically 32-64ms)
+## 10. Controllers
 
-### Logging
-Set `log_level` in pipeline config to see:
-- Frame-by-frame updates (DEBUG)
-- Motor status (INFO)
-- Performance metrics (INFO)
-- Errors and warnings (WARNING/ERROR)
+### `pose_imitation_controller.py` — **recommended**
+The full stack described above. This is the one wired into the world file.
 
-## Real-Time Performance
+### `pose_imitation_controller_advanced.py`
+Same `NaoPoseDriver` core, tuned for **inspecting motors**: smoother settings and
+verbose per-joint diagnostics (commanded vs. measured, average error, stuck
+flags). Deliberately no locomotion, so the robot stays on the spot and the
+numbers stay interpretable — but the legs still do full per-leg pose imitation
+through the same `LowerBodyController`, so what you measure here is what runs
+there.
 
-### Expected Performance
-- **Latency**: <50ms end-to-end (camera → detection → command → robot)
-- **FPS**: 30-50 fps typical, up to 100 fps possible
-- **Smoothness**: Smooth continuous motion due to velocity control
-- **Responsiveness**: Immediate response to detected human movements
+### Output: joint-trajectory log (FR-7 / US-3)
+With `ENABLE_TRAJECTORY_LOG = True` (default), each run writes
+`<project>/logs/webots_joint_trajectory_<epoch>.csv`: per simulation frame,
+`wall_time_s, sim_time_s, frame_index` and, for every driven joint, a
+`<joint>_cmd_rad` (commanded) and `<joint>_meas_rad` (achieved, from the position
+sensor) column. This is what the evaluation step uses for per-joint MAE and
+timing. Logging is fully defensive — any I/O error disables it without disturbing
+the real-time loop. `logs/` is git-ignored.
 
-### Optimization Tips
-1. **Lower detection confidence** if humans are not detected consistently
-2. **Reduce frame resolution** (e.g., 640x480) for higher FPS
-3. **Enable smooth_landmarks** in MediaPipe config
-4. **Use model_complexity: 1** for balanced performance
+---
 
-## Integration with Pipeline
-
-The controllers integrate seamlessly with the Python pipeline:
+## 11. Reading the controller log
 
 ```
-Human in Camera
-    ↓
-MediaPipe Pose Detection (25-27/33 landmarks)
-    ↓
-Retargeting Mapper (human pose → robot joints)
-    ↓
-Smoothing Filter (exponential smoothing)
-    ↓
-UDP Command (JSON packet)
-    ↓
-Webots Controller (receives and applies)
-    ↓
-Robot Moves in Real-Time
+Frame 400 | sim 49.8 Hz | tracking | legs=pose | 8 joints applied
+  pose-legs mode=single stance=R shift=1.00 lift=0.73 gate=0.77 margin=+0.0145m crouch=0.10
+  heading error  -8 deg (servo latched)
 ```
 
-## Running the System
+- `legs=` — which layer is commanding: `pose`, `march:march`, `motion:forward`, `stand`
+- `mode` — `double` / `load` / `single` (§3)
+- `gate` — how much lift the CoM model currently permits (0 = do not unload)
+- `margin` — signed distance of the CoM inside the stance foot; must be positive to step
+- `heading error` — what the turn servo still wants to rotate
 
-### 1. Start Webots
+---
+
+## 12. Troubleshooting
+
+**Legs do not move at all**
+1. `WorldInfo.contactProperties` missing → §7. This is the usual cause.
+2. `LEG_CONTROL = "off"` in the controller.
+3. Log says `Lower-body pose imitation OFF (...)` → NumPy is missing from the
+   Python interpreter Webots is using (`Tools → Preferences → Python command`).
+4. Legs out of camera frame: watch `Visible: nn/33` in the pipeline HUD.
+
+**Raised leg produces only a small response**
+Check `gate` and `margin` in the log. `gate=0.00` means the CoM model refuses to
+unload the foot — usually the robot has not finished leaning yet (`shift < 0.75`),
+or the foot sensors disagree. This is working as designed; it is the difference
+between a step and a fall.
+
+**Robot marches instead of walking across the floor**
+No `.motion` clips found. Check the startup log for `Locomotion clips found: …`.
+Set `$WEBOTS_HOME`, or drop clips into
+`main/controllers/pose_imitation_controller/motions/`.
+
+**Robot turns the wrong way** → flip `TURN_SIGN`.
+
+**Left/right mirrored** → set `SWAP_SIDES = True`.
+
+**Robot falls while walking** → confirm `basicTimeStep` is 20 ms and the contact
+properties are present; then lower `LOCOMOTION.walk_conf_min` so it walks less
+eagerly, or use `LEG_CONTROL = "engine"` to keep it in place.
+
+**Robot not moving at all**
+1. Is the simulation playing, and the controller running?
+2. Pipeline log shows `Webots bridge sending to 127.0.0.1:8765`?
+3. `netstat -uln | grep 8765` (Linux) — is the port bound?
+4. Controller log shows `tracking`, not `STALE (holding)`?
+
+**Jerky motion** → raise `SMOOTHING_ALPHA` for responsiveness or lower it for
+smoothness; reduce camera resolution; run Webots without rendering (`--no-rendering`).
+
+---
+
+## 13. Tests
+
+All the maths is Webots-free and unit-tested from the repo root:
+
 ```bash
-# Open the world file with the pose imitation controller
-# main/worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt
+pytest -q
 ```
 
-### 2. Run Python Pipeline
-```bash
-conda activate py312
-cd /path/to/project
-python run.py
-```
-
-The pipeline will:
-- Detect human pose from webcam
-- Send commands to Webots (port 8765)
-- Show landmarks on camera feed
-- Log joint tracking
-
-### 3. Move in Front of Camera
-The robot will follow your movements in real-time!
-
-## Troubleshooting
-
-### Robot Not Moving
-1. Check if controller is running in Webots
-2. Verify UDP port 8765 is not blocked
-3. Check pipeline log for "Webots bridge sending to 127.0.0.1:8765"
-4. Ensure human is detected ("Human detected" status)
-
-### Jerky/Stuttering Motion
-1. Lower `min_detection_confidence` (0.35 default)
-2. Reduce camera resolution
-3. Disable Webots graphics (run headless) for better performance
-
-### Stuck Motors
-1. Check motor names in controller match robot PROTO
-2. Verify joint angle ranges are within limits
-3. Check for motor max torque settings in Webots
-
-### No UDP Messages Received
-```bash
-# On Linux, check if port is listening:
-netstat -uln | grep 8765
-
-# Or use UDP sniffer:
-tcpdump -i lo udp port 8765
-```
-
-## Advanced Usage
-
-### Using Motor Health Monitor
-The advanced controller automatically:
-- Tracks position errors per frame
-- Detects stuck motors
-- Logs diagnostics every 200 frames
-
-Check logs for warnings like:
-```
-Motor 'RElbowRoll' may be stuck (error: 0.0850 rad)
-```
-
-### Custom Motor Configurations
-Edit `pose_control_utils.py`:
-```python
-def get_default_motor_configs() -> Dict[str, MotorConfig]:
-    return {
-        "CustomJoint": MotorConfig(
-            name="CustomJoint",
-            min_angle=math.radians(-90),
-            max_angle=math.radians(90),
-            max_velocity=1.5,
-            max_acceleration=5.0,
-        ),
-    }
-```
-
-## Performance Metrics
-
-Monitor these in real-time via logs:
-
-| Metric | Good | Warning | Critical |
-|--------|------|---------|----------|
-| FPS | >30 | 20-30 | <20 |
-| Latency | <50ms | 50-100ms | >100ms |
-| Visible Landmarks | >20/33 | 15-20/33 | <15/33 |
-| Position Error | <0.01 rad | 0.01-0.05 rad | >0.05 rad |
-
-## Development Notes
-
-### Code Structure
-```
-main/
-├── controllers/
-│   └── pose_imitation_controller/
-│       ├── pose_imitation_controller.py (standard)
-│       └── pose_imitation_controller_advanced.py (advanced)
-└── libraries/
-    └── pose_control_utils.py (utilities)
-```
-
-### Testing Controller Locally
-For testing without full Webots:
-```python
-# Mock controller for development
-import socket
-import json
-import time
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("127.0.0.1", 8765))
-
-while True:
-    data, addr = sock.recvfrom(65535)
-    payload = json.loads(data)
-    print(f"Frame {payload['frame_index']}: {len(payload['joint_angles_rad'])} joints")
-```
-
-## Future Enhancements
-
-- [ ] Support for NAO V6 specific motors
-- [ ] Inverse kinematics for more natural movement
-- [ ] Multi-sensor feedback (accelerometers, gyros)
-- [ ] Collision avoidance
-- [ ] Motion recording and playback
-- [ ] Network communication over internet
-
-## License
-
-See main project LICENSE file.
-
-## Questions?
-
-For issues or questions:
-1. Check logs: `logs/run_*/pose_keypoints.csv`
-2. Enable DEBUG logging: `python run.py --log-level DEBUG`
-3. Check Webots console for controller errors
-4. Verify UDP connectivity: `netstat -uln | grep 8765`
+| File | Covers |
+|---|---|
+| `tests/test_nao_retarget.py` | leg solve **round trip** (project known NAO angles → recover them), self-calibration, lift detection, mirrored roll signs, occlusion, garbage input |
+| `tests/test_lower_body.py` | the step sequence, the model-probed lean direction, every safety gate, joint limits |
+| `tests/test_walk_motion.py` | clip discovery, overshoot guard, hysteresis, yaw servo latch/relatch/wrapping |
+| `tests/test_gait_cues.py` | cadence/phase/stop, and torso yaw sign, monotonicity and magnitude |
+| `tests/test_gait.py`, `tests/test_balance.py` | march engine invariants, CoM model and Fibonacci search |

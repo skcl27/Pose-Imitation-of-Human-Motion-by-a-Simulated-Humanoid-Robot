@@ -10,6 +10,11 @@ from src.type_defs import JointCommand, Keypoint
 # Landmarks streamed to the Webots controller for full-body retargeting.
 # A curated subset keeps the UDP packet small (low latency, NFR-1) while still
 # covering every joint the controller maps: arms, head and legs.
+#
+# The heels and toes are included on purpose: the controller locates the "ground
+# line" as the lower of the two feet, and averaging the ankle with the heel makes
+# that line -- and therefore single-leg lift detection -- markedly steadier than
+# the ankle landmark alone.
 KEYPOINTS_TO_STREAM = (
     "nose",
     "left_eye", "right_eye",
@@ -20,6 +25,8 @@ KEYPOINTS_TO_STREAM = (
     "left_hip", "right_hip",
     "left_knee", "right_knee",
     "left_ankle", "right_ankle",
+    "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
 )
 
 

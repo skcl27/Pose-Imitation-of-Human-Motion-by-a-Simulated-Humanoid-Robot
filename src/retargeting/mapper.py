@@ -37,10 +37,23 @@ class RetargetingMapper:
             return angle
         return max(lim.min_rad, min(lim.max_rad, angle))
 
+    # Landmarks this mapper cannot work without. MediaPipe always returns all 33,
+    # but a partial pose (replayed log, a different estimator, a unit test) used
+    # to raise KeyError here and kill the whole pipeline thread.
+    REQUIRED = (
+        "left_shoulder", "left_elbow", "left_wrist",
+        "right_shoulder", "right_elbow", "right_wrist",
+        "left_hip", "right_hip", "left_knee", "right_knee",
+    )
+
     def map_pose(self, pose: PoseFrame) -> JointCommand:
         kp = pose.keypoints
-        if not kp:
-            return JointCommand(timestamp_s=pose.timestamp_s, joint_angles_rad={}, frame_index=pose.frame_index)
+        if not kp or any(name not in kp for name in self.REQUIRED):
+            return JointCommand(
+                timestamp_s=pose.timestamp_s,
+                joint_angles_rad={},
+                frame_index=pose.frame_index,
+            )
 
         left_upper = _vector(kp["left_shoulder"], kp["left_elbow"])
         left_lower = _vector(kp["left_elbow"], kp["left_wrist"])

@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, Tuple
+from typing import Iterable, Tuple
 
 import cv2
 import numpy as np
 
 from src.perception.landmarks import MEDIAPIPE_POSE_LANDMARKS
-from src.type_defs import Keypoint, PoseFrame
+from src.type_defs import PoseFrame
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,11 @@ LOW_VIS_THRESHOLD = 0.3          # Lowered threshold to show more detected landm
 class SkeletonOverlay:
     """Draws keypoints, bones, and HUD onto a BGR frame."""
 
-    def __init__(self, window_name: str = "Pose Imitation - Camera Feed", show: bool = True) -> None:
+    def __init__(
+        self,
+        window_name: str = "Pose Imitation - Camera Feed",
+        show: bool = True,
+    ) -> None:
         self.window_name = window_name
         self.show = show
         self._window_created = False

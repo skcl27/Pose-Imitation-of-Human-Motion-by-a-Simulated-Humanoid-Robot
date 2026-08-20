@@ -125,15 +125,23 @@ python run.py --no-display --no-webots
 python run.py
 ```
 
-> Note: the controller does safe upper-body imitation **and real-time walking**.
-> When you march / walk in place in front of the camera, the robot replicates
-> your gait via an on-robot walk engine (it tracks your cadence, phase and stop —
-> it does not copy raw leg angles, which is unreliable from a single camera).
-> The default `WALK_TIER = "march"` is a double-support march that never fully
-> unloads a foot, so the robot stays upright; an experimental single-support
-> stepping tier (`WALK_TIER = "step"`) is available but off by default. Set
-> `walk.enabled: false` in `configs/default.yaml` for upper-body-only behaviour.
-> See `main/controllers/pose_imitation_controller/README.md` → *Real-time walking*.
+> Note: the controller drives the **whole body** — arms, head and legs. In front
+> of the camera you can:
+>
+> * **squat** → the robot squats (symmetric, statically balanced);
+> * **raise one leg** → the robot shifts its weight onto the other foot and then
+>   raises the matching leg, as far as its own centre-of-mass model says is safe;
+> * **walk / march** → the robot walks across the floor for real, using Webots'
+>   pre-balanced NAO walk clips (it marches in place if no clips are installed);
+> * **turn your body** → the robot steps round to face the same way, closing the
+>   loop on its InertialUnit heading.
+>
+> One knob controls all of it: `LEG_CONTROL` at the top of
+> `main/controllers/pose_imitation_controller/pose_imitation_controller.py`
+> (`"auto"` = everything, `"pose"` = stay on the spot, `"engine"` = march in
+> place, `"off"` = upper body only). Set `walk.enabled: false` in
+> `configs/default.yaml` to stop streaming gait/yaw cues altogether.
+> Full explanation: `main/controllers/pose_imitation_controller/README.md`.
 
 ### 4.5 Optional flags
 - `--source 0` — use webcam index 0  
@@ -213,6 +221,22 @@ pose_imitation_controller
 
 ### In Webots
 - The humanoid robot moves in response to the pipeline
+- The controller console prints a status line every 100 frames, e.g.
+  `Frame 400 | sim 49.8 Hz | tracking | legs=pose | 8 joints applied`.
+  `legs=` tells you which layer is driving the legs (`pose`, `march:march`,
+  `motion:forward`, `stand`) — the quickest way to see what the robot thinks you
+  are doing.
+- At startup it prints `Locomotion clips found: forward, turn_left, turn_right, …`.
+  If it instead warns that **no NAO .motion files were found**, the robot will
+  march in place rather than walking across the floor: set `$WEBOTS_HOME`, or copy
+  the clips from `<webots>/projects/robots/softbank/nao/motions/` into
+  `main/controllers/pose_imitation_controller/motions/`.
+
+### If the legs do not move at all
+The most common cause is a world file missing the NAO foot/floor contact pair —
+the feet then slide on the floor and absorb every leg command. The committed
+world already has it; see section 7 of
+`main/controllers/pose_imitation_controller/README.md`.
 - The controller logs show UDP activity
 - If the robot does not move, verify the simulation is playing and the controller is active
 

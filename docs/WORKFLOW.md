@@ -40,16 +40,35 @@ This document describes the complete workflow and architecture of the **Pose Imi
          │
          ▼
 ┌─────────────────┐
-│  UDP Bridge to  │
+│  UDP Bridge to  │   landmarks + gait cues + body yaw
 │     Webots      │
 └────────┬────────┘
          │
          ▼
+┌──────────────────────────────────────────────────────────┐
+│ Webots controller  (main/controllers/…)                  │
+│                                                          │
+│   arms + head ── nao_retarget.retarget_upper_body        │
+│                                                          │
+│   legs ── ARBITER: exactly ONE layer per step            │
+│     1. locomotion    walk_motion + Webots .motion clips  │
+│     2. march engine  gait.GaitEngine (in place)          │
+│     3. pose imitation lower_body.LowerBodyController     │
+│     4. stand         balance.BalanceController           │
+│                          │                               │
+│                     NaoPoseDriver                        │
+│                     clamp → smooth → setPosition         │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
 ┌─────────────────┐
-│ Webots Humanoid │
+│ Webots NAO H25  │
 │    Simulation   │
 └─────────────────┘
 ```
+
+> The robot-side maths lives in `main/libraries/` and imports **no** Webots
+> module, so every layer above is unit-tested off-simulation (`pytest -q`).
 
 ---
 
@@ -157,7 +176,15 @@ Feet: left/right heel, left/right foot_index
 
 ---
 
-## Phase 3: Pose Retargeting & Joint Mapping
+## Phase 3: Pose Retargeting & Joint Mapping (fallback channel)
+
+> **Where retargeting really happens.** This Python-side mapper is now the
+> *fallback* path only. The primary channel streams the raw landmarks and the
+> **controller** retargets them (`main/libraries/nao_retarget.py`), because
+> driving the robot's full pose needs the actual limb geometry, NAO's real joint
+> axes/signs/limits, and the robot's own balance state — none of which the Python
+> side has. The controller uses these pre-computed angles only when a frame
+> arrives with no `keypoints`. See Phase 8.
 
 ### Technology Stack
 - **NumPy** - Vector mathematics
@@ -357,18 +384,38 @@ Feet: left/right heel, left/right foot_index
    - No handshake required (fire-and-forget)
 
 2. **Command Serialization**
-   - Converts `JointCommand` to JSON:
+   - Builds the frame as JSON:
      ```json
      {
        "timestamp_s": 1.234,
        "frame_index": 42,
-       "joint_angles_rad": {
-         "LShoulderPitch": 0.52,
-         "RShoulderPitch": -0.31,
-         ...
-       }
+       "keypoints": {
+         "left_shoulder": [0.40, 0.40, -0.10, 0.99],
+         "left_knee":     [0.46, 0.73, -0.10, 0.97],
+         "left_heel":     [0.45, 0.93, -0.10, 0.93]
+       },
+       "gait": {
+         "state": "march", "cadence_hz": 0.95, "phase": 1.83,
+         "swing_side": 1, "intensity": 0.7, "turn": 0.4, "conf": 0.98,
+         "body_yaw_rad": 0.42, "yaw_conf": 0.99
+       },
+       "joint_angles_rad": { "LShoulderPitch": 0.52 }
      }
      ```
+   - `keypoints` **(primary)** — ~21 landmarks as `[x, y, z, visibility]` in
+     normalized image coordinates. Head, shoulders, elbows, wrists, hips, knees,
+     ankles, **heels and toes**; the curated subset keeps the packet small
+     (NFR-1). The feet matter: the controller finds the "ground line" as the lower
+     of the two feet, and averaging ankle with heel makes single-leg lift
+     detection markedly steadier.
+   - `gait` — cadence/phase/stop for the march engine, plus `body_yaw_rad`
+     (**an angle**, so the controller can close a heading loop on it) and
+     `yaw_conf`, which is independent of `conf` because the yaw needs only the
+     shoulders and hips and stays usable when the legs leave the frame.
+   - `joint_angles_rad` **(fallback)** — used only when a frame carries no
+     `keypoints`.
+   - Additive and backward compatible: a controller ignores fields it does not
+     know, so the protocol can grow without breaking older builds.
    - Encodes as UTF-8 bytes
 
 3. **UDP Transmission**
@@ -389,55 +436,110 @@ Feet: left/right heel, left/right foot_index
 
 ---
 
-## Phase 8: Webots Robot Simulation
+## Phase 8: Webots Robot Simulation & Whole-Body Control
 
 ### Technology Stack
-- **Webots R2023b+** - Robot simulation environment
-- **Python Webots API** - Controller interface
-- **UDP Socket** - Command reception
+- **Webots R2025a** - Robot simulation environment (NAO H25 proto)
+- **Python Webots API** - `Robot`, `Motion`, motors, position sensors, IMU, gyro, FSRs
+- **UDP Socket** - Command reception (port 8765)
+- **NumPy** - forward kinematics and the centre-of-mass model
 
 ### Components
-- World file: `main/worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt`
-- Controller: `main/controllers/pose_imitation_controller/pose_imitation_controller.py` or `pose_imitation_controller_advanced.py`
+| File | Role |
+|---|---|
+| `main/worlds/…​.wbt` | world; **must** define the NAO foot/floor contact pair (see below) |
+| `main/controllers/pose_imitation_controller/pose_imitation_controller.py` | Webots glue + the lower-body **arbiter** |
+| `main/libraries/nao_retarget.py` | landmarks → NAO angles (arms, head, closed-form per-leg solve) |
+| `main/libraries/lower_body.py` | weight-shift / single-leg-lift sequencer and its safety gates |
+| `main/libraries/gait.py` | in-place march engine |
+| `main/libraries/balance.py` | model-based CoM balance (FK + link masses + Fibonacci search) |
+| `main/libraries/walk_motion.py` | `.motion` clip discovery, heading (yaw) servo, locomotion planning |
+| `main/libraries/pose_control_utils.py` | `NaoPoseDriver`: limits, smoothing, velocity caps, trajectory log |
 
 ### Process Flow
 
-1. **Simulation Initialization**
-   - Loads humanoid robot model
-   - Initializes robot joints (motors)
-   - Creates UDP socket listener on port 8765
+1. **Initialization**
+   - Look up all 24 motors and their `<name>S` position sensors
+   - Enable the InertialUnit (gravity **and** heading), gyro, accelerometer and
+     the 3-axis foot force sensors (`LFsr` / `RFsr`)
+   - Discover Webots' pre-balanced NAO `.motion` clips on disk
+   - Bind the non-blocking UDP listener on port 8765
 
-2. **Command Reception**
-   - Listens for UDP datagrams (non-blocking)
-   - Deserializes JSON payload
-   - Extracts joint angle commands
+2. **Command reception** (per simulation step)
+   - Drain the UDP backlog and keep only the **freshest** frame (latency, NFR-1)
+   - Arms and head are commanded directly from the landmarks
+   - The legs' observation is only *latched*, for whichever layer runs this step
 
-3. **Joint Actuation**
-   - Sets target positions for robot motors
-   - Applies joint angles in radians
-   - Webots physics engine handles:
-     - Motor dynamics
-     - Collision detection
-     - Balance physics
-     - Gravity simulation
+3. **Lower-body arbitration — exactly one commander per step**
+   Two layers commanding the 12 leg joints at once means they fight and the
+   robot falls, so the arbiter picks one, in priority order:
 
-4. **Simulation Step**
-   - Webots updates at simulation timestep (typically 32ms)
-   - Robot moves to target pose
-   - Physics constraints enforced
+   | Priority | Layer | When |
+   |---|---|---|
+   | 1 | **Locomotion** — play a `.motion` clip | heading needs correcting, or the human is walking and clips exist |
+   | 2 | **March engine** — `gait.GaitEngine` | human is walking but no clips are installed (marches in place) |
+   | 3 | **Pose imitation** — `lower_body.LowerBodyController` | default: squat, leg abduction, single-leg lift |
+   | 4 | **Stand** — `balance.BalanceController` only | legs disabled |
 
-### Supported Joints
-- Shoulders (pitch/roll)
-- Elbows (roll)
-- Hips (pitch)
-- Torso (pitch)
-- Additional joints can be added as needed
+4. **Single-leg lift: LOAD → SINGLE → UNLOAD**
+   - **LOAD** — lean so the CoM moves over the stance foot. The lean *sign* is
+     probed against the CoM model rather than hard-coded.
+   - **SINGLE** — only once `stance_margin > 0` (and the FSRs agree) does the
+     swing leg follow the human, its authority scaled continuously by that margin
+   - **UNLOAD** — human lowers the foot, or margin/tilt safety closes the gate
+   - Both blends are rate-limited, so there is always a smooth path back to the
+     symmetric crouch
+
+5. **Turning is a closed loop**
+   `error = wrap_pi(desired_heading − InertialUnit yaw)`, where the desired
+   heading tracks the human's measured torso yaw. Turn clips fire until the error
+   closes, so the rotation converges despite coarse clips and noisy tracking —
+   and it works while standing still.
+
+6. **Motion playback hand-off**
+   While a clip plays it owns the **whole** body: per-joint commanding is
+   suspended and the motor velocity caps are lifted (a velocity-capped motor
+   cannot reach a clip's keyframes, and the pre-balanced gait then arrives late at
+   every foot placement and topples). Clips play to completion — a clip boundary
+   is a balanced double-support pose, the only safe place to hand control back —
+   and the smoothers are reseeded from the position sensors on reclaim.
+
+7. **Simulation step**
+   `basicTimeStep` is 20 ms. Webots' default of 32 ms is too coarse for NAO leg
+   control and destabilises the walk clips; the controller warns if it sees more.
+
+### Driven joints
+All 24: head yaw/pitch, both arms (shoulder pitch **and** roll, elbow yaw/roll,
+wrist), and the full 12-joint leg chain (hip yaw-pitch/roll/pitch, knee pitch,
+ankle pitch/roll). NAO has no torso joint, so torso pitch is dropped and torso
+*yaw* is realised by stepping round.
+
+### World requirement (not optional)
+```
+WorldInfo {
+  basicTimeStep 20
+  contactProperties [
+    ContactProperties {
+      material2 "NAO foot material"
+      coulombFriction [ 8 ]
+      bounce 0
+      bounceVelocity 0.003
+    }
+  ]
+}
+```
+`Nao.proto` tags its soles `"NAO foot material"`. Without a matching
+`ContactProperties` the pair falls back to Webots' low-friction bouncy default:
+the feet slide, the robot cannot load one foot or take a step, and the leg
+controller *looks frozen* because every leg command is absorbed by foot slip.
 
 ### Key Features
-- Realistic physics simulation
-- Real-time robot visualization
-- Balance and collision handling
-- Extendable robot model
+- Realistic physics with correct foot friction
+- One commander per step — no layer fighting
+- Model-verified weight transfer before any foot leaves the ground
+- Gyro-lead fall detection that aborts a motion clip before the tilt threshold
+- Graceful degradation: no clips → march in place; no NumPy → hard-capped lift;
+  tracking lost → ramp back to the balanced crouch
 
 ---
 

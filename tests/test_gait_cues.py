@@ -148,4 +148,100 @@ def test_as_dict_is_json_friendly() -> None:
     cmd = _feed(GaitCueExtractor(), lambda t, i: _march_frame(t, i, freq_hz=1.0), duration_s=4.0)
     d = cmd.as_dict()
     json.dumps(d)  # must not raise
-    assert set(d) == {"state", "cadence_hz", "phase", "swing_side", "intensity", "turn", "conf"}
+    assert set(d) == {
+        "state", "cadence_hz", "phase", "swing_side", "intensity", "turn", "conf",
+        "body_yaw_rad", "yaw_conf",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Torso yaw (body rotation)
+# ---------------------------------------------------------------------------
+def _yaw_frame(t: float, yaw_deg: float, idx: int = 0, vis: float = 1.0) -> PoseFrame:
+    """A subject standing still, rotated ``yaw_deg`` about the vertical axis.
+
+    The shoulder and hip lines are body-fixed horizontal segments, so rotating
+    the body shrinks their image-plane extent and separates their endpoints in
+    depth -- exactly the projection the yaw solve inverts.
+    """
+    a = math.radians(yaw_deg)
+    kps = {}
+    for name, half, y in (("shoulder", 0.09, 0.30), ("hip", 0.06, 0.55)):
+        for side, sgn in (("left", -1.0), ("right", +1.0)):
+            kps[f"{side}_{name}"] = Keypoint(
+                x=0.5 + sgn * half * math.cos(a),
+                y=y,
+                z=-sgn * half * math.sin(a),   # screen-right endpoint comes nearer
+                visibility=vis,
+            )
+    for side, sgn in (("left", -1.0), ("right", +1.0)):
+        kps[f"{side}_knee"] = Keypoint(0.5 + sgn * 0.06, 0.75, 0.0, vis)
+        kps[f"{side}_ankle"] = Keypoint(0.5 + sgn * 0.06, 0.92, 0.0, vis)
+    return PoseFrame(timestamp_s=t, keypoints=kps, frame_index=idx)
+
+
+def _settle_yaw(yaw_deg: float, frames: int = 40, vis: float = 1.0):
+    ex = GaitCueExtractor()
+    cmd = None
+    for i in range(frames):
+        cmd = ex.update(_yaw_frame(i / 30.0, yaw_deg, i, vis))
+    return cmd
+
+
+def test_facing_the_camera_is_zero_yaw() -> None:
+    cmd = _settle_yaw(0.0)
+    assert abs(cmd.body_yaw_rad) < 0.02
+    assert abs(cmd.turn) < 0.05
+    assert cmd.yaw_conf > 0.9
+
+
+def test_yaw_is_signed_and_monotonic() -> None:
+    values = [_settle_yaw(d).body_yaw_rad for d in (-60, -30, 0, 30, 60)]
+    assert values == sorted(values)
+    assert values[0] < -0.4 and values[-1] > 0.4
+
+
+def test_yaw_magnitude_tracks_the_real_rotation() -> None:
+    for deg in (20, 45, -35):
+        got = math.degrees(_settle_yaw(deg).body_yaw_rad)
+        # Depth is deliberately down-weighted, so the estimate under-reports
+        # rather than over-reports; the robot must never overshoot a turn.
+        assert 0.6 * abs(deg) <= abs(got) <= abs(deg) + 2.0
+        assert (got > 0) == (deg > 0)
+
+
+def test_yaw_is_reported_while_standing_perfectly_still() -> None:
+    """The regression that made body rotation move only the head: the yaw used
+    to be gated behind the marching state, so standing and turning did nothing."""
+    cmd = _settle_yaw(45.0)
+    assert cmd.state == "idle"          # not marching...
+    assert cmd.body_yaw_rad > 0.4       # ...but the rotation is still reported
+    assert cmd.turn > 0.5
+
+
+def test_yaw_survives_the_legs_leaving_the_frame() -> None:
+    ex = GaitCueExtractor()
+    cmd = None
+    for i in range(40):
+        frame = _yaw_frame(i / 30.0, 40.0, i)
+        kps = dict(frame.keypoints)
+        for name in ("left_knee", "right_knee", "left_ankle", "right_ankle"):
+            kps[name] = Keypoint(kps[name].x, kps[name].y, kps[name].z, 0.0)
+        cmd = ex.update(PoseFrame(frame.timestamp_s, kps, i))
+    assert cmd.conf < 0.6               # lower body not trusted
+    assert cmd.body_yaw_rad > 0.3       # yaw still usable (shoulders + hips)
+    assert cmd.yaw_conf > 0.9
+
+
+def test_invisible_torso_yields_no_yaw_confidence() -> None:
+    cmd = _settle_yaw(45.0, vis=0.1)
+    assert cmd.yaw_conf == 0.0
+
+
+def test_yaw_is_smoothed_not_snapped() -> None:
+    ex = GaitCueExtractor()
+    for i in range(30):
+        ex.update(_yaw_frame(i / 30.0, 0.0, i))
+    jump = ex.update(_yaw_frame(1.0, 60.0, 30))
+    # One frame must not deliver the whole 60 deg step, or turn clips chatter.
+    assert 0.0 < jump.body_yaw_rad < math.radians(45)

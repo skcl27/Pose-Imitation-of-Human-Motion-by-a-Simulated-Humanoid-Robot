@@ -6,19 +6,54 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
 
 WorldInfo {
+  info [
+    "Pose imitation of human motion by a simulated humanoid robot (NAO H25)."
+    "Real time: MediaPipe pose -> UDP 8765 -> pose_imitation_controller."
+    ""
+    "DO NOT REMOVE THE contactProperties NODE BELOW - it is not cosmetic."
+    "Nao.proto tags its soles with the contact material 'NAO foot material'."
+    "With no matching ContactProperties the sole/floor pair silently falls back"
+    "to Webots' default contact (coulombFriction 1, bouncy), so the feet SLIDE"
+    "and JITTER: the robot cannot load one foot, cannot take a step, and the leg"
+    "controller LOOKS FROZEN because every leg command is absorbed by foot slip."
+    "The values here match Cyberbotics' own NAO worlds (friction 8, no bounce)."
+    ""
+    "basicTimeStep must stay at 20 ms or less. Webots' default of 32 ms is too"
+    "coarse for NAO leg control and destabilises the pre-balanced .motion walk"
+    "clips; the controller logs a warning if it finds a larger value."
+    ""
+    "The floor is 20 x 20 m because the robot really translates when the human"
+    "walks, and the Viewpoint follows 'NAO' so the camera does not lose it."
+  ]
+  basicTimeStep 20
+  contactProperties [
+    ContactProperties {
+      material2 "NAO foot material"
+      coulombFriction [
+        8
+      ]
+      bounce 0
+      bounceVelocity 0.003
+    }
+  ]
 }
 Viewpoint {
   orientation -0.021022313892317804 0.0056450718198366185 0.9997630696733911 2.617167874717846
   position 4.472881117506071 -1.0522202310572988 0.2730153252869645
+  follow "NAO"
+  followSmoothness 0.5
+}
+Floor {
+  size 20 20
+  tileSize 1 1
 }
 Nao {
+  name "NAO"
   controller "pose_imitation_controller"
-  translation 0 0 0.333
+  translation 0 0 0.334
   rotation 0 0 1 0
 }
 TexturedBackground {
 }
 TexturedBackgroundLight {
-}
-Floor {
 }

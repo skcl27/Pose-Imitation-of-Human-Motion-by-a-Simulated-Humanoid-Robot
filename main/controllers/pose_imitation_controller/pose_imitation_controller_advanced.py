@@ -2,21 +2,25 @@
 Advanced NAO pose imitation controller.
 
 Same UDP protocol and :class:`NaoPoseDriver` core as the standard controller,
-but tuned for experimentation:
+but tuned for *inspecting motors* rather than for the best demo:
 
 * Lower smoothing alpha and velocity scale for extra-smooth motion.
-* Optional leg driving (hip pitch) for lower-body experiments — OFF by default
-  because NAO has no balance controller yet and will fall (PRD NFR-4 / risks).
 * Verbose per-joint diagnostics: tracking error, stuck-motor detection, and the
   measured-vs-commanded position table.
+* Deliberately NO locomotion: no ``.motion`` clips and no march engine, so the
+  robot stays on the spot and per-joint numbers stay interpretable. With
+  ``DRIVE_LEGS = True`` the legs still do full per-leg pose imitation (squat,
+  single-leg lift) through ``lower_body.LowerBodyController`` -- the same layer
+  the standard controller uses, so what you measure here is what runs there.
 
-Use the standard ``pose_imitation_controller`` for normal demos; use this one
-when you need to inspect motor behaviour or trial lower-body imitation.
+Use the standard ``pose_imitation_controller`` for normal demos (it adds real
+walking and turning); use this one to inspect motor behaviour.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -37,13 +41,15 @@ UDP_HOST = "127.0.0.1"
 UDP_PORT = 8765
 SOCKET_RCVBUF = 1 << 16
 
-DRIVE_LEGS = False        # set True to experiment with full leg imitation
+DRIVE_LEGS = True         # per-leg pose imitation (squat / single-leg lift)
 DRIVE_HEAD = True
 SWAP_SIDES = False        # True = mirror-image mapping
 SMOOTHING_ALPHA = 0.3     # smoother (laggier) than the standard controller
 VELOCITY_SCALE = 0.4
 STALE_AFTER_S = 0.5
 DIAGNOSTICS_EVERY = 200   # frames
+ENABLE_BALANCE = True     # model-based CoM feedback (see main/libraries/balance.py)
+INERTIAL_UNIT_NAME = "inertial unit"
 
 ENABLE_TRAJECTORY_LOG = True
 LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "logs"))
@@ -72,8 +78,10 @@ class AdvancedPoseController:
             smoothing_alpha=SMOOTHING_ALPHA,
             velocity_scale=VELOCITY_SCALE,
             stale_after_s=STALE_AFTER_S,
+            enable_balance=ENABLE_BALANCE,
             logger=logger.info,
         )
+        self._init_imu()
         self._init_socket()
 
         self.trajectory_log = None
@@ -85,6 +93,32 @@ class AdvancedPoseController:
         self.frame_count = 0
         self._last_diag_time = time.time()
         logger.info("Advanced controller initialized")
+
+    def _init_imu(self) -> None:
+        """Enable the InertialUnit so the balance/step layers see the true tilt."""
+        self.imu = None
+        imu = self.robot.getDevice(INERTIAL_UNIT_NAME)
+        if imu is None:
+            logger.warning("InertialUnit '%s' not found; balance runs CoM-only",
+                           INERTIAL_UNIT_NAME)
+            return
+        try:
+            imu.enable(self.timestep)
+            self.imu = imu
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not enable InertialUnit: %s", exc)
+
+    def _torso_tilt(self) -> tuple:
+        """(roll, pitch) of the torso in rad; (0, 0) if unavailable."""
+        if self.imu is None:
+            return (0.0, 0.0)
+        try:
+            roll, pitch, _yaw = self.imu.getRollPitchYaw()
+        except Exception:  # noqa: BLE001
+            return (0.0, 0.0)
+        if math.isnan(roll) or math.isnan(pitch):
+            return (0.0, 0.0)
+        return (roll, pitch)
 
     def _init_socket(self) -> None:
         logger.info("Opening UDP socket on %s:%d ...", UDP_HOST, UDP_PORT)
@@ -152,6 +186,13 @@ class AdvancedPoseController:
                     self.driver.check_stale(now)
 
                 self.driver.read_feedback()
+                # Continuous lower-body control at simulation rate (not per
+                # camera frame), exactly as in the standard controller.
+                torso_rp = self._torso_tilt()
+                if self.driver.lower_body is not None:
+                    self.driver.lower_body_tick(now, torso_rp)
+                else:
+                    self.driver.balance_tick(torso_rp)
                 if self.trajectory_log is not None:
                     self.trajectory_log.record(
                         now, self.frame_count, self.driver.commanded, self.driver.measured

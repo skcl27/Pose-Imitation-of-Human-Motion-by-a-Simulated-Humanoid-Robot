@@ -24,6 +24,24 @@ clamps to the real NAO mechanical limits (FR-5), exponentially smooths the
 targets to prevent oscillation (FR-6), and holds a stable standing posture so
 the robot does not fall during upper-body imitation (NFR-4).
 
+Who commands the legs
+---------------------
+Only ONE layer may command the 12 leg joints at a time, or they fight each other
+and the robot falls. The driver exposes exactly one entry point per layer and the
+controller picks between them each step:
+
+* :meth:`NaoPoseDriver.lower_body_tick` -- per-leg pose imitation with the
+  weight-shift/lift sequencer (``lower_body.LowerBodyController``). The default:
+  this is what makes squatting and raising a single leg work.
+* :meth:`NaoPoseDriver.gait_tick` -- the in-place march engine
+  (``gait.GaitEngine``), used when the human is walking but no pre-balanced
+  Webots walk clip is available to translate with.
+* :meth:`NaoPoseDriver.balance_tick` -- CoM balance only (legs otherwise static).
+* :meth:`NaoPoseDriver.release_to_motion` -- hands the WHOLE body to a Webots
+  ``Motion`` clip: per-joint commanding stops and the motor velocity caps are
+  lifted, because a velocity-capped motor cannot follow a motion clip's keyframes
+  and the "walk" degenerates into a stumble.
+
 This module deliberately does **not** import the Webots ``controller`` package,
 so the math (limits, mapping, smoothing) stays unit-testable off-simulation.
 Motor/sensor objects are passed in from the controller process.
@@ -31,9 +49,8 @@ Motor/sensor objects are passed in from the controller process.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional
-
 
 # ---------------------------------------------------------------------------
 # NAO H25 joint limits (radians)
@@ -43,7 +60,7 @@ from typing import Callable, Dict, Iterable, List, Optional
 # ranges; Webots clamps setPosition() to them, so commanding outside the range
 # silently saturates the joint.
 # ---------------------------------------------------------------------------
-NAO_JOINT_LIMITS: Dict[str, "MotorConfig"] = {}
+NAO_JOINT_LIMITS: Dict[str, MotorConfig] = {}
 
 
 @dataclass
@@ -245,13 +262,20 @@ def map_pipeline_angles(
 # Joints that imitation actively drives. Everything else is held at its
 # rest_angle for a stable, natural-looking standing pose.
 DRIVEN_ARM_JOINTS = ("LShoulderPitch", "RShoulderPitch", "LElbowRoll", "RElbowRoll")
-# Lower body: a single symmetric, statically-balanced crouch (hip/knee/ankle
-# pitch only — no roll/lean, which would topple a free-standing NAO). See
-# nao_retarget._lower_body.
+# Lower body: the symmetric, statically-balanced crouch axis (hip/knee/ankle
+# pitch). This is the posture every leg layer decays back to; see
+# ``nao_retarget.crouch_posture``.
 DRIVEN_LEG_JOINTS = (
     "LHipPitch", "RHipPitch",
     "LKneePitch", "RKneePitch",
     "LAnklePitch", "RAnklePitch",
+)
+# Every joint the lower-body layers may command. Used for the gentler leg
+# velocity cap: these carry the robot's weight, so a jolt here is a fall.
+ALL_LEG_JOINTS = DRIVEN_LEG_JOINTS + (
+    "LHipYawPitch", "RHipYawPitch",
+    "LHipRoll", "RHipRoll",
+    "LAnkleRoll", "RAnkleRoll",
 )
 
 
@@ -291,17 +315,20 @@ class NaoPoseDriver:
     robot:
         Webots ``Robot`` instance.
     drive_legs:
-        If True, hip-pitch channels from the pipeline drive the legs. Off by
-        default because moving the legs without a balance controller makes NAO
-        fall (NFR-4 / PRD risk table).
+        If True, build the per-leg lower-body layer
+        (``lower_body.LowerBodyController``): squat, leg abduction, and
+        single-leg lift with a model-verified weight transfer. If False the legs
+        are held in the neutral standing posture and only the upper body imitates.
     smoothing_alpha:
         EMA factor for joint targets in (0, 1].
     velocity_scale:
         Fraction of each joint's hardware max velocity used as the motion cap.
     leg_velocity_factor:
-        Extra multiplier (0..1) applied on top of ``velocity_scale`` for the
-        leg joints only, so the weight-bearing crouch/sway eases in slowly and
-        does not jolt the robot off balance (NFR-4).
+        Extra multiplier (0..1) applied on top of ``velocity_scale`` for the leg
+        joints only, so a weight-bearing crouch/lean eases in slowly and does not
+        jolt the centre of mass off the feet (NFR-4). While stepping or marching
+        the (higher) ``gait_leg_velocity_factor`` is used instead, because there
+        the leg has to actually keep up with the motion.
     stale_after_s:
         If no command arrives within this many seconds, the driver is marked
         stale (the robot simply holds its last commanded pose).
@@ -324,6 +351,7 @@ class NaoPoseDriver:
         gait_smoothing_alpha: float = 0.7,
         gait_leg_velocity_factor: float = 0.85,
         gait_params: Optional[object] = None,
+        lower_body_params: Optional[object] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.robot = robot
@@ -351,6 +379,9 @@ class NaoPoseDriver:
         self.sensors: Dict[str, object] = {}
         self.commanded: Dict[str, float] = {}
         self.measured: Dict[str, float] = {}
+        # True while a Webots Motion clip owns the whole body (see
+        # release_to_motion / reclaim_from_motion).
+        self.suspended = False
         # The pose imitation wants this leg posture; the balance loop adds small
         # corrections on top of it each control step.
         self.base_targets: Dict[str, float] = {}
@@ -387,6 +418,30 @@ class NaoPoseDriver:
                 self.enable_walk = False
                 self.log(f"Walk engine OFF ({exc})")
 
+        # Per-leg pose imitation + weight-shift/lift sequencer. This is the layer
+        # that makes a squat and a single-leg lift actually reach the robot; it
+        # needs the CoM model to decide when unloading a foot is safe, and
+        # degrades to a hard-capped lift without it (never to "no motion at all",
+        # which is what made the legs look dead before).
+        self.leg_retargeter = None
+        self.lower_body = None
+        if drive_legs:
+            try:
+                from lower_body import LowerBodyController
+                from nao_retarget import LowerBodyRetargeter
+                com_model = self.balance.model if self.balance is not None else None
+                self.leg_retargeter = LowerBodyRetargeter()
+                self.lower_body = LowerBodyController(
+                    params=lower_body_params, com_model=com_model, limiter=self.limiter
+                )
+                self.log(
+                    "Lower-body pose imitation ON"
+                    f" (CoM-gated stepping: {com_model is not None})"
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Lower-body pose imitation OFF ({exc})")
+        self._lb_meta: Dict[str, object] = {"mode": "off", "balance_ok": True}
+
         self._setup_devices()
         self.apply_standing_posture()
 
@@ -414,7 +469,9 @@ class NaoPoseDriver:
 
     def _set_motor(self, name: str, angle: float, velocity: float) -> None:
         motor = self.motors.get(name)
-        if motor is None:
+        if motor is None or self.suspended:
+            # Suspended = a Webots Motion clip owns the body; commanding motors
+            # now would fight the clip's keyframes and break its balance.
             return
         angle = self.limiter.clamp_angle(name, angle)
         try:
@@ -431,7 +488,7 @@ class NaoPoseDriver:
         scale = self.velocity_scale
         # Legs carry the robot's weight: move them gently so a crouch/sway eases
         # in rather than jolting the centre of mass off the feet (NFR-4).
-        if name in DRIVEN_LEG_JOINTS:
+        if name in ALL_LEG_JOINTS:
             scale *= self.leg_velocity_factor
         return ceiling * scale
 
@@ -447,6 +504,12 @@ class NaoPoseDriver:
     # -- per-frame update ---------------------------------------------------
     def _apply_targets(self, targets: Dict[str, float], now_s: Optional[float]) -> int:
         """Smooth, command and bookkeep a set of NAO joint targets."""
+        if self.suspended:
+            # A motion clip owns the body; still record the frame time so
+            # staleness detection keeps working across the clip.
+            if now_s is not None:
+                self._last_command_time = now_s
+            return 0
         applied = 0
         for name, target in targets.items():
             if name not in self.motors:
@@ -470,7 +533,7 @@ class NaoPoseDriver:
         maintained continuously. ``torso_rp`` is the InertialUnit (roll, pitch)
         in rad. Returns the number of joints nudged. No-op if balance is off.
         """
-        if self.balance is None:
+        if self.balance is None or self.suspended:
             return 0
         # Best estimate of the current pose: measured where available, else the
         # last commanded angle.
@@ -492,6 +555,123 @@ class NaoPoseDriver:
             self._set_motor(name, smoothed, self._velocity_for(name))
             applied += 1
         return applied
+
+    # -- lower-body pose imitation -----------------------------------------
+    def lower_body_tick(
+        self,
+        now_s: float,
+        torso_rp: tuple = (0.0, 0.0),
+        fsr: Optional[Dict[str, float]] = None,
+        yaw_bias: float = 0.0,
+    ) -> int:
+        """Advance the per-leg pose imitation one control step.
+
+        This is the DEFAULT leg commander: it turns the latest camera
+        observation into a safe leg posture via
+        ``lower_body.LowerBodyController`` (symmetric crouch + authority-weighted
+        per-leg deviation + a model-verified weight shift when the human lifts a
+        foot), then folds in the symmetric CoM balance correction *only* while the
+        sequencer says both feet are still evenly loaded -- once we are
+        deliberately leaning onto one foot, "centre the CoM between the feet" is
+        the wrong objective and would cancel the transfer.
+
+        Called every simulation step rather than per camera frame, so the legs
+        keep being controlled at sim rate even when pose packets stall. Returns
+        the number of joints commanded (0 when the layer is off/suspended).
+        """
+        if self.lower_body is None or self.suspended:
+            return 0
+        state = dict(self.commanded)
+        state.update(self.measured)
+        try:
+            targets, meta = self.lower_body.step(
+                now_s, torso_rp=torso_rp, fsr=fsr, measured=state, yaw_bias=yaw_bias
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Lower-body step failed, disabling ({exc})")
+            self.lower_body = None
+            return 0
+        self._lb_meta = meta
+
+        if self.balance is not None and meta.get("balance_ok", False):
+            try:
+                corr = self.balance.compute_correction(state, torso_rp)
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Balance step failed, disabling ({exc})")
+                self.balance = None
+                corr = {}
+            for name, delta in corr.items():
+                targets[name] = self.limiter.clamp_angle(
+                    name, targets.get(name, 0.0) + delta
+                )
+
+        applied = 0
+        for name, value in targets.items():
+            if name not in self.motors:
+                continue
+            self.base_targets[name] = value
+            # The gait smoother's snappier alpha is right here too: the legs must
+            # follow a step, not lag it into a shuffle.
+            smoothed = self.gait_smoother.smooth(name, value)
+            self._set_motor(name, smoothed, self._gait_velocity_for(name))
+            applied += 1
+        return applied
+
+    def set_lower_body_observation(self, obs: Optional[object]) -> None:
+        """Latch a fresh lower-body observation (no-op when the layer is off)."""
+        if self.lower_body is not None and obs is not None:
+            self.lower_body.set_observation(obs)
+
+    def lower_body_stand_down(self) -> None:
+        """Tell the lower body to forget the last observation (tracking lost)."""
+        if self.lower_body is not None:
+            self.lower_body.stand_down()
+
+    @property
+    def lower_body_meta(self) -> Dict[str, object]:
+        """Latest lower-body telemetry (mode, shift, lift, stance margin, ...)."""
+        return dict(self._lb_meta)
+
+    # -- whole-body Webots Motion clips ------------------------------------
+    def release_to_motion(self) -> None:
+        """Hand the whole body to a Webots ``Motion`` clip.
+
+        Two things have to happen, and missing either one is why "play a walk
+        clip" usually looks broken:
+
+        1. Stop commanding motors, so our targets do not fight the clip's
+           keyframes.
+        2. **Lift the velocity caps.** ``Motion`` playback works by calling
+           ``setPosition`` on every joint each step; a motor still limited to
+           ~25% of its maximum velocity simply cannot reach those keyframes, so
+           the pre-balanced gait arrives late at every foot placement and the
+           robot topples. Motors keep whatever velocity was last set, so the caps
+           must be raised explicitly here.
+        """
+        if self.suspended:
+            return
+        for name, motor in self.motors.items():
+            cfg = self.configs.get(name)
+            try:
+                motor.setVelocity(cfg.max_velocity if cfg else 6.0)
+            except Exception:  # noqa: BLE001
+                pass
+        self.suspended = True
+
+    def reclaim_from_motion(self) -> None:
+        """Take the body back from a motion clip without a jolt.
+
+        The smoothers still hold pre-clip values, and the robot is now somewhere
+        else entirely, so they are reseeded from the position sensors before
+        per-joint commanding resumes.
+        """
+        if not self.suspended:
+            return
+        self.suspended = False
+        self.reseed_from_measured()
+        for name in self.motors:
+            self._set_motor(name, self.measured.get(name, self.commanded.get(name, 0.0)),
+                            self._velocity_for(name))
 
     # -- gait / walking -----------------------------------------------------
     def set_gait_command(self, gait: Optional[Dict[str, object]]) -> None:
@@ -521,7 +701,7 @@ class NaoPoseDriver:
         symmetric correction is skipped (the engine's IMU-tilt abort is the
         safety net). Returns the number of joints commanded; 0 if walk is off.
         """
-        if self.gait_engine is None:
+        if self.gait_engine is None or self.suspended:
             return 0
         state = dict(self.commanded)
         state.update(self.measured)
@@ -562,6 +742,22 @@ class NaoPoseDriver:
         """Latest walk-engine telemetry (amp_gain, phase, cadence, single_support)."""
         return dict(self._gait_meta)
 
+    def reseed_from_measured(self) -> None:
+        """Reset the smoothers to the measured joint angles.
+
+        Call this when handing control back from an external whole-body motion
+        (e.g. a Webots walk clip) to per-joint imitation/gait, so targets ease
+        from where the robot ACTUALLY is rather than from a stale smoother value
+        — avoids a jolt at the motion->imitation transition.
+        """
+        for name in self.motors:
+            val = self.measured.get(name)
+            if val is None:
+                continue
+            self.smoother.reset(name, val)
+            self.gait_smoother.reset(name, val)
+            self.commanded[name] = val
+
     def update(self, incoming: Dict[str, float], now_s: Optional[float] = None) -> int:
         """Apply one frame of *pre-computed* pipeline joint angles (fallback).
 
@@ -575,23 +771,33 @@ class NaoPoseDriver:
     def update_from_keypoints(
         self, keypoints: Dict[str, object], now_s: Optional[float] = None
     ) -> int:
-        """Apply one frame by retargeting raw MediaPipe landmarks (full body).
+        """Apply one camera frame: arms/head now, legs via the lower-body layer.
+
+        The arms and head are commanded here because they are safe to drive
+        straight from the pose. The legs are NOT: their observation is only
+        *latched* for whichever lower-body layer the controller is running this
+        step, which then decides how much of it the robot can execute without
+        losing balance. That split is what keeps a single commander on the legs.
 
         Returns the number of joints commanded. Imported lazily to avoid a
         circular import (``nao_retarget`` depends on this module).
         """
-        from nao_retarget import retarget_full_body
+        from nao_retarget import retarget_upper_body
 
-        # When the walk engine is active it OWNS the legs (the gait posture
-        # replaces the retargeter's crouch), so don't let the keypoint path
-        # fight it for the lower body.
-        targets = retarget_full_body(
+        targets = retarget_upper_body(
             keypoints,
-            drive_legs=self.drive_legs and not self.enable_walk,
             drive_head=self.drive_head,
             swap_sides=self.swap_sides,
             limiter=self.limiter,
         )
+        if self.leg_retargeter is not None:
+            try:
+                obs = self.leg_retargeter.observe(keypoints)
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Leg retargeting failed, disabling ({exc})")
+                self.leg_retargeter = None
+            else:
+                self.set_lower_body_observation(obs)
         return self._apply_targets(targets, now_s)
 
     def read_feedback(self) -> None:
@@ -640,10 +846,10 @@ class NaoPoseDriver:
             joints += ["HeadYaw", "HeadPitch"]
         if self.drive_legs or self.enable_walk:
             for side in ("L", "R"):
-                joints += [f"{side}HipPitch", f"{side}KneePitch", f"{side}AnklePitch"]
-        if self.enable_walk:
-            for side in ("L", "R"):
-                joints += [f"{side}HipRoll", f"{side}AnkleRoll"]
+                joints += [
+                    f"{side}HipYawPitch", f"{side}HipRoll", f"{side}HipPitch",
+                    f"{side}KneePitch", f"{side}AnklePitch", f"{side}AnkleRoll",
+                ]
         return [j for j in joints if j in self.motors]
 
 

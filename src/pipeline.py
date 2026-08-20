@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import signal
 import time
 from collections import deque
@@ -75,6 +76,7 @@ class PoseImitationPipeline:
             model_complexity=int(cfg.get("pose.model_complexity", 1)),
             min_detection_confidence=float(cfg.get("pose.min_detection_confidence", 0.5)),
             min_tracking_confidence=float(cfg.get("pose.min_tracking_confidence", 0.5)),
+            smooth_landmarks=bool(cfg.get("pose.smooth_landmarks", True)),
             allow_synthetic_fallback=bool(cfg.get("pose.allow_synthetic_fallback", False)),
         )
         if estimator.is_real:
@@ -84,7 +86,10 @@ class PoseImitationPipeline:
                 estimator.min_detection_confidence, estimator.min_tracking_confidence
             )
         else:
-            logger.error("Pose estimator: SYNTHETIC fallback (will NOT follow the human). This is a fallback mode.")
+            logger.error(
+                "Pose estimator: SYNTHETIC fallback (will NOT follow the human). "
+                "This is a fallback mode."
+            )
 
         flip_horizontal = bool(cfg.get("input.flip_horizontal", True))
         mapper = RetargetingMapper(joint_limits=default_joint_limits())
@@ -147,13 +152,16 @@ class PoseImitationPipeline:
                         frame_index=command.frame_index,
                     )
                     run_logger.log_joint_command(command)
-                    if bridge is not None:
-                        # Stream joint angles + raw landmarks (full-body
-                        # retargeting) and the gait command (real-time walking).
-                        bridge.send_pose_frame(
-                            command, pose.keypoints,
-                            gait=gait_cmd.as_dict() if walk_enabled else None,
-                        )
+                # The landmarks are the PRIMARY channel -- the controller does its
+                # own full-body retargeting from them and only falls back to these
+                # joint angles. So the frame goes out whenever a human was
+                # detected: gating the send on the legacy mapper succeeding meant a
+                # partial pose silently froze the robot mid-motion.
+                if bridge is not None and (pose.keypoints or command.joint_angles_rad):
+                    bridge.send_pose_frame(
+                        command, pose.keypoints,
+                        gait=gait_cmd.as_dict() if walk_enabled else None,
+                    )
 
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
                 latency_window.append(elapsed_ms)
@@ -163,13 +171,17 @@ class PoseImitationPipeline:
 
                 if self.options.show_window:
                     n_joints = len(command.joint_angles_rad) if command else 0
-                    visible_landmarks = sum(1 for kp in pose.keypoints.values() if kp.visibility > 0.3)
+                    visible_landmarks = sum(
+                        1 for kp in pose.keypoints.values() if kp.visibility > 0.3
+                    )
                     hud = [
                         f"Target FPS: {fps_controller.current_fps:5.1f}",
                         f"Joints: {n_joints}   Visible: {visible_landmarks}/33",
                         "Source: MediaPipe" if estimator.is_real else "Source: SYNTHETIC",
                         f"Gait: {gait_cmd.state:5s} {gait_cmd.cadence_hz:.2f}Hz "
                         f"conf {gait_cmd.conf:.2f}",
+                        f"Body yaw: {math.degrees(gait_cmd.body_yaw_rad):+6.1f} deg "
+                        f"conf {gait_cmd.yaw_conf:.2f}",
                     ]
                     canvas = overlay.draw(
                         image, pose,

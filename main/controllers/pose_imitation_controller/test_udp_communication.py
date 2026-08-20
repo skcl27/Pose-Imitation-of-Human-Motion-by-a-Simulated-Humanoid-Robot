@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import socket
 import time
-from typing import Dict
 
 
 def test_receive_commands(port: int = 8765, timeout: float = 10.0) -> None:
@@ -62,12 +61,12 @@ def test_receive_commands(port: int = 8765, timeout: float = 10.0) -> None:
                     
                     # Show joint details on first frame
                     if frame_count == 10:
-                        print("\nSample joint angles (frame {}):".format(frame_idx))
+                        print(f"\nSample joint angles (frame {frame_idx}):")
                         for joint, angle in sorted(angles.items()):
                             print(f"  {joint:20s}: {angle:7.4f} rad ({angle*180/3.14159:7.2f}°)")
                         print()
                 
-            except socket.timeout:
+            except TimeoutError:
                 print("\n✗ No data received (timeout)")
                 break
                 
@@ -80,7 +79,7 @@ def test_receive_commands(port: int = 8765, timeout: float = 10.0) -> None:
         elapsed = time.time() - start_time
         fps = frame_count / elapsed if elapsed > 0 else 0
         print("-" * 70)
-        print(f"Summary:")
+        print("Summary:")
         print(f"  Frames received: {frame_count}")
         print(f"  Total bytes: {total_bytes}")
         print(f"  Duration: {elapsed:.1f} seconds")
@@ -141,7 +140,7 @@ def test_bidirectional(port: int = 8765) -> None:
     }
     message = json.dumps(payload).encode("utf-8")
     sock.sendto(message, ("127.0.0.1", port))
-    print(f"✓ Sent test command (frame 999)")
+    print("✓ Sent test command (frame 999)")
     
     # Try to receive it back (if loopback)
     try:
@@ -149,7 +148,7 @@ def test_bidirectional(port: int = 8765) -> None:
         received = json.loads(data.decode("utf-8"))
         print(f"✓ Received response from {addr}")
         print(f"  Frame: {received.get('frame_index')}")
-    except socket.timeout:
+    except TimeoutError:
         print("✗ No response (expected if controller doesn't echo)")
     
     sock.close()

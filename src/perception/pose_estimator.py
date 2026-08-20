@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 
 import cv2
 import numpy as np
@@ -70,7 +70,7 @@ class PoseEstimator:
                 "Imported `mediapipe` module does not expose `solutions` (mp.solutions).\n"
                 "This commonly happens when MediaPipe is not compatible with the current Python\n"
                 "version (MediaPipe supports Python 3.10-3.12). See docs/RUN_INSTRUCTIONS.md\n"
-                "for guidance.\nOriginal error: {}".format(exc)
+                f"for guidance.\nOriginal error: {exc}"
             )
             if self.allow_synthetic_fallback:
                 logger.error(msg)

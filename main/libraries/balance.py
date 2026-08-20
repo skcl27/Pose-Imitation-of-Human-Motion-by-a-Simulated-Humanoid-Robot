@@ -174,7 +174,7 @@ class NaoCoMModel:
     def __init__(self) -> None:
         self.joints = _JOINTS
         self.links = _LINKS
-        self.total_mass = sum(l.mass for l in self.links)
+        self.total_mass = sum(link.mass for link in self.links)
 
     def frames(self, angles: Dict[str, float]) -> Dict[str, np.ndarray]:
         """4x4 transforms of every frame in the Torso frame for ``angles`` (rad)."""
@@ -348,11 +348,13 @@ class BalanceController:
         best_cost = self._imbalance(self._apply_corr(angles, c0), torso_rp)[0]
         # Spiral in ankle space; hips follow at a fraction (ankle strategy first).
         for dx, dy in fibonacci_spiral(self.params.search_points, self.params.search_scale):
+            ank_lo, ank_hi = -self.params.max_ankle_corr, self.params.max_ankle_corr
+            hip_lo, hip_hi = -self.params.max_hip_corr, self.params.max_hip_corr
             cand = {
-                "ank_pitch": _clamp(c0["ank_pitch"] + dx, -self.params.max_ankle_corr, self.params.max_ankle_corr),
-                "ank_roll":  _clamp(c0["ank_roll"] + dy, -self.params.max_ankle_corr, self.params.max_ankle_corr),
-                "hip_pitch": _clamp(c0["hip_pitch"] + 0.4 * dx, -self.params.max_hip_corr, self.params.max_hip_corr),
-                "hip_roll":  _clamp(c0["hip_roll"] + 0.4 * dy, -self.params.max_hip_corr, self.params.max_hip_corr),
+                "ank_pitch": _clamp(c0["ank_pitch"] + dx, ank_lo, ank_hi),
+                "ank_roll":  _clamp(c0["ank_roll"] + dy, ank_lo, ank_hi),
+                "hip_pitch": _clamp(c0["hip_pitch"] + 0.4 * dx, hip_lo, hip_hi),
+                "hip_roll":  _clamp(c0["hip_roll"] + 0.4 * dy, hip_lo, hip_hi),
             }
             cost = self._imbalance(self._apply_corr(angles, cand), torso_rp)[0]
             if cost < best_cost:

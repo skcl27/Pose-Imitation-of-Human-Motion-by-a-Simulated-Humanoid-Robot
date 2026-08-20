@@ -13,8 +13,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.pipeline import PipelineOptions, PoseImitationPipeline
-from src.utils.config import load_config
+from src.pipeline import PipelineOptions, PoseImitationPipeline  # noqa: E402
+from src.utils.config import load_config  # noqa: E402
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 
@@ -74,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         log.error(
             "Detected Python %d.%d with MediaPipe enabled and no synthetic fallback.\n"
             "MediaPipe is not compatible with Python 3.13+.\n"
-            "Options: use Python 3.10-3.12, set `pose.allow_synthetic_fallback: true` in %s, or set `pose.use_mediapipe: false`.",
+            "Options: use Python 3.10-3.12, set `pose.allow_synthetic_fallback: true`\n"
+            "in %s, or set `pose.use_mediapipe: false`.",
             py_ver.major, py_ver.minor, config_path,
         )
         return 3

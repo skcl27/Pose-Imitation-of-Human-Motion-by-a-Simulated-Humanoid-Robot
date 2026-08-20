@@ -13,12 +13,10 @@ import math
 import os
 import sys
 
-import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
 from balance import HIP_OFFSET_Y, NaoCoMModel  # noqa: E402
-from gait import GaitEngine, GaitParams, LEG_JOINTS  # noqa: E402
+from gait import LEG_JOINTS, GaitEngine, GaitParams  # noqa: E402
 from pose_control_utils import get_default_motor_configs  # noqa: E402
 
 CONFIGS = get_default_motor_configs()

@@ -13,6 +13,9 @@ pose:
   use_mediapipe: true
   # 0 = lite (fastest), 1 = full (balanced), 2 = heavy (most accurate, slowest).
   model_complexity: 1
+  # MediaPipe's own temporal filter. Keep it on: the controller's leg solve reads
+  # segment foreshortening, which is very sensitive to per-frame landmark jitter.
+  smooth_landmarks: true
   # Lowered thresholds for more robust detection in real-time scenarios
   min_detection_confidence: 0.35
   min_tracking_confidence: 0.35
@@ -36,13 +39,18 @@ webots_bridge:
   host: 127.0.0.1
   port: 8765
 
-# Real-time walking (Python side: gait-cue extraction + streaming).
-# The robot replicates the human's WALK via an on-robot gait engine; it does NOT
-# copy raw leg angles (monocular depth is unreliable). The walk TIER (march vs.
-# experimental single-support step) is selected controller-side in
+# Real-time walking / turning (Python side: cue extraction + streaming).
+#
+# This side reports *what the human is doing*: marching cadence/phase and the
+# torso yaw angle. What the ROBOT does with that -- pre-balanced walk clips, the
+# in-place march engine, or per-leg pose imitation -- is decided controller-side
+# by LEG_CONTROL in
 # main/controllers/pose_imitation_controller/pose_imitation_controller.py.
+#
+# Per-leg lower-body imitation (squat, single-leg lift) needs no configuration
+# here: it is driven straight from the streamed landmarks by the controller.
 walk:
-  enabled: true        # stream the gait command in the UDP packet
+  enabled: true        # stream the gait + body-yaw command in the UDP packet
   cue_window_s: 1.3    # history window for cadence/amplitude (s)
   amp_start: 0.08      # normalized knee-swing amplitude to START marching
   amp_stop: 0.05       # below this -> STOP (hysteresis; bias to standing still)

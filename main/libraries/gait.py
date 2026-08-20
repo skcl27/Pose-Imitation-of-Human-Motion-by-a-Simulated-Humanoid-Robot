@@ -39,7 +39,7 @@ Design invariants
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from pose_control_utils import JointLimiter, get_default_motor_configs
@@ -67,7 +67,7 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def _wrap_pi(a: float) -> float:
-    """Wrap an angle to (-pi, pi]."""
+    """Wrap an angle to [-pi, pi)."""
     return (a + math.pi) % TWO_PI - math.pi
 
 
@@ -240,7 +240,8 @@ class GaitEngine:
 
     # -- postures -----------------------------------------------------------
     def _crouch(self, u: float) -> Dict[str, float]:
-        """Symmetric statically-balanced crouch (matches nao_retarget._lower_body)."""
+        """Symmetric statically-balanced crouch (same posture as
+        ``nao_retarget.crouch_posture``, which every leg layer decays back to)."""
         return {
             "LHipPitch": -u, "RHipPitch": -u,
             "LKneePitch": 2.0 * u, "RKneePitch": 2.0 * u,
@@ -304,8 +305,14 @@ class GaitEngine:
         half = (theta % math.pi) / math.pi  # 0..1 within the current half-cycle
         lift_window = 0.5 * (1.0 - math.cos(TWO_PI * half))  # 0 at ends, 1 mid-swing
 
-        # Shift weight onto the stance foot (asymmetric, same-sign world lean).
-        shift_dir = 1.0 if stance == "L" else -1.0
+        # Shift weight onto the stance foot (same-sign roll = a whole-body lean).
+        # Sign note: a POSITIVE same-sign hip roll carries the pelvis toward the
+        # robot's RIGHT (the thighs tilt left, so with the feet planted the torso
+        # goes the other way), so loading the LEFT foot needs a NEGATIVE lean.
+        # Verified against balance.NaoCoMModel.stance_margin; the equivalent
+        # decision in lower_body.LowerBodyController is probed from that model at
+        # run time rather than hard-coded.
+        shift_dir = -1.0 if stance == "L" else 1.0
         shift = p.step_shift_rad * eff * shift_dir
 
         targets = self._crouch(u0)
