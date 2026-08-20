@@ -85,7 +85,7 @@ class LowerBodyParams:
 
     # -- how much asymmetric human detail we allow, per channel ------------
     max_hip_pitch_dev: float = 0.90
-    max_hip_roll_dev: float = 0.35
+    max_hip_roll_dev: float = 0.7906  # rad ~ 45.3 deg, NAO HipRoll hardware limit
     max_knee_dev: float = 1.10
     max_ankle_dev: float = 0.60
     # Authority given to per-leg deviations while BOTH feet are loaded. Small on
