@@ -65,10 +65,18 @@ What actually limits a wide stance
 ----------------------------------
 Not the hip. NAO's ``HipRoll`` reaches 45.3 deg, but ``AnkleRoll`` only reaches
 22.8 deg -- and the ankle is what levels the sole against the hip's abduction.
-Past 22.8 deg the sole can no longer be kept flat and the robot ends up standing
-on the inner edges of its feet, which tips it. So ``max_abduction`` is set by the
-*ankle* range, and it is still a very visible stance widening (the feet end up
-~2.5x further apart than they start).
+Past 22.8 deg the sole can no longer be kept flat.
+
+Refusing to go past that point turned out to be too strict: recorded runs show
+subjects spreading to ~25 deg routinely and 34 deg at the extreme, so the robot
+saturated just below the human and it read as "it spreads, but not as much as
+me". So a small, explicit ``sole_tilt_budget`` is spent instead: the hip may
+abduct that much further than the ankle can level, leaving each sole a few
+degrees off flat and the robot standing on the inner part of each foot, which is
+a good trade for the extra width. The budget is then enforced as a *post-
+condition* on the commanded angles (:meth:`_limit_sole_tilt`), so it holds no
+matter how the symmetric, antisymmetric and balance terms happen to add up -- and
+when something has to give, it is stance width, never sole contact.
 
 Pure Python + the (optional) NumPy CoM model, no Webots import, so all of the
 sequencing and gating logic is unit-testable off-simulation.
@@ -81,6 +89,13 @@ from typing import Dict, Optional, Tuple
 
 from nao_retarget import LegTarget, LowerBodyObservation, crouch_posture
 from pose_control_utils import JointLimiter, get_default_motor_configs
+
+_CONFIGS = get_default_motor_configs()
+# How far the ankle can roll to level a sole against the hip's abduction. Smaller
+# than the hip's own range, which is what makes it -- not the hip -- the binding
+# constraint on stance width.
+ANKLE_ROLL_LIMIT = min(abs(_CONFIGS["LAnkleRoll"].min_angle),
+                       _CONFIGS["RAnkleRoll"].max_angle)
 
 # The 12 leg joints this controller owns while it is active.
 LEG_JOINTS = (
@@ -120,10 +135,18 @@ class LowerBodyParams:
     # Mirror-symmetric poses (wider stance, deeper squat) are CoM-neutral and
     # widen the support polygon, so they pass at full authority.
     symmetric_gain: float = 1.0
-    # Largest both-legs-outward abduction we ask for. Set by the ANKLE range, not
-    # the hip: beyond 22.8 deg the ankle can no longer level the sole and the
-    # robot stands on the inner edges of its feet. See the module docstring.
-    max_abduction: float = 0.398
+    # How far out of flat each sole is allowed to end up. A sole is flat when
+    # AnkleRoll == -HipRoll, and the ankle's range is smaller than the hip's, so a
+    # wide stance necessarily tilts the soles a little. Spending a small, bounded
+    # amount of tilt buys real stance width: at 0.15 rad the outer edge of a
+    # 76 mm-wide foot lifts about 11 mm, so the robot stands on the inner part of
+    # each sole while the two soles are far further apart than before.
+    sole_tilt_budget: float = 0.15
+    # Largest both-legs-outward abduction we ask for: what the ankle can level,
+    # plus that tilt budget. Recorded runs show subjects reaching ~25 deg (p99)
+    # and 34 deg (peak), so the ankle limit alone (22.8 deg) saturated just below
+    # what people actually do -- which read as "it spreads, but not like me".
+    max_abduction: float = ANKLE_ROLL_LIMIT + 0.15
     # Antisymmetric poses (a lean, a split stance) do move the CoM, and in double
     # support there is no single-foot polygon to verify them against, so they are
     # deliberately limited.
@@ -293,6 +316,7 @@ class LowerBodyController:
 
         targets = self._compose(obs, swing, yaw_bias if mode == MODE_DOUBLE else 0.0)
         clamped = {n: self.limiter.clamp_angle(n, v) for n, v in targets.items()}
+        self._limit_sole_tilt(clamped)
         meta: Dict[str, object] = {
             "why": self._explain(obs, tilt_ok, swing, gate, human_lift),
             "lift_source": obs.lift_source,
@@ -581,6 +605,38 @@ class LowerBodyController:
                 targets.get("R" + channel, 0.0)
                 + p.symmetric_gain * r_sym
                 + p.asymmetric_gain * (antisym if mirrored else -antisym)
+            )
+
+    def apply_sole_tilt_limit(self, targets: Dict[str, float]) -> Dict[str, float]:
+        """Keep each sole within ``sole_tilt_budget`` of flat, in place.
+
+        A sole is flat when ``AnkleRoll == -HipRoll``. When the budget is exceeded
+        the HIP gives way, not the ankle: standing on the edge of a foot is what
+        tips the robot, and losing a little stance width is cheap by comparison.
+
+        Call this **last**, immediately before commanding the motors. The layer
+        applies it to its own output, but the caller then folds in the CoM balance
+        correction, whose roll terms are not tilt-neutral (``balance.py`` searches
+        hip and ankle roll independently) -- so the guarantee only actually holds
+        at the final commanded values if it is re-applied there. Idempotent.
+        """
+        self._limit_sole_tilt(targets)
+        return targets
+
+    def _limit_sole_tilt(self, targets: Dict[str, float]) -> None:
+        """In-place implementation of :meth:`apply_sole_tilt_limit`."""
+        budget = self.params.sole_tilt_budget
+        for side in ("L", "R"):
+            hip_name, ankle_name = f"{side}HipRoll", f"{side}AnkleRoll"
+            hip = targets.get(hip_name)
+            ankle = targets.get(ankle_name)
+            if hip is None or ankle is None:
+                continue
+            tilt = hip + ankle
+            if abs(tilt) <= budget:
+                continue
+            targets[hip_name] = self.limiter.clamp_angle(
+                hip_name, hip - (tilt - math.copysign(budget, tilt))
             )
 
     def _shift_dir_cached(self, stance: str) -> float:

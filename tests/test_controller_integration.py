@@ -411,9 +411,21 @@ def test_a_very_wide_spread_saturates_instead_of_tipping(harness) -> None:
     harness.spin(150, STANDING, IDLE_GAIT)
     harness.spin(200, LEGS_WIDE, IDLE_GAIT)
     roll = harness.angle("LHipRoll")
-    # Capped by the ankle's ability to level the sole, not by the hip's range.
-    assert 0.35 < roll <= abs(CONFIGS["LAnkleRoll"].min_angle) + 1e-6
+    # Reaches past what the ankle can level -- spending a bounded sole tilt to
+    # buy width, because stopping at the ankle's limit saturated below the ~25 deg
+    # people actually spread to.
+    assert roll > abs(CONFIGS["LAnkleRoll"].min_angle)
     assert roll < CONFIGS["LHipRoll"].max_angle          # hip could go further
+    # ... but no sole ends up more than the budget off flat. The budget is a
+    # guarantee on the commanded target; the per-joint smoother can overshoot it
+    # by a hair in transit because hip and ankle travel different distances, so
+    # allow a small settling margin.
+    from lower_body import LowerBodyParams
+    budget = LowerBodyParams().sole_tilt_budget
+    harness.spin(400, LEGS_WIDE, IDLE_GAIT)
+    for side in ("L", "R"):
+        tilt = harness.angle(f"{side}HipRoll") + harness.angle(f"{side}AnkleRoll")
+        assert abs(tilt) <= budget + 0.01, (side, tilt)
 
 
 def test_the_legs_come_back_together(harness) -> None:
@@ -804,3 +816,42 @@ def test_unresponsive_foot_sensors_reduce_the_lift_but_do_not_block_it(
         assert "reduced authority" in str(meta["why"])
     finally:
         h.close()
+
+
+def test_the_robot_turns_round_to_face_behind_you(harness) -> None:
+    """The yaw estimate used to be bounded to +/-90 deg by an abs(), so the robot
+    could never be asked to turn more than a quarter circle."""
+    harness.spin(60, STANDING, IDLE_GAIT)
+    behind = dict(IDLE_GAIT, body_yaw_rad=math.radians(175))
+    kps = subject(yaw=175.0)
+    for _ in range(8):
+        harness.spin(40, kps, behind)
+        if harness.ctl.motion.active:
+            # Model the clip actually turning the robot by its nominal 60 deg.
+            action = harness.ctl.motion.action
+            harness.ctl.imu.rpy[2] += math.radians(60 if action == "turn_left" else -60)
+    turns = [m for m in FakeMotion.played if "Turn" in m]
+    assert len(turns) >= 3                       # 175 deg needs several clips
+    assert len(set(turns)) == 1                  # all the same way -- no thrash
+    residual = abs(harness.ctl.yaw_servo.error(harness.ctl.imu.rpy[2]))
+    assert residual < math.radians(35)           # within half a clip
+
+
+def test_a_wobbling_heading_does_not_thrash_turn_clips(harness) -> None:
+    """A jittery yaw made the planner alternate left/right, which starves forward
+    walking and trips the locomotion failure backoff -- the reason nothing moved."""
+    harness.spin(60, STANDING, IDLE_GAIT)
+    for i in range(30):
+        wobble = math.radians(12) * (1 if i % 2 else -1)
+        harness.spin(6, subject(yaw=math.degrees(wobble)),
+                     dict(IDLE_GAIT, body_yaw_rad=wobble))
+    turns = [m for m in FakeMotion.played if "Turn" in m]
+    assert turns == []                           # nothing fired at all
+    assert harness.ctl.motion.available          # and clips were never abandoned
+
+
+def test_walking_is_not_starved_by_a_settled_heading(harness) -> None:
+    harness.spin(60, STANDING, IDLE_GAIT)
+    mode = harness.spin(20, STANDING, MARCH_GAIT)
+    assert mode == "motion:forward"
+    assert "Forwards.motion" in FakeMotion.played

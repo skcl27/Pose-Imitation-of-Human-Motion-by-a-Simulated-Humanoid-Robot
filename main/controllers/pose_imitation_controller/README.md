@@ -130,7 +130,7 @@ stance leg stays near the balanced crouch because it is carrying the robot.
 | You do | Robot does | Limited by |
 |---|---|---|
 | Squat | 1:1 to 40° hip / 80° knee | knee range, not balance — see below |
-| Spread your legs | 1:1 to 22.8° per leg | **the ankle**, not the hip — see below |
+| Spread your legs | 1:1 to ~30°, saturating at 31.4° per leg | the **ankle** plus a bounded sole tilt — see below |
 | Lean sideways | ~35% of your lean | moves the CoM; gated on purpose |
 | Split stance (one leg fwd) | ~35% | same |
 | **Raise one leg** | full lift once the weight has transferred | the CoM model (§3) |
@@ -143,11 +143,23 @@ shank are within 3 mm of the same length, so the crouch posture
 CoM over the foot — at *any* depth, with the torso vertical and the soles flat
 throughout. The real ceiling is the knee's own 121° range.
 
-**A wide stance is capped by the ankle.** `HipRoll` reaches 45.3° but `AnkleRoll`
-only 22.8°, and the ankle is what levels the sole against the hip's abduction.
-Past 22.8° the sole cannot be kept flat and the robot ends up standing on the
-inner edges of its feet, which tips it. So the usable stance width is set by the
-*ankle* range — still about 2.5× the feet's resting separation.
+**A wide stance is capped by the ankle, plus a deliberate tilt budget.**
+`HipRoll` reaches 45.3° but `AnkleRoll` only 22.8°, and the ankle is what levels
+the sole against the hip's abduction — so past 22.8° the sole cannot be kept flat.
+
+Refusing to go further turned out to be too strict. Recorded runs show subjects
+spreading to ~25° routinely and 34° at the extreme, so the robot saturated just
+below the human and it read as *"it spreads, but not as much as me"*. A small
+explicit `sole_tilt_budget` (0.15 rad) is spent instead: the hip may abduct that
+much further than the ankle can level, leaving each sole a few degrees off flat
+and the robot on the inner part of each foot — a good trade for the extra width
+(the outer edge of a 76 mm foot lifts about 11 mm).
+
+The budget is enforced as a **post-condition on the final commanded angles**, not
+just on this layer's output — the CoM balance correction is folded in afterwards
+and its roll terms are not tilt-neutral, so the guarantee is re-applied at the
+point of command. When the budget binds, stance width gives way, never sole
+contact.
 
 **The squat is one degree of freedom, read off the solve.** Depth is the smallest
 reading across two axes and both legs: hip vs. knee (bending at the *waist* also
@@ -223,7 +235,7 @@ first — each trades stability margin for faithfulness:
 |---|---|---|
 | `asymmetric_gain` (0.35) | follow leans and split stances more closely | moves the CoM with no single-foot polygon to verify it against |
 | `max_crouch_u` (0.70) | squat deeper | approaches the knee's 121° limit |
-| `max_abduction` (0.398) | spread wider | past the ankle's range the soles tilt onto their inner edges |
+| `sole_tilt_budget` (0.15) | spread wider still | the soles sit further off flat, onto their inner edges |
 | `fsr_min_gain` (0.40) | trust the CoM model over the foot sensors | loses the load-transfer cross-check |
 | `margin_min` (0.002) | start lifting sooner | starts unloading a foot with less margin |
 
@@ -303,6 +315,63 @@ while standing perfectly still. `plan_action` also refuses a clip that would
 overshoot (a 60° clip is not fired at a 15° error), so the residual heading error
 is bounded by half a clip. Aligning the heading takes priority over walking
 forward: walking off along the wrong heading is much harder to undo.
+
+The servo tracks rotation **relative to where it first saw you**, so standing
+habitually a little off-square is absorbed by the latch rather than corrected
+forever.
+
+### The yaw covers the whole circle
+
+The lateral term is used **signed**. Turn past 90° and your shoulders swap sides
+in the image, and that sign is exactly the front/back discriminator a single
+camera is otherwise missing:
+
+| You are | lateral | depth | yaw |
+|---|---|---|---|
+| facing the camera | > 0 | ~0 | ~0° |
+| turned 90° | ~0 | ≠ 0 | ±90° |
+| facing away | < 0 | ~0 | ±180° |
+
+An earlier version took `abs()` of the lateral term, which folded the two halves
+together and bounded the estimate to ±90° — so the robot could never be asked to
+turn round, however far you turned.
+
+The term is `left.x − right.x`, not the other way about: MediaPipe labels a
+person facing the camera with their *left* shoulder on the image's **right**.
+Measured on recorded runs, `right.x − left.x` is negative on 67% of frames with
+both shoulders clearly visible (median −0.085), and 99% of those frames have both
+ears visible — a face-on view. The hips agree, so it is a labelling convention
+rather than noise, and it holds whether or not the preview is mirrored (MediaPipe
+cannot tell a mirrored subject from a real one, so it labels by appearance either
+way). With the sign inverted, someone looking straight at the camera was reported
+as turned 180° away.
+
+### Why the yaw is filtered so carefully
+
+A noisy heading does not merely wobble the robot — it makes the controller demand
+turn clips in **alternating directions**, which starves forward walking and trips
+the locomotion failure backoff, so the robot ends up doing nothing at all. That
+is exactly what recorded runs showed: `|yaw|` spiking to the ±90° bound on 7–18%
+of frames while the subject stood square to the camera, and the planner asking
+for `turn_left` 1438× against `forward` 17× in one run.
+
+Three guards, all in `gait_cues._update_yaw`:
+
+1. **Span gating.** A body-fixed segment keeps a near-constant length however you
+   turn (the depth term takes over from the lateral one). The observed length is
+   compared against a self-calibrated peak-hold reference, so a collapsed or
+   occluded detection is rejected outright instead of becoming a large angle.
+2. **Shortest-arc smoothing.** Yaw is circular now, so a plain EMA would travel
+   the long way round through 180°. The estimate is smoothed along the shortest
+   arc and the pair contributions are averaged as *vectors*, not angles.
+3. **Jump de-weighting.** A frame disagreeing with the running estimate by more
+   than 0.6 rad is more likely noise than a real rotation at camera frame rates,
+   so it is followed (it might be genuine — never latch up) but its confidence is
+   halved.
+
+Replayed over the same recorded runs, turn requests drop from 1438+53 and
+846+1206 to 9+8 and 11+15, `forward` rises to 13–15% of decisions, and the
+planner sits in "stand" 83–86% of the time.
 
 While the stepping turn has not fired yet, a small capped `HipYawPitch` bias
 gives immediate visual feedback. It is deliberately tiny — NAO's `HipYawPitch`
@@ -555,11 +624,25 @@ model refuses to unload the foot: usually the robot has not finished leaning yet
 only 50% of the load…"*, the FSRs are not seeing the transfer; raise
 `fsr_min_gain` toward 1.0 to trust the CoM model instead.
 
-**Spreading my legs barely widens the stance**
-It saturates at 22.8° per leg, which is the ankle's limit for keeping the soles
-flat, not a safety gate (see §2). If it stops well short of that, check the
-`legs:` reason — a one-sided spread is partly antisymmetric and therefore partly
-gated.
+**Spreading my legs does not go as wide as mine**
+It tracks you 1:1 to about 30° and saturates at 31.4° per leg (§2). Past that the
+soles would sit too far off flat. Raise `sole_tilt_budget` if you want more and
+can accept the robot standing further onto the inner edges of its feet. If it
+stops well short of 30°, check the `legs:` reason — a one-sided spread is partly
+antisymmetric and therefore partly gated.
+
+**The robot never turns, or turns the wrong way and back again**
+Check the `heading error` line. If it never settles, the yaw estimate is not
+being trusted — most often because your torso is only partly in frame, so the
+span gate rejects it (§5). If the robot turns *consistently* the wrong way, flip
+`TURN_SIGN`; if it alternates, that is the yaw thrashing, not the sign.
+
+**The robot never walks forward**
+Forward walking needs the gait detector to see you marching, which needs your
+**knees** in frame: `gait_cues` requires 3 of the 4 hip/knee landmarks above 0.5
+visibility for `conf >= 0.6`. Recorded runs had the knees visible on only
+53–65% of frames with a detected torso. Watch the `Gait: … conf` field in the
+pipeline HUD and step back until it stays above 0.6.
 
 **Raised leg produces nothing at all**
 Check `lift-cue` in the log. `none` means neither your feet nor your knees are in

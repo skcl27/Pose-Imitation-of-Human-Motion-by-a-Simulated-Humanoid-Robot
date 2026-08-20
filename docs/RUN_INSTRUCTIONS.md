@@ -243,6 +243,12 @@ The per-100-frame status line then says in plain language what the legs are
 doing, e.g. `legs: holding: centre of mass not yet over the stance foot` or
 `legs: knees and feet both out of frame; leg lift cannot be seen`.
 
+### If the robot never walks forward
+Forward walking needs the gait detector to see you *marching*, and that needs
+your **knees** in frame. Watch the `Gait: … conf` field in the camera window: it
+has to stay above 0.6. Recorded runs had the knees visible on only 53–65% of
+frames with a detected torso — step back from the camera until your knees show.
+
 ### If a raised leg does nothing
 Check `lift-cue` in that status line. `none` means neither your feet nor your
 knees are in frame, so the lift is literally invisible — step back from the

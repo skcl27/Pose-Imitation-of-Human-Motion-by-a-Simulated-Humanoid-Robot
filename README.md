@@ -17,11 +17,11 @@ A Linux-first, real-time pipeline that:
 | Move your arms | Follows both arms (shoulder pitch **and** roll, elbow) |
 | Turn / nod your head | Follows head yaw and pitch |
 | Squat | Squats 1:1 with you, to 40° hip / 80° knee |
-| **Spread your legs** | Widens its stance 1:1 with you, to 22.8° per leg (the ankle's limit for keeping the soles flat) |
+| **Spread your legs** | Widens its stance 1:1 with you, to ~30° per leg (limited by how far the ankle can keep the sole flat) |
 | **Raise one leg** | Shifts its weight onto the other foot, *then* raises the matching leg — as far as its own centre-of-mass model says is safe |
 | Lean, or split your stance | Follows partly — these move the centre of mass, so they stay limited |
 | **Walk / march** | Walks across the floor for real (its world coordinates change), using Webots' pre-balanced NAO walk clips; marches in place if no clips are installed |
-| **Turn your body** | Steps round to face the same way, closing the loop on the InertialUnit heading |
+| **Turn your body** | Steps round to face the same way — through the **full circle**, including turning to face behind you — closing the loop on the InertialUnit heading |
 
 The lower body is the interesting part: a single camera cannot see whether NAO's
 centre of mass is over a foot, so the camera only ever supplies the *desired* leg

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "librar
 
 from balance import NaoCoMModel  # noqa: E402
 from lower_body import (  # noqa: E402
+    ANKLE_ROLL_LIMIT,
     LEG_JOINTS,
     MODE_DOUBLE,
     MODE_SINGLE,
@@ -381,16 +382,43 @@ def test_a_wider_stance_keeps_both_soles_flat() -> None:
             pytest.approx(0.0, abs=1e-6)
 
 
-def test_abduction_is_capped_by_the_ankle_not_the_hip() -> None:
-    """NAO's HipRoll reaches 45 deg but AnkleRoll only 22.8, and past that the
-    sole cannot be levelled -- so the ankle sets the usable stance width."""
+def test_abduction_is_capped_by_the_ankle_plus_a_tilt_budget() -> None:
+    """NAO's HipRoll reaches 45 deg but AnkleRoll only 22.8, and past that the sole
+    cannot be levelled. Stopping at 22.8 saturated below what people actually do,
+    so a small bounded sole tilt is spent to buy the extra width."""
     p = LowerBodyParams()
     ctl = LowerBodyController(com_model=NaoCoMModel())
     targets, _, _, _ = run(ctl, abducted(1.5), 2.0)      # absurd request
     assert targets["LHipRoll"] == pytest.approx(p.max_abduction, abs=0.02)
     assert p.max_abduction < CONFIGS["LHipRoll"].max_angle   # hip could go further
     assert p.max_abduction == pytest.approx(
-        abs(CONFIGS["LAnkleRoll"].min_angle), abs=0.005)     # ankle is the limit
+        ANKLE_ROLL_LIMIT + p.sole_tilt_budget, abs=1e-9)
+    # ... and it reaches past the ankle's own range, which is the whole point.
+    assert p.max_abduction > ANKLE_ROLL_LIMIT
+    # Recorded runs show subjects at ~25 deg (p99); the cap must clear that.
+    assert p.max_abduction > math.radians(25)
+
+
+def test_the_sole_tilt_budget_is_enforced_as_a_post_condition() -> None:
+    """Whatever the symmetric, antisymmetric and balance terms add up to, no sole
+    may end up further than the budget from flat -- standing on the edge of a foot
+    is what tips the robot."""
+    p = LowerBodyParams()
+    for obs in (abducted(1.5), leaning(1.5), abducted(1.2), split_stance(1.5)):
+        ctl = LowerBodyController(com_model=NaoCoMModel())
+        targets, _, _, _ = run(ctl, obs, 2.0)
+        for side in ("L", "R"):
+            tilt = targets[f"{side}HipRoll"] + targets[f"{side}AnkleRoll"]
+            assert abs(tilt) <= p.sole_tilt_budget + 1e-6, (side, tilt)
+
+
+def test_stance_width_gives_way_before_sole_contact() -> None:
+    """When the budget binds it is the HIP that backs off, not the ankle."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, _, _, _ = run(ctl, abducted(1.5), 2.0)
+    # The ankle is at its hardware limit, doing all it can to level the sole.
+    assert targets["LAnkleRoll"] == pytest.approx(
+        CONFIGS["LAnkleRoll"].min_angle, abs=1e-6)
 
 
 def test_a_lean_is_still_gated() -> None:

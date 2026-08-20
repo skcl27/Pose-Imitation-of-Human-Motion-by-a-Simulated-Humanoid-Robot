@@ -604,6 +604,9 @@ class NaoPoseDriver:
                 targets[name] = self.limiter.clamp_angle(
                     name, targets.get(name, 0.0) + delta
                 )
+            # The balance loop's roll terms are not sole-tilt-neutral, so the
+            # lower body's tilt guarantee has to be re-applied once they are in.
+            self.lower_body.apply_sole_tilt_limit(targets)
 
         applied = 0
         for name, value in targets.items():

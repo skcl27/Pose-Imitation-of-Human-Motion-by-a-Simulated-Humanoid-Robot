@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
 from walk_motion import (  # noqa: E402
@@ -255,3 +257,97 @@ def test_reset_unlatches() -> None:
     servo.update(human_yaw=0.2, conf=1.0, robot_yaw=0.0, now_s=0.0)
     servo.reset()
     assert not servo.latched and servo.error(1.0) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Turning through large angles, and noise immunity
+# ---------------------------------------------------------------------------
+def _converge(target_yaw, *, clip="/w/TurnLeft60.motion", steps=40, noise=0.0):
+    """Settle facing forward, then have the human turn to ``target_yaw``.
+
+    The settle phase matters: :class:`YawServo` latches the human/robot heading
+    pair on first sight, so a *constant* offset is absorbed by the latch and is
+    not an error at all -- only a change from the latched reference is. The robot
+    is then turned by discrete clips of the size the filename implies.
+
+    Returns ``(final |error| rad, clips played, left/right direction flips)``.
+    """
+    clips = {"turn_left": clip, "turn_right": clip.replace("Left", "Right")}
+    nominal = abs(motion_nominal_yaw(clip))
+    servo = YawServo()
+    robot = 0.0
+    played = flips = 0
+    previous = None
+    turning = False
+    t = 0.0
+    for _ in range(5):                      # settle: human faces forward
+        servo.update(human_yaw=0.0, conf=1.0, robot_yaw=robot, now_s=t)
+        t += 0.1
+    for i in range(steps):                  # then they turn, with some wobble
+        wobble = noise * (1 if i % 2 else -1)
+        servo.update(human_yaw=target_yaw + wobble, conf=1.0,
+                     robot_yaw=robot, now_s=t)
+        t += 0.1
+        plan = plan_action(yaw_error_rad=servo.error(robot),
+                           available=clips, turning=turning)
+        turning = plan.is_turn
+        if plan.is_turn:
+            played += 1
+            if previous and previous != plan.action:
+                flips += 1
+            previous = plan.action
+            robot += nominal * (1 if plan.action == "turn_left" else -1)
+    return abs(wrap_pi(servo.error(robot))), played, flips
+
+
+def test_the_servo_turns_the_robot_all_the_way_round() -> None:
+    """Half a turn takes several 60 deg clips; it must converge, not stall."""
+    for target in (math.radians(150), math.radians(180), -math.radians(170)):
+        err, played, flips = _converge(target)
+        assert played >= 2, target
+        assert err <= math.radians(35), (target, math.degrees(err))
+        assert flips == 0, (target, flips)
+
+
+def test_the_servo_converges_for_any_target_heading() -> None:
+    for degrees in range(-180, 181, 15):
+        err, _, flips = _converge(math.radians(degrees))
+        assert err <= math.radians(35), (degrees, math.degrees(err))
+        assert flips <= 1, (degrees, flips)
+
+
+def test_the_servo_takes_the_short_way_round() -> None:
+    """A 170 deg target must not be chased the 190 deg way."""
+    _, played_left, _ = _converge(math.radians(170))
+    _, played_right, _ = _converge(-math.radians(170))
+    assert played_left == played_right          # symmetric effort
+    assert played_left <= 4                     # 170/60 -> 3 clips, not 4+
+
+
+def test_measurement_noise_does_not_thrash_the_turn_direction() -> None:
+    """The real failure: a jittery yaw made the planner alternate left/right,
+    which starves forward walking and trips the locomotion failure backoff."""
+    err, played, flips = _converge(0.0, noise=math.radians(12), steps=60)
+    assert flips == 0
+    assert played == 0            # 12 deg of wobble is below the turn gate
+    assert err <= math.radians(15)
+
+
+def test_a_small_turn_does_not_start_a_clip() -> None:
+    """Shifting 20 deg is below the gate: firing a 60 deg clip would leave a
+    bigger error, of the opposite sign, than it started with."""
+    err, played, _ = _converge(math.radians(20), steps=80)
+    assert played == 0
+    assert err == pytest.approx(math.radians(20), abs=1e-6)
+
+
+def test_a_constant_offset_is_absorbed_by_the_latch() -> None:
+    """Standing habitually a little off-square is not an error to correct: the
+    servo tracks rotation *relative* to where it first saw you."""
+    servo = YawServo()
+    for i in range(10):
+        servo.update(human_yaw=math.radians(25), conf=1.0,
+                     robot_yaw=0.0, now_s=i * 0.1)
+    assert servo.error(0.0) == pytest.approx(0.0, abs=1e-9)
+    assert plan_action(yaw_error_rad=servo.error(0.0),
+                       available={"turn_left": "/w/TurnLeft60.motion"}).action is None

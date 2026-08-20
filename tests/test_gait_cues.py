@@ -157,7 +157,8 @@ def test_as_dict_is_json_friendly() -> None:
 # ---------------------------------------------------------------------------
 # Torso yaw (body rotation)
 # ---------------------------------------------------------------------------
-def _yaw_frame(t: float, yaw_deg: float, idx: int = 0, vis: float = 1.0) -> PoseFrame:
+def _yaw_frame(t: float, yaw_deg: float, idx: int = 0, vis: float = 1.0,
+               span: float = 1.0) -> PoseFrame:
     """A subject standing still, rotated ``yaw_deg`` about the vertical axis.
 
     The shoulder and hip lines are body-fixed horizontal segments, so rotating
@@ -166,12 +167,14 @@ def _yaw_frame(t: float, yaw_deg: float, idx: int = 0, vis: float = 1.0) -> Pose
     """
     a = math.radians(yaw_deg)
     kps = {}
-    for name, half, y in (("shoulder", 0.09, 0.30), ("hip", 0.06, 0.55)):
-        for side, sgn in (("left", -1.0), ("right", +1.0)):
+    # MediaPipe's convention, verified against recorded runs: for a subject
+    # facing the camera the LEFT landmark sits on the image's RIGHT.
+    for name, half, y in (("shoulder", 0.09 * span, 0.30), ("hip", 0.06 * span, 0.55)):
+        for side, sgn in (("left", +1.0), ("right", -1.0)):
             kps[f"{side}_{name}"] = Keypoint(
                 x=0.5 + sgn * half * math.cos(a),
                 y=y,
-                z=-sgn * half * math.sin(a),   # screen-right endpoint comes nearer
+                z=+sgn * half * math.sin(a),
                 visibility=vis,
             )
     for side, sgn in (("left", -1.0), ("right", +1.0)):
@@ -245,3 +248,82 @@ def test_yaw_is_smoothed_not_snapped() -> None:
     jump = ex.update(_yaw_frame(1.0, 60.0, 30))
     # One frame must not deliver the whole 60 deg step, or turn clips chatter.
     assert 0.0 < jump.body_yaw_rad < math.radians(45)
+
+
+# ---------------------------------------------------------------------------
+# Full-circle yaw
+#
+# The estimate used abs(lateral), which folded the front/back halves together and
+# bounded it to +/-90 deg -- so the robot could never be asked to turn round. It
+# also spiked to that bound on 7-18% of frames in recorded runs, which made the
+# controller demand turn clips in alternating directions and starved walking.
+# ---------------------------------------------------------------------------
+def test_yaw_covers_the_whole_circle() -> None:
+    for target in (0, 45, 90, 135, 180, -135, -90, -45):
+        got = math.degrees(_settle_yaw(target).body_yaw_rad)
+        # Wrapped difference, since +180 and -180 are the same heading.
+        err = (got - target + 180.0) % 360.0 - 180.0
+        assert abs(err) < 12.0, (target, got)
+
+
+def test_facing_away_is_not_confused_with_facing_forward() -> None:
+    forward = _settle_yaw(0.0).body_yaw_rad
+    away = _settle_yaw(180.0).body_yaw_rad
+    assert abs(forward) < 0.15
+    assert abs(away) > math.radians(160)
+
+
+def test_yaw_is_monotonic_through_ninety_degrees() -> None:
+    """+/-90 deg used to be a hard bound; it must now be an ordinary waypoint."""
+    values = [_settle_yaw(d).body_yaw_rad for d in (60, 75, 90, 105, 120)]
+    assert values == sorted(values)
+    assert values[-1] > math.radians(100)
+
+
+def test_a_collapsed_detection_is_rejected_not_read_as_a_big_angle() -> None:
+    """The failure that produced the +/-90 spikes: when the shoulder line
+    collapses, atan2 reports a large angle from what is really just noise."""
+    ex = GaitCueExtractor()
+    for i in range(120):
+        cmd = ex.update(_yaw_frame(i / 30.0, 0.0, i))
+    assert cmd.yaw_conf > 0.9
+    for i in range(15):
+        cmd = ex.update(_yaw_frame(4.0 + i / 30.0, 0.0, 200 + i, span=0.2))
+    assert cmd.yaw_conf == 0.0            # not trusted at all
+    assert abs(cmd.body_yaw_rad) < 0.2    # and the estimate did not run away
+
+
+def test_a_single_frame_jump_is_de_weighted() -> None:
+    ex = GaitCueExtractor()
+    for i in range(120):
+        ex.update(_yaw_frame(i / 30.0, 0.0, i))
+    jumped = ex.update(_yaw_frame(4.1, 85.0, 200))
+    assert jumped.yaw_conf <= 0.55         # halved: too fast to be real
+    assert abs(jumped.body_yaw_rad) < math.radians(45)   # and not followed fully
+
+
+def test_yaw_crosses_the_seam_by_the_short_way() -> None:
+    ex = GaitCueExtractor()
+    for i in range(120):
+        ex.update(_yaw_frame(i / 30.0, 175.0, i))
+    for i in range(60):
+        cmd = ex.update(_yaw_frame(5.0 + i / 30.0, -175.0, 300 + i))
+    # 10 deg apart across the seam; going the long way would pass through 0.
+    assert cmd.body_yaw_rad < -math.radians(150)
+
+
+def test_yaw_survives_a_steady_rotation_all_the_way_round() -> None:
+    """A continuous turn must not stick, fold or jump direction anywhere."""
+    ex = GaitCueExtractor()
+    seen = []
+    for i in range(361):
+        cmd = ex.update(_yaw_frame(i / 30.0, i - 180.0, i))
+        if i > 60:
+            seen.append(cmd.body_yaw_rad)
+    unwrapped = [seen[0]]
+    for value in seen[1:]:
+        prev = unwrapped[-1]
+        unwrapped.append(prev + ((value - prev + math.pi) % (2 * math.pi) - math.pi))
+    # Monotonically increasing heading, covering most of a full turn.
+    assert unwrapped[-1] - unwrapped[0] > math.radians(250)
+    assert all(b >= a - 1e-6 for a, b in zip(unwrapped, unwrapped[1:], strict=False))

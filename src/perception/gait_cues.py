@@ -30,6 +30,39 @@ landmark motion** — never an absolute angle and never depth ``z``:
   its whole body instead of just its head: NAO has no torso-yaw joint, so the
   controller servos its measured heading onto this angle by stepping round.
 
+  The lateral term is used **signed**, which is what makes the estimate cover
+  the whole circle rather than a quarter of it. Turn past 90 degrees and your
+  shoulders swap sides in the image, so the lateral term changes sign -- and that
+  sign is exactly the front/back discriminator a single camera is otherwise
+  missing. Using ``abs()`` folded the two halves together and bounded the estimate
+  to +/-90 degrees, so the robot could never be asked to turn round.
+
+  The lateral term is ``left.x - right.x``, not the other way about. MediaPipe
+  labels a person facing the camera with their *left* shoulder on the image's
+  right, so ``right.x - left.x`` is negative in the facing-forward case -- which
+  would report someone looking straight at the camera as being turned 180 degrees
+  away. Measured on recorded runs: negative on 67% of frames with both shoulders
+  clearly visible (median -0.085), and 99% of those frames have both ears visible,
+  i.e. a face-on view. The hips agree, so it is a labelling convention rather than
+  noise, and it holds whether or not the preview is mirrored (MediaPipe cannot
+  tell a mirrored subject from a real one, so it labels by appearance either way)::
+
+      facing the camera   lateral > 0, dz ~ 0   ->  yaw ~   0 deg
+      turned 90 deg       lateral ~ 0, dz != 0  ->  yaw ~ +/-90 deg
+      facing away         lateral < 0, dz ~ 0   ->  yaw ~ +/-180 deg
+
+  Robustness matters more here than anywhere else in this module, because a
+  noisy yaw does not merely wobble the robot -- it makes the controller demand
+  turn clips in alternating directions, which starves forward walking and trips
+  the locomotion failure backoff. Recorded runs showed |yaw| spiking to the
+  +/-90 bound on 7-18% of frames while the subject stood square to the camera.
+  Three guards fix that: the shoulder span is compared against a self-calibrated
+  reference so a collapsed or occluded detection is rejected rather than turned
+  into a large angle; the estimate is smoothed on the *shortest arc* (it is a
+  circular quantity now, so a plain EMA would take the long way round through
+  180 degrees); and a frame that disagrees sharply with the running estimate has
+  its confidence halved instead of being trusted.
+
 The extractor is stateful (it keeps a short timestamped history) but is a pure
 function of the landmark stream — no camera, no Webots, no RNG — so it is
 unit-testable off-simulation and deterministic for recorded-video replay
@@ -106,11 +139,59 @@ IDLE = GaitCommand("idle", 0.0, 0.0, 0, 0.0, 0.0, 0.0)
 TURN_FULL_RAD = math.radians(60.0)
 # Depth is only trustworthy for the *sign* of a shoulder/hip depth difference, so
 # it is scaled down before entering the yaw solve; the lateral (image-plane) term
-# carries the magnitude.
+# carries the magnitude. Under-reporting the angle is the safe direction: the
+# robot then approaches the true heading rather than overshooting it.
 YAW_Z_TRUST = 0.75
 # Landmark pairs the yaw is averaged over, hips weighted lower (they are noisier
 # and clothing-dependent).
 _YAW_PAIRS = (("left_shoulder", "right_shoulder", 1.0), ("left_hip", "right_hip", 0.6))
+# A body-fixed segment keeps a near-constant length however the subject turns
+# (the depth term takes over from the lateral one), so an observed length well
+# below the self-calibrated reference means the landmarks are unreliable -- not
+# that the subject is at some large angle. Below ``_YAW_SPAN_FLOOR`` of the
+# reference the reading is discarded; it ramps to full trust at ``_YAW_SPAN_GOOD``.
+_YAW_SPAN_FLOOR = 0.45
+_YAW_SPAN_GOOD = 0.70
+# Circular EMA rate for the reported yaw. Slow on purpose: this drives a stepping
+# servo whose granularity is a 60 degree clip, so chasing per-frame noise buys
+# nothing and costs clip thrash.
+_YAW_EMA_ALPHA = 0.18
+# A single frame disagreeing with the running estimate by more than this is more
+# likely noise than a real rotation at camera frame rates, so it is de-weighted.
+_YAW_JUMP_RAD = 0.60
+
+
+def _wrap_pi(angle: float) -> float:
+    """Wrap an angle to [-pi, pi). Yaw is circular now, so this is load-bearing."""
+    return (angle + math.pi) % TWO_PI - math.pi
+
+
+class _PeakHold:
+    """Running maximum: rises quickly, decays very slowly.
+
+    Learns a body-fixed segment's true length from the stream. A projected
+    segment can only ever look *shorter* than it is, so the running peak
+    converges on the real length; the slow decay lets it follow a genuinely
+    different subject or camera distance instead of latching forever.
+    """
+
+    __slots__ = ("value", "rise", "decay")
+
+    def __init__(self, rise: float = 0.30, decay: float = 0.004) -> None:
+        self.value: float = 0.0
+        self.rise = rise
+        self.decay = decay
+
+    def update(self, sample: float) -> float:
+        if not math.isfinite(sample) or sample <= 0.0:
+            return self.value
+        if self.value <= 0.0:
+            self.value = sample
+        elif sample > self.value:
+            self.value += self.rise * (sample - self.value)
+        else:
+            self.value += self.decay * (sample - self.value)
+        return self.value
 
 
 class GaitCueExtractor:
@@ -160,6 +241,8 @@ class GaitCueExtractor:
         self._scale_ema: Optional[float] = None  # smoothed body width
         self._yaw_ema: float = 0.0                # smoothed torso yaw (rad)
         self._yaw_seen: bool = False
+        # Self-calibrated reference length of each yaw segment (shoulders, hips).
+        self._yaw_span = [_PeakHold() for _ in _YAW_PAIRS]
         self._state: str = "idle"
 
     # -- public API ---------------------------------------------------------
@@ -215,6 +298,7 @@ class GaitCueExtractor:
         self._scale_ema = None
         self._yaw_ema = 0.0
         self._yaw_seen = False
+        self._yaw_span = [_PeakHold() for _ in _YAW_PAIRS]
         self._state = "idle"
 
     # -- internals ----------------------------------------------------------
@@ -249,25 +333,23 @@ class GaitCueExtractor:
         return (left_h - right_h) / scale
 
     def _update_yaw(self, kps: Dict[str, Keypoint]) -> Tuple[float, float]:
-        """Smoothed torso yaw in radians and its confidence.
+        """Smoothed torso yaw in radians (full circle) and its confidence.
 
         The shoulder (and hip) line is a body-fixed horizontal segment, so its
         image-plane extent and its depth spread are the two legs of a right
         triangle whose angle *is* the yaw::
 
-            yaw = atan2(depth spread, lateral extent)
+            yaw = atan2(-depth spread, lateral extent)
 
-        Facing the camera the depth spread is ~0 and the lateral extent is
-        maximal, so yaw ~ 0; turned 90 deg the shoulders overlap in the image and
-        separate fully in depth, so yaw ~ +/-90 deg. Only the *sign* of the depth
-        term is load-bearing (which side is nearer), which is exactly what
-        MediaPipe's ``z`` is dependable for, so it is down-weighted rather than
-        trusted metrically.
+        with the lateral term taken **signed** so the estimate covers the whole
+        circle -- see the module docstring for the sign table and for why the
+        robustness guards below exist.
         """
+        best_conf = 0.0
+        vec_x = 0.0     # accumulate as a VECTOR, not an angle: averaging angles
+        vec_y = 0.0     # across the +/-180 seam gives nonsense.
         total_w = 0.0
-        acc = 0.0
-        conf = 0.0
-        for left_name, right_name, weight in _YAW_PAIRS:
+        for index, (left_name, right_name, weight) in enumerate(_YAW_PAIRS):
             left = kps.get(left_name)
             right = kps.get(right_name)
             if left is None or right is None:
@@ -275,28 +357,48 @@ class GaitCueExtractor:
             vis = min(left.visibility, right.visibility)
             if vis < 0.5:
                 continue
-            lateral = right.x - left.x
+            # See the module docstring: MediaPipe puts the LEFT shoulder on the
+            # image's right for a subject facing the camera, so this ordering is
+            # what makes "facing forward" read as 0 rather than 180 degrees.
+            lateral = left.x - right.x
             depth = (right.z - left.z) * YAW_Z_TRUST
-            if abs(lateral) < 1e-4 and abs(depth) < 1e-4:
+            span = math.hypot(lateral, depth)
+            if span < 1e-4:
                 continue
-            # Positive yaw = rotated toward the subject's screen-left, i.e. the
-            # landmark drawn on the right of the image has moved *nearer*.
-            acc += weight * math.atan2(-depth, abs(lateral))
-            total_w += weight
-            conf = max(conf, vis)
+            # A body-fixed segment has a near-constant length at any yaw, so the
+            # observed length against its learned reference tells us whether to
+            # believe this frame at all.
+            reference = self._yaw_span[index].update(span)
+            trust = _clamp(
+                (span / max(reference, 1e-6) - _YAW_SPAN_FLOOR)
+                / (_YAW_SPAN_GOOD - _YAW_SPAN_FLOOR), 0.0, 1.0
+            )
+            if trust <= 0.0:
+                continue
+            w = weight * trust
+            vec_x += w * lateral / span
+            vec_y += w * -depth / span
+            total_w += w
+            best_conf = max(best_conf, vis * trust)
 
-        if total_w <= 0.0:
+        if total_w <= 0.0 or math.hypot(vec_x, vec_y) < 1e-9:
             return self._yaw_ema, 0.0
 
-        raw = acc / total_w
-        # A light EMA: the yaw feeds a stepping servo with coarse granularity, so
-        # a jittery angle would chatter turn clips.
+        raw = math.atan2(vec_y, vec_x)
         if not self._yaw_seen:
             self._yaw_ema = raw
             self._yaw_seen = True
-        else:
-            self._yaw_ema += 0.25 * (raw - self._yaw_ema)
-        return self._yaw_ema, _clamp(conf, 0.0, 1.0)
+            return self._yaw_ema, _clamp(best_conf, 0.0, 1.0)
+
+        # Smooth along the SHORTEST arc: a plain EMA would travel the long way
+        # round whenever the subject crosses the +/-180 seam.
+        delta = _wrap_pi(raw - self._yaw_ema)
+        if abs(delta) > _YAW_JUMP_RAD:
+            # Too big a jump for one camera frame to be a real rotation. Follow it
+            # (it may be genuine and we must not latch up) but say we are unsure.
+            best_conf *= 0.5
+        self._yaw_ema = _wrap_pi(self._yaw_ema + _YAW_EMA_ALPHA * delta)
+        return self._yaw_ema, _clamp(best_conf, 0.0, 1.0)
 
     def _push(self, t: float, s: float) -> None:
         self._hist.append((t, s))
