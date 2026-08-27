@@ -23,7 +23,7 @@ This document describes the complete workflow and architecture of the **Pose Imi
          ▼
 ┌─────────────────┐
 │  Pose Detection │
-│  (MediaPipe)    │
+│  (MeTRAbs, GPU) │
 └────────┬────────┘
          │
          ▼
@@ -119,38 +119,40 @@ This document describes the complete workflow and architecture of the **Pose Imi
 ## Phase 2: Pose Detection & Estimation
 
 ### Technology Stack
-- **MediaPipe Pose** - Google's ML-based human pose estimation
+- **[MeTRAbs](https://github.com/isarandi/metrabs)** - GPU-accelerated absolute-3D human pose estimation (TensorFlow / TensorFlow-Hub, with a built-in YOLOv4 person detector)
 - **NumPy** - Numerical computations
 - **OpenCV** - Image preprocessing
 
 ### Components
 - `src/perception/pose_estimator.py` - `PoseEstimator` class
-- `src/perception/landmarks.py` - Landmark definitions (33 keypoints)
+- `src/perception/metrabs_model.py` - model loading, GPU check, skeleton introspection, camera intrinsics
+- `src/perception/landmarks.py` - Landmark definitions (19 keypoints, `coco_19` skeleton)
 
 ### Process Flow
 
 1. **Initialization**
-   - Loads MediaPipe Pose model with configurable complexity:
-     - 0 = Lite (fastest)
-     - 1 = Full (balanced, default)
-     - 2 = Heavy (most accurate, slowest)
-   - Sets detection and tracking confidence thresholds (default: 0.35)
-   - Enables landmark smoothing for temporal stability
+   - Checks a GPU is visible to TensorFlow (fails loudly otherwise -- see
+     `pose.require_gpu` in configs/default.yaml)
+   - Loads the MeTRAbs SavedModel via TensorFlow-Hub (`pose.model_url`,
+     default: EfficientNetV2-S backbone, cached locally after first download)
+   - Reads the model's actual joint names for `pose.skeleton` (`coco_19`) and
+     matches them against this project's canonical landmark names
 
 2. **Frame Processing**
-   - Converts BGR frame to RGB (MediaPipe requirement)
-   - Feeds image to MediaPipe Pose detector
-   - Receives 33 body landmarks per frame
+   - Converts BGR frame to RGB
+   - Feeds the image to `model.detect_poses(...)` (detector + 3D pose network
+     in one call), with `num_aug=1` and `max_detections=1` for latency
+   - Receives 3D poses (mm, camera frame), 2D pixel poses, and a detection box
 
 3. **Landmark Extraction**
-   - **33 Keypoints** including:
-     - Face: nose, eyes, ears, mouth
-     - Upper body: shoulders, elbows, wrists, hands
-     - Torso: hips
-     - Lower body: knees, ankles, feet, toes
+   - **19 Keypoints** including:
+     - Face: nose, eyes, ears
+     - Upper body: shoulders, elbows, wrists
+     - Torso: neck, pelvis, hips
+     - Lower body: knees, ankles
    - Each landmark contains:
-     - (x, y, z) coordinates (normalized 0-1 for x,y; depth for z)
-     - Visibility score (0-1)
+     - (x, y, z) absolute METRIC coordinates in millimeters, camera frame (x right, y down, z forward/away)
+     - Visibility PROXY (0-1): in-frame/in-detection-box confidence, NOT a true per-joint occlusion estimate (MeTRAbs has no per-joint confidence output)
 
 4. **Output Generation**
    - Creates `PoseFrame` object with:
@@ -159,19 +161,16 @@ This document describes the complete workflow and architecture of the **Pose Imi
      - Dictionary of named keypoints (e.g., "left_shoulder", "right_elbow")
 
 ### Key Features
-- Real-time human pose tracking (25-100 FPS)
-- Robust cross-platform support
-- Explicit failure handling (no silent fallbacks unless configured)
+- Real GPU-accelerated 3D pose tracking
+- Explicit failure handling (no silent CPU fallback unless configured)
 - Optional synthetic fallback mode for testing (disabled by default)
 
 ### Detected Landmarks
 ```
-Head: nose, left/right eye (inner/outer), left/right ear
+Head: nose, left/right eye, left/right ear
 Upper Body: left/right shoulder, left/right elbow, left/right wrist
-Hands: left/right pinky, left/right index, left/right thumb
-Torso: left/right hip
+Torso: neck, pelvis, left/right hip
 Lower Body: left/right knee, left/right ankle
-Feet: left/right heel, left/right foot_index
 ```
 
 ---
@@ -330,7 +329,8 @@ Feet: left/right heel, left/right foot_index
 
 ### Technology Stack
 - **OpenCV** - GUI window and drawing
-- **MediaPipe Drawing Utils** - Skeleton rendering
+- Custom skeleton renderer (`SkeletonOverlay`), projecting MeTRAbs' 3D mm
+  landmarks back to pixels with a pinhole intrinsic matrix
 
 ### Components
 - `src/perception/visualizer.py` - `SkeletonOverlay` class
@@ -390,9 +390,9 @@ Feet: left/right heel, left/right foot_index
        "timestamp_s": 1.234,
        "frame_index": 42,
        "keypoints": {
-         "left_shoulder": [0.40, 0.40, -0.10, 0.99],
-         "left_knee":     [0.46, 0.73, -0.10, 0.97],
-         "left_heel":     [0.45, 0.93, -0.10, 0.93]
+         "left_shoulder": [-160.2, -580.4, 1980.1, 0.99],
+         "left_knee":     [-114.8, 428.7, 2010.5, 0.97],
+         "left_ankle":    [-119.3, 826.9, 2005.1, 0.95]
        },
        "gait": {
          "state": "march", "cadence_hz": 0.95, "phase": 1.83,
@@ -402,12 +402,14 @@ Feet: left/right heel, left/right foot_index
        "joint_angles_rad": { "LShoulderPitch": 0.52 }
      }
      ```
-   - `keypoints` **(primary)** — ~21 landmarks as `[x, y, z, visibility]` in
-     normalized image coordinates. Head, shoulders, elbows, wrists, hips, knees,
-     ankles, **heels and toes**; the curated subset keeps the packet small
-     (NFR-1). The feet matter: the controller finds the "ground line" as the lower
-     of the two feet, and averaging ankle with heel makes single-leg lift
-     detection markedly steadier.
+   - `keypoints` **(primary)** — 19 landmarks as `[x, y, z, visibility]` in
+     absolute METRIC camera-frame coordinates (millimeters; x right, y down, z
+     forward/away). Head, shoulders, elbows, wrists, hips, knees, ankles, neck,
+     pelvis; the curated subset keeps the packet small (NFR-1). `visibility` is
+     a PROXY (in-frame/in-box confidence), not true per-joint occlusion --
+     MeTRAbs has no per-joint confidence output. MeTRAbs' `coco_19` skeleton has
+     no separate heel/toe landmarks (unlike the old MediaPipe 33-point set), so
+     the controller's ground-line/lift detection falls back to ankle-only.
    - `gait` — cadence/phase/stop for the march engine, plus `body_yaw_rad`
      (**an angle**, so the controller can close a heading loop on it) and
      `yaw_conf`, which is independent of `conf` because the yaw needs only the
@@ -601,11 +603,11 @@ controller *looks frozen* because every leg command is absorbed by foot slip.
 ```
 1. Video Frame (30-100 FPS)
    ↓
-2. Pose Detection (MediaPipe) → 33 landmarks
+2. Pose Detection (MeTRAbs, GPU) → 19 landmarks (absolute 3D, mm)
    ↓
-3. Joint Mapping (Geometric IK) → 7 joint angles
+3. Joint Mapping (Geometric IK) → 7 joint angles (Python-side fallback path)
    ↓
-4. Smoothing (Exponential filter) → Filtered angles
+4. Smoothing (Exponential filter, keypoints + angles) → Filtered
    ↓
 5. UDP Send (JSON over UDP) → Webots controller
    ↓
@@ -613,9 +615,9 @@ controller *looks frozen* because every leg command is absorbed by foot slip.
 ```
 
 ### Key Performance Characteristics
-- **End-to-end latency**: 50-150ms (adaptive)
-- **Frame rate**: 25-100 FPS (adaptive)
-- **Pose detection**: 25-35ms per frame
+- **End-to-end latency / frame rate / pose-detection timing**: depends heavily
+  on the GPU and MeTRAbs backbone chosen (`pose.model_url`) -- unverified on
+  this machine (written without GPU access); benchmark on the target hardware.
 - **Retargeting**: <1ms per frame
 - **UDP transmission**: <1ms per frame
 - **Smoothing**: <1ms per frame
@@ -629,7 +631,7 @@ controller *looks frozen* because every leg command is absorbed by foot slip.
 | Phase | Technology | Purpose |
 |-------|-----------|---------|
 | Video Input | OpenCV + V4L2/AVFoundation | Cross-platform video capture |
-| Pose Detection | MediaPipe Pose | ML-based human pose estimation |
+| Pose Detection | MeTRAbs (GPU) | Absolute-3D human pose estimation |
 | Retargeting | NumPy + Math | Geometric inverse kinematics |
 | Smoothing | Exponential Filter | Temporal noise reduction |
 | Communication | UDP Sockets + JSON | Low-latency data transmission |
@@ -643,7 +645,7 @@ controller *looks frozen* because every leg command is absorbed by foot slip.
 
 ### Key Libraries
 - `opencv-python` (≥4.9) - Computer vision
-- `mediapipe` (≥0.10.13) - Pose estimation
+- `tensorflow` (≥2.12, GPU build) + `tensorflow-hub` - MeTRAbs pose estimation
 - `numpy` (≥1.26) - Numerical computing
 - `pyyaml` (≥6.0) - Configuration parsing
 - `scipy` (≥1.11) - Signal processing
@@ -672,10 +674,14 @@ input:
 ### Pose Detection Configuration
 ```yaml
 pose:
-  use_mediapipe: true          # Enable MediaPipe
-  model_complexity: 1          # 0=lite, 1=full, 2=heavy
-  min_detection_confidence: 0.35
-  min_tracking_confidence: 0.35
+  use_metrabs: true             # Enable MeTRAbs
+  model_url: "https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_eff2s_y4.zip"
+  skeleton: coco_19
+  default_fov_degrees: 55.0
+  detector_threshold: 0.3
+  num_aug: 1
+  max_detections: 1
+  require_gpu: true             # refuse to start without a GPU
   allow_synthetic_fallback: false
 ```
 
@@ -754,7 +760,7 @@ python run.py --max-frames 100
 - **CPU**: Multi-core processor (Intel i5/AMD Ryzen 5 or better)
 - **RAM**: 4GB minimum (8GB recommended)
 - **Camera**: USB webcam or Sony A7 III via HDMI capture
-- **GPU**: Optional (MediaPipe uses CPU by default)
+- **GPU**: REQUIRED (CUDA-enabled, matching TensorFlow build) for real-time MeTRAbs inference
 
 ### Software
 - **OS**: Linux (Ubuntu 20.04+), macOS (10.15+), Windows 10+
@@ -811,7 +817,7 @@ python run.py --max-frames 100
 
 ## References
 
-- **MediaPipe Pose**: https://google.github.io/mediapipe/solutions/pose.html
+- **MeTRAbs**: https://github.com/isarandi/metrabs
 - **Webots Documentation**: https://cyberbotics.com/doc/guide/index
 - **OpenCV Python**: https://docs.opencv.org/4.x/d6/d00/tutorial_py_root.html
 - **Project Repository**: https://github.com/tarikbilla/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot
@@ -828,7 +834,7 @@ src/
 ├── webots_bridge.py          # UDP communication
 ├── perception/
 │   ├── video_input.py        # Video capture
-│   ├── pose_estimator.py     # MediaPipe wrapper
+│   ├── pose_estimator.py     # MeTRAbs wrapper
 │   ├── landmarks.py          # Landmark definitions
 │   └── visualizer.py         # Skeleton overlay
 ├── retargeting/

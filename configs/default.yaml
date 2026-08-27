@@ -10,16 +10,37 @@ input:
   flip_horizontal: true
 
 pose:
-  use_mediapipe: true
-  # 0 = lite (fastest), 1 = full (balanced), 2 = heavy (most accurate, slowest).
-  model_complexity: 1
-  # MediaPipe's own temporal filter. Keep it on: the controller's leg solve reads
-  # segment foreshortening, which is very sensitive to per-frame landmark jitter.
-  smooth_landmarks: true
-  # Lowered thresholds for more robust detection in real-time scenarios
-  min_detection_confidence: 0.35
-  min_tracking_confidence: 0.35
-  # MUST be false to enable real human detection via MediaPipe.
+  use_metrabs: true
+  # TF-Hub SavedModel URL (zip) or a local path to an already-extracted
+  # SavedModel dir. Default is EfficientNetV2-S ("eff2s"): a real-time-oriented
+  # speed/accuracy balance. Swap for "metrabs_eff2l_y4" (more accurate, slower)
+  # or "metrabs_mob3s_y4"/"metrabs_rn18_y4" (faster, less accurate) -- see
+  # https://github.com/isarandi/metrabs/blob/master/docs/MODELS_6_DATASETS.md
+  model_url: "https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_eff2s_y4.zip"
+  # Skeleton joint convention MeTRAbs should output. coco_19 is the closest
+  # match to the joint set this project uses (no SMPL spine/hand joints).
+  skeleton: coco_19
+  # Field of view (degrees, along the larger image side) assumed for an
+  # uncalibrated webcam -- used both for MeTRAbs' own inference and for
+  # projecting 3D points back to pixels for the HUD overlay. A rough guess,
+  # not a real calibration; tune per-camera if absolute scale matters.
+  default_fov_degrees: 55.0
+  # Confidence threshold for MeTRAbs' built-in YOLOv4 person detector.
+  detector_threshold: 0.3
+  # Test-time augmentation passes per detection. MeTRAbs' own default is 5
+  # (more accurate, slower); 1 favors the pipeline's real-time budget.
+  num_aug: 1
+  # This pipeline drives a single robot from a single human -- cap detections
+  # to 1 to skip inference work on any other people in frame.
+  max_detections: 1
+  # Light EMA smoothing applied to raw 3D keypoints (MeTRAbs, unlike MediaPipe,
+  # does not smooth across frames itself). 1.0 = no smoothing.
+  smoothing_alpha: 0.5
+  # Refuse to start on a machine with no GPU visible to TensorFlow rather than
+  # silently falling back to a much-too-slow CPU run. Only relevant when
+  # use_metrabs is true.
+  require_gpu: true
+  # MUST be false to enable real human detection via MeTRAbs.
   # When true, uses synthetic fallback with fixed landmarks (not tracking humans).
   allow_synthetic_fallback: false
 

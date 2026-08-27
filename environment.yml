@@ -21,4 +21,7 @@ dependencies:
   # System tools
   - git
   - make
-# Post-install: run `conda run -n py312 pip install mediapipe==0.10.13`
+# Post-install: run
+#   conda run -n py312 pip install "tensorflow>=2.12,<2.16" "tensorflow-hub>=0.15,<0.17"
+# with a GPU-enabled TensorFlow build matching this machine's CUDA/cuDNN driver
+# -- see docs/RUN_INSTRUCTIONS.md step 2.4.

@@ -35,22 +35,27 @@ conda env create -f environment.yml -y
 echo "✓ Conda environment created"
 echo ""
 
-# Step 3: Install MediaPipe via conda's pip
-echo "Step 3: Installing MediaPipe 0.10.13 via conda..."
-conda run -n py312 pip install mediapipe==0.10.13 --quiet
-echo "✓ MediaPipe 0.10.13 installed"
+# Step 3: Install TensorFlow + TensorFlow-Hub via conda's pip
+# Install a GPU-enabled TensorFlow build matching this machine's CUDA/cuDNN
+# driver -- see docs/RUN_INSTRUCTIONS.md step 2.4 if this pin doesn't fit.
+echo "Step 3: Installing TensorFlow + TensorFlow-Hub via conda (for MeTRAbs)..."
+conda run -n py312 pip install "tensorflow>=2.12,<2.16" "tensorflow-hub>=0.15,<0.17" --quiet
+echo "✓ TensorFlow + TensorFlow-Hub installed"
 echo ""
 
 # Step 4: Verify installation
 echo "Step 4: Verifying installation..."
-MEDIAPIPE_VERSION=$(conda run -n py312 python -c "import mediapipe as mp; print(mp.__version__)")
-MEDIAPIPE_HAS_SOLUTIONS=$(conda run -n py312 python -c "import mediapipe as mp; print(hasattr(mp, 'solutions'))")
+TF_VERSION=$(conda run -n py312 python -c "import tensorflow as tf; print(tf.__version__)")
+TF_GPUS=$(conda run -n py312 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))")
 
-echo "  - MediaPipe version: $MEDIAPIPE_VERSION"
-echo "  - Has solutions module: $MEDIAPIPE_HAS_SOLUTIONS"
+echo "  - TensorFlow version: $TF_VERSION"
+echo "  - GPUs visible: $TF_GPUS"
 
-if [ "$MEDIAPIPE_HAS_SOLUTIONS" != "True" ]; then
-    echo "ERROR: MediaPipe solutions module not found. Installation may have failed."
+if [ "$TF_GPUS" == "[]" ]; then
+    echo "ERROR: No GPU visible to TensorFlow. MeTRAbs needs a GPU for real-time"
+    echo "inference -- fix the CUDA/cuDNN install before continuing (or set"
+    echo "pose.allow_synthetic_fallback: true in configs/default.yaml to run"
+    echo "without real pose tracking)."
     exit 1
 fi
 

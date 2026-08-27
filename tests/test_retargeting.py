@@ -7,20 +7,24 @@ from src.type_defs import Keypoint, PoseFrame
 
 
 def test_mapper_outputs_expected_joints() -> None:
+    # Camera-frame mm coordinates (x right, y down, z forward/away) -- a
+    # person standing with arms hanging, facing the camera square-on (z=0
+    # for every landmark, so this also exercises the z==0 edge case of
+    # ``_horizontal_extent``).
     pose = PoseFrame(
         timestamp_s=0.0,
         frame_index=0,
         keypoints={
-            "left_shoulder": Keypoint(0.4, 0.4),
-            "right_shoulder": Keypoint(0.6, 0.4),
-            "left_elbow": Keypoint(0.35, 0.5),
-            "right_elbow": Keypoint(0.65, 0.5),
-            "left_wrist": Keypoint(0.3, 0.6),
-            "right_wrist": Keypoint(0.7, 0.6),
-            "left_hip": Keypoint(0.45, 0.6),
-            "right_hip": Keypoint(0.55, 0.6),
-            "left_knee": Keypoint(0.45, 0.8),
-            "right_knee": Keypoint(0.55, 0.8),
+            "left_shoulder": Keypoint(-100.0, -600.0, 0.0),
+            "right_shoulder": Keypoint(100.0, -600.0, 0.0),
+            "left_elbow": Keypoint(-150.0, -400.0, 0.0),
+            "right_elbow": Keypoint(150.0, -400.0, 0.0),
+            "left_wrist": Keypoint(-200.0, -200.0, 0.0),
+            "right_wrist": Keypoint(200.0, -200.0, 0.0),
+            "left_hip": Keypoint(-50.0, -200.0, 0.0),
+            "right_hip": Keypoint(50.0, -200.0, 0.0),
+            "left_knee": Keypoint(-50.0, 200.0, 0.0),
+            "right_knee": Keypoint(50.0, 200.0, 0.0),
         },
     )
 
@@ -38,21 +42,58 @@ def test_mapper_outputs_expected_joints() -> None:
     }
 
 
+def test_mapper_uses_depth_not_just_lateral_extent() -> None:
+    """Unlike the old MediaPipe-era mapper (which ignored z entirely, since
+    MediaPipe's depth was unreliable), the horizontal extent of a limb should
+    now account for real forward/backward motion too: an elbow raised the
+    same amount but reaching FORWARD instead of SIDEWAYS should read as the
+    same shoulder pitch, not a much steeper one."""
+    base = {
+        "right_shoulder": Keypoint(100.0, -600.0, 0.0),
+        "right_elbow": Keypoint(150.0, -400.0, 0.0),
+        "right_wrist": Keypoint(200.0, -200.0, 0.0),
+        "left_hip": Keypoint(-50.0, -200.0, 0.0),
+        "right_hip": Keypoint(50.0, -200.0, 0.0),
+        "left_knee": Keypoint(-50.0, 200.0, 0.0),
+        "right_knee": Keypoint(50.0, 200.0, 0.0),
+    }
+    sideways = PoseFrame(
+        timestamp_s=0.0, frame_index=0,
+        keypoints={
+            **base,
+            "left_shoulder": Keypoint(-100.0, -600.0, 0.0),
+            "left_elbow": Keypoint(-250.0, -500.0, 0.0),   # dx=-150, dy=+100, dz=0
+        },
+    )
+    forward = PoseFrame(
+        timestamp_s=0.0, frame_index=0,
+        keypoints={
+            **base,
+            "left_shoulder": Keypoint(-100.0, -600.0, 0.0),
+            "left_elbow": Keypoint(-100.0, -500.0, 150.0),  # dx=0, dy=+100, dz=150
+        },
+    )
+    mapper = RetargetingMapper(default_joint_limits())
+    pitch_sideways = mapper.map_pose(sideways).joint_angles_rad["LShoulderPitch"]
+    pitch_forward = mapper.map_pose(forward).joint_angles_rad["LShoulderPitch"]
+    assert abs(pitch_sideways - pitch_forward) < 1e-4
+
+
 def test_mapper_clips_joint_limits() -> None:
     pose = PoseFrame(
         timestamp_s=0.0,
         frame_index=1,
         keypoints={
-            "left_shoulder": Keypoint(0.5, 0.5),
-            "right_shoulder": Keypoint(0.5, 0.5),
-            "left_elbow": Keypoint(0.5, 0.1),
-            "right_elbow": Keypoint(0.5, 0.1),
-            "left_wrist": Keypoint(0.5, -0.4),
-            "right_wrist": Keypoint(0.5, -0.4),
-            "left_hip": Keypoint(0.5, 0.8),
-            "right_hip": Keypoint(0.5, 0.8),
-            "left_knee": Keypoint(0.5, 1.5),
-            "right_knee": Keypoint(0.5, 1.5),
+            "left_shoulder": Keypoint(0.0, 0.0, 0.0),
+            "right_shoulder": Keypoint(0.0, 0.0, 0.0),
+            "left_elbow": Keypoint(0.0, -400.0, 0.0),
+            "right_elbow": Keypoint(0.0, -400.0, 0.0),
+            "left_wrist": Keypoint(0.0, -900.0, 0.0),
+            "right_wrist": Keypoint(0.0, -900.0, 0.0),
+            "left_hip": Keypoint(0.0, 300.0, 0.0),
+            "right_hip": Keypoint(0.0, 300.0, 0.0),
+            "left_knee": Keypoint(0.0, 1000.0, 0.0),
+            "right_knee": Keypoint(0.0, 1000.0, 0.0),
         },
     )
 

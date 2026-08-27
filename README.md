@@ -3,12 +3,20 @@
 A Linux-first, real-time pipeline that:
 
 1. Captures live video from a webcam (or replays a video file).
-2. Runs **MediaPipe Pose** to detect a human and all **33 body landmarks**.
+2. Runs **[MeTRAbs](https://github.com/isarandi/metrabs)** (GPU-accelerated) to
+   detect a human and estimate **absolute 3D body landmarks** (millimeters,
+   camera-frame), not just a 2D projection.
 3. Draws the live skeleton on top of the camera feed in an OpenCV window.
 4. Streams the landmarks (plus gait and body-yaw cues) to a **Webots** simulated
    NAO H25 over UDP.
 5. The Webots controller retargets them to the full NAO pose and drives the robot
    while keeping it on its feet.
+
+> **GPU required.** MeTRAbs needs a CUDA-enabled TensorFlow install for
+> real-time inference -- see [`docs/RUN_INSTRUCTIONS.md`](docs/RUN_INSTRUCTIONS.md).
+> The pretrained model weights are non-commercial-use only (training-data
+> license; the MeTRAbs code itself is MIT) -- see
+> [MODELS_6_DATASETS.md](https://github.com/isarandi/metrabs/blob/master/docs/MODELS_6_DATASETS.md).
 
 ## What the robot does
 
@@ -70,7 +78,7 @@ Press **`q`** or **`ESC`** in the window to quit.
 .
 ├── configs/default.yaml              # runtime configuration
 ├── docs/
-│   ├── PRD.md                        # product requirements (incl. 33 landmarks)
+│   ├── PRD.md                        # product requirements (incl. MeTRAbs 3D landmarks)
 │   └── RUN_INSTRUCTIONS.md           # full setup guide for target PC
 ├── main/                             # Webots project root
 │   ├── worlds/…​.wbt                  # world + REQUIRED NAO foot/floor contact
