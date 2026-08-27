@@ -20,7 +20,13 @@ landmark motion** — never an absolute angle and never depth ``z``:
   which knee is currently raised; its amplitude gives how vigorously the human
   marches.
 * Normalization by a *smoothed* body width makes the cues scale-invariant, so
-  they survive the subject walking toward/away from the camera.
+  they survive the subject walking toward/away from the camera. Landmarks are
+  now MeTRAbs' absolute 3D coordinates in millimeters (camera frame: x right,
+  y down, z forward/away -- see ``src/type_defs.Keypoint``) rather than the
+  old MediaPipe-era normalized [0,1] image fractions, but every formula below
+  is a ratio of same-unit quantities, so the math is unaffected by the unit
+  change -- only the depth (``z``) trust below changes, because that channel
+  went from unreliable to accurate.
 * **Torso yaw** (``body_yaw_rad``) comes from the shoulder/hip line's *rotation
   in the horizontal plane*: the line's lateral extent shrinks as the subject
   turns (foreshortening) while the two endpoints separate in depth. Taking
@@ -37,15 +43,22 @@ landmark motion** — never an absolute angle and never depth ``z``:
   missing. Using ``abs()`` folded the two halves together and bounded the estimate
   to +/-90 degrees, so the robot could never be asked to turn round.
 
-  The lateral term is ``left.x - right.x``, not the other way about. MediaPipe
-  labels a person facing the camera with their *left* shoulder on the image's
-  right, so ``right.x - left.x`` is negative in the facing-forward case -- which
-  would report someone looking straight at the camera as being turned 180 degrees
-  away. Measured on recorded runs: negative on 67% of frames with both shoulders
-  clearly visible (median -0.085), and 99% of those frames have both ears visible,
-  i.e. a face-on view. The hips agree, so it is a labelling convention rather than
-  noise, and it holds whether or not the preview is mirrored (MediaPipe cannot
-  tell a mirrored subject from a real one, so it labels by appearance either way)::
+  The lateral term is ``left.x - right.x``, not the other way about. Pose
+  estimators conventionally label a person facing the camera with their
+  *left* shoulder on the image's right (anatomical left/right, not
+  screen-left/right -- MeTRAbs' ``coco_19`` follows the same COCO convention
+  MediaPipe did), so ``right.x - left.x`` is negative in the facing-forward
+  case -- which would report someone looking straight at the camera as being
+  turned 180 degrees away. This was measured on recorded MediaPipe runs
+  (negative on 67% of frames with both shoulders clearly visible, median
+  -0.085, 99% of those frames also having both ears visible, i.e. a face-on
+  view; the hips agreed, so it reflected a labelling convention rather than
+  noise). MeTRAbs is expected to follow the same convention, but this has not
+  been re-measured against real MeTRAbs output -- worth a quick sanity check
+  ("stand facing the camera, confirm yaw reads ~0") the first time this runs
+  on the target machine. It holds whether or not the preview is mirrored (the
+  estimator cannot tell a mirrored subject from a real one, so it labels by
+  appearance either way)::
 
       facing the camera   lateral > 0, dz ~ 0   ->  yaw ~   0 deg
       turned 90 deg       lateral ~ 0, dz != 0  ->  yaw ~ +/-90 deg
@@ -137,11 +150,13 @@ IDLE = GaitCommand("idle", 0.0, 0.0, 0, 0.0, 0.0, 0.0)
 
 # Torso yaw that maps to a full-scale (+/-1) legacy ``turn`` value.
 TURN_FULL_RAD = math.radians(60.0)
-# Depth is only trustworthy for the *sign* of a shoulder/hip depth difference, so
-# it is scaled down before entering the yaw solve; the lateral (image-plane) term
-# carries the magnitude. Under-reporting the angle is the safe direction: the
-# robot then approaches the true heading rather than overshooting it.
-YAW_Z_TRUST = 0.75
+# MeTRAbs' depth channel is a real metric measurement (unlike MediaPipe's,
+# which was foreshortening-only and unreliable), so it is trusted at full
+# weight in the yaw solve -- no down-scaling needed. Kept as a named constant
+# (rather than inlining 1.0) so the yaw formula's shape stays unchanged and
+# this trust level is easy to find and re-tune if MeTRAbs' depth precision
+# does not hold up in practice.
+YAW_Z_TRUST = 1.0
 # Landmark pairs the yaw is averaged over, hips weighted lower (they are noisier
 # and clothing-dependent).
 _YAW_PAIRS = (("left_shoulder", "right_shoulder", 1.0), ("left_hip", "right_hip", 0.6))

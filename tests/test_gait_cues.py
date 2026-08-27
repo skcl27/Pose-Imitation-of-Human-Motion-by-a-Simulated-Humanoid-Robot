@@ -167,8 +167,11 @@ def _yaw_frame(t: float, yaw_deg: float, idx: int = 0, vis: float = 1.0,
     """
     a = math.radians(yaw_deg)
     kps = {}
-    # MediaPipe's convention, verified against recorded runs: for a subject
-    # facing the camera the LEFT landmark sits on the image's RIGHT.
+    # Anatomical left/right convention (see gait_cues.py's module docstring):
+    # for a subject facing the camera the LEFT landmark sits on the image's
+    # RIGHT. This was verified against recorded MediaPipe runs; MeTRAbs is
+    # expected to follow the same COCO-derived convention but that has not
+    # been re-verified against real MeTRAbs output.
     for name, half, y in (("shoulder", 0.09 * span, 0.30), ("hip", 0.06 * span, 0.55)):
         for side, sgn in (("left", +1.0), ("right", -1.0)):
             kps[f"{side}_{name}"] = Keypoint(
@@ -207,9 +210,11 @@ def test_yaw_is_signed_and_monotonic() -> None:
 def test_yaw_magnitude_tracks_the_real_rotation() -> None:
     for deg in (20, 45, -35):
         got = math.degrees(_settle_yaw(deg).body_yaw_rad)
-        # Depth is deliberately down-weighted, so the estimate under-reports
-        # rather than over-reports; the robot must never overshoot a turn.
-        assert 0.6 * abs(deg) <= abs(got) <= abs(deg) + 2.0
+        # Depth is now a real MeTRAbs measurement and trusted at full weight
+        # (YAW_Z_TRUST = 1.0, vs. the old MediaPipe-era 0.75 down-weighting),
+        # so the estimate should track the true rotation closely rather than
+        # deliberately under-report it.
+        assert abs(deg) - 3.0 <= abs(got) <= abs(deg) + 3.0
         assert (got > 0) == (deg > 0)
 
 

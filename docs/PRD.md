@@ -9,7 +9,7 @@
 | Document Version | 1.0 |
 | Date | 2026-05-05 |
 | Status | Draft |
-| Primary Tech Stack | Python, Webots, OpenCV, MediaPipe / a learned pose estimator |
+| Primary Tech Stack | Python, Webots, OpenCV, MeTRAbs (GPU-accelerated 3D pose estimator) |
 | Capture Hardware | Sony A7 III (tripod-mounted), 1920×1080 @ 25–100 FPS (adaptive) |
 | Webots Project Root | `main/` (contains `worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt`) |
 
@@ -105,32 +105,35 @@ Build an end-to-end pipeline in which a simulated humanoid robot in Webots imita
    - Each frame is timestamped at capture time and passed to the pose estimator.
 
 2. **Pose Estimation Module**
-   - Library candidates (Python): **MediaPipe Pose**, **MMPose**, or **Ultralytics YOLOv8-Pose**.
-   - Output: per-frame keypoints (33 landmarks for MediaPipe) with 3D world coordinates and visibility.
-   - Smoothing: One-Euro filter or exponential smoothing to reduce jitter.
+   - Library: **[MeTRAbs](https://github.com/isarandi/metrabs)** (GPU-accelerated, TensorFlow / TensorFlow-Hub, built-in YOLOv4 person detector). Selected over MediaPipe Pose because it outputs absolute METRIC 3D coordinates directly, rather than a 2D projection that has to be reconstructed into 3D downstream; this requires a GPU for real-time inference, unlike MediaPipe's CPU-friendly 2D model.
+   - Output: per-frame keypoints (19 landmarks, `coco_19` skeleton convention) with absolute 3D camera-frame coordinates (millimeters) and a visibility PROXY (MeTRAbs has no true per-joint confidence, unlike MediaPipe).
+   - Smoothing: exponential smoothing applied to raw 3D keypoints (MeTRAbs does not smooth across frames itself, unlike MediaPipe's built-in temporal filter) and to retargeted joint angles.
 
-   #### 5.1.2 MediaPipe Pose Landmark Set (33 landmarks)
+   #### 5.1.2 MeTRAbs `coco_19` Landmark Set (19 landmarks)
 
-   The system SHALL consume all 33 MediaPipe Pose landmarks. Each landmark provides `(x, y, z, visibility)` where `x, y` are normalized image coordinates, `z` is depth relative to the hips (in normalized units), and `visibility ∈ [0, 1]`.
+   The system SHALL consume all 19 landmarks of MeTRAbs' `coco_19` skeleton convention. Each landmark provides `(x, y, z, visibility)` where `x, y, z` are absolute METRIC coordinates in millimeters, in the camera's coordinate frame (x right, y down, z forward/away from the camera), and `visibility ∈ [0, 1]` is an in-frame/in-detection-box confidence proxy.
 
-   | ID | Name | ID | Name | ID | Name |
-   |----|------|----|------|----|------|
-   | 0  | nose                | 11 | left_shoulder        | 22 | right_thumb          |
-   | 1  | left_eye_inner      | 12 | right_shoulder       | 23 | left_hip             |
-   | 2  | left_eye            | 13 | left_elbow           | 24 | right_hip            |
-   | 3  | left_eye_outer      | 14 | right_elbow          | 25 | left_knee            |
-   | 4  | right_eye_inner     | 15 | left_wrist           | 26 | right_knee           |
-   | 5  | right_eye           | 16 | right_wrist          | 27 | left_ankle           |
-   | 6  | right_eye_outer     | 17 | left_pinky           | 28 | right_ankle          |
-   | 7  | left_ear            | 18 | right_pinky          | 29 | left_heel            |
-   | 8  | right_ear           | 19 | left_index           | 30 | right_heel           |
-   | 9  | mouth_left          | 20 | right_index          | 31 | left_foot_index      |
-   | 10 | mouth_right         | 21 | left_thumb           | 32 | right_foot_index     |
+   | Name | Name | Name |
+   |------|------|------|
+   | nose                | left_shoulder        | left_hip             |
+   | left_eye             | right_shoulder       | right_hip            |
+   | right_eye            | left_elbow           | left_knee            |
+   | left_ear             | right_elbow          | right_knee           |
+   | right_ear            | left_wrist           | left_ankle           |
+   | neck                 | right_wrist          | right_ankle          |
+   | pelvis               |                      |                      |
 
    Notes:
-   - Reference figure: `docs/` (MediaPipe Pose skeleton diagram).
-   - Naming follows MediaPipe’s `mp.solutions.pose.PoseLandmark` enum (uppercase form, e.g. `LEFT_SHOULDER`).
-   - The retargeting module currently uses a curated subset relevant to humanoid joints (shoulders, elbows, wrists, hips, knees, ankles, head reference). The remaining landmarks (face, fingers, feet indices) are still **logged** for downstream metrics, gesture extensions, and future work.
+   - Joint names/order are read from the live model at startup
+     (`model.per_skeleton_joint_names['coco_19']`) rather than hard-coded, and
+     matched against this project's canonical names via
+     `src/perception/landmarks.py`'s alias table -- see that file's docstring.
+   - `coco_19` has no separate heel/toe or finger landmarks, unlike MediaPipe's
+     33-point set; the retargeting module's ground-line/lift detection falls
+     back to ankle-only where the old code used ankle+heel.
+   - The retargeting module uses a curated subset relevant to humanoid joints
+     (shoulders, elbows, wrists, hips, knees, ankles, head reference, neck,
+     pelvis).
 
 3. **Retargeting Module**
    - Convert human keypoints into joint angles compatible with the Webots humanoid (e.g., NAO, Atlas, or a custom URDF/PROTO).
@@ -192,7 +195,7 @@ Build an end-to-end pipeline in which a simulated humanoid robot in Webots imita
 - **Simulator:** Webots R2023b+. The `main/` directory is the Webots project root (contains `worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt`, plus `controllers/`, `protos/`, `plugins/` as needed). Webots is launched against this project directory.
 - **Capture hardware:** Sony A7 III (tripod-mounted) + HDMI-to-USB capture device (UVC) or USB streaming, providing 1920×1080 @ 25–100 FPS to the host.
 - **Language:** Python 3.10+.
-- **Key libraries:** `opencv-python`, `mediapipe` (or `ultralytics`), `numpy`, `scipy`, `pyyaml`, `matplotlib` (analysis), `pytest`.
+- **Key libraries:** `opencv-python`, `tensorflow` (GPU build) + `tensorflow-hub` (MeTRAbs), `numpy`, `scipy`, `pyyaml`, `matplotlib` (analysis), `pytest`.
 - **Webots API:** `controller` Python module shipped with Webots.
 - **Optional:** `pyzmq` for inter-process messaging.
 
@@ -244,11 +247,13 @@ Build an end-to-end pipeline in which a simulated humanoid robot in Webots imita
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Monocular 3D pose is ambiguous (depth, self-occlusion). | Inaccurate retargeting. | Use MediaPipe World Landmarks; constrain via joint limits; consider multi-view extension later. |
+| Monocular 3D pose is ambiguous without real camera calibration (absolute scale/FOV). | Slightly inaccurate absolute-scale retargeting (angle-based retargeting is largely unaffected). | Use MeTRAbs' absolute-3D output (already resolves the depth ambiguity MediaPipe had); constrain via joint limits; calibrate `pose.default_fov_degrees` per camera if absolute scale matters. |
+| No GPU available at inference time. | Pipeline cannot run in real time (or at all, with `pose.require_gpu: true`). | Require a CUDA-enabled TensorFlow build on the target machine; `pose.allow_synthetic_fallback` for non-tracking smoke tests only. |
 | Direct joint mapping causes the robot to fall. | Demo failure. | Start with feet fixed; add PD torso stabilization; restrict CoM-affecting joints. |
-| Latency too high for real-time feel. | Poor UX. | Run pose estimation in a separate process; downscale frames; use GPU model. |
+| Latency too high for real-time feel. | Poor UX. | Run pose estimation in a separate process; downscale frames; use a smaller/faster MeTRAbs backbone (`pose.model_url`); reduce `pose.num_aug`. |
 | Webots humanoid model joint structure differs from human skeleton. | Mapping errors. | Build an explicit, documented mapping table; validate per-joint with test motions. |
-| Library/version drift (Webots, MediaPipe). | Reproducibility issues. | Pin versions in `requirements.txt`; document Webots release. |
+| MeTRAbs' raw joint naming doesn't match this project's assumed names. | Silent/incorrect joint mapping. | `pose_estimator.py` verifies the alias table against the live model at startup and refuses to start on a mismatch (see `src/perception/landmarks.py`); `scripts/inspect_metrabs_skeleton.py` for a one-off check. |
+| Library/version drift (Webots, TensorFlow/CUDA). | Reproducibility issues. | Pin versions in `requirements.txt`; document Webots release and the target GPU driver version. |
 | Sony A7 III capture chain (HDMI/UVC) introduces extra latency or frame drops. | Higher end-to-end latency, jitter. | Benchmark capture latency; prefer hardware capture device with low-latency UVC mode; expose driver settings in config. |
 | Sustaining 100 FPS not feasible on target hardware. | Underutilized capture rate. | Adaptive FPS controller (FR-1b) gracefully downscales toward 25 FPS without breaking the pipeline. |
 
