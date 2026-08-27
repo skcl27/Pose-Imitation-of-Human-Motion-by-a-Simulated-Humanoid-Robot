@@ -38,20 +38,23 @@ WorldInfo {
   ]
 }
 Viewpoint {
-  orientation -0.021022313892317804 0.0056450718198366185 0.9997630696733911 2.617167874717846
-  position 4.472881117506071 -1.0522202310572988 0.2730153252869645
+  orientation 0.02860952101842819 -0.01070769781337589 0.9995333113581725 3.0934870340474974
+  position 2.132546942267732 -0.09997433988663172 0.3005749931473203
   follow "NAO"
-  followSmoothness 0.5
 }
 Floor {
   size 20 20
   tileSize 1 1
 }
 Nao {
-  name "NAO"
   controller "pose_imitation_controller"
-  translation 0 0 0.334
-  rotation 0 0 1 0
+  # Needed only so the controller can stand the robot back up by itself
+  # after a fall (Supervisor.simulationReset). Without it the controller
+  # still DETECTS the fall -- head height above the soles needs no
+  # privileges -- but can only ask you to press Ctrl+Shift+R. Nothing else
+  # in this project uses supervisor powers: the balance loop is
+  # deliberately model-based precisely so that it does not need them.
+  supervisor TRUE
 }
 TexturedBackground {
 }
