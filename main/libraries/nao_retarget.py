@@ -1,77 +1,101 @@
 """
-Full-body retargeting: MediaPipe landmarks -> NAO joint angles.
+Full-body retargeting: MeTRAbs 3D landmarks -> NAO joint angles.
 
-The Python pipeline streams raw MediaPipe Pose landmarks (normalized image
-coordinates: ``x`` right [0,1], ``y`` down [0,1], ``z`` depth, ``visibility``
-[0,1]). This module converts them into NAO joint targets for the whole body.
+The Python pipeline streams MeTRAbs pose landmarks: absolute METRIC
+coordinates in MILLIMETERS, in the camera's coordinate frame (``x`` right,
+``y`` down, ``z`` forward/away from the camera -- a standard pinhole-camera
+convention), plus a visibility PROXY in [0,1] (MeTRAbs has no true per-joint
+confidence; see ``src/perception/pose_estimator.py``). This module converts
+them into NAO joint targets for the whole body.
+
+This replaces an earlier version of this file built around MediaPipe, which
+gave only a 2D image-plane projection plus an unreliable depth channel, and
+so had to *reconstruct* a plausible 3D pose via a frontal-projection
+assumption and a self-calibration scheme that learned the subject's
+foreshortened proportions over time. With MeTRAbs' real 3D, that
+reconstruction is no longer needed -- the angle math below is an exact
+closed-form decomposition of a real 3D bone direction, not an approximation
+recovered from partial information.
 
 Why retarget here instead of upstream
--------------------------------------
+--------------------------------------
 Driving the robot's *full* pose needs the actual limb geometry, not just a
-handful of pre-baked angles. Keeping the kinematics next to the robot means the
-controller owns everything NAO-specific (joint axes, signs, limits) and the
-Python side stays a generic pose source.
+handful of pre-baked angles. Keeping the kinematics next to the robot means
+the controller owns everything NAO-specific (joint axes, signs, limits) and
+the Python side stays a generic pose source.
 
-Shoulder model
---------------
-NAO's shoulder is 2-DOF: ``ShoulderPitch`` (raise the arm up/down in the
-sagittal plane) and ``ShoulderRoll`` (abduct the arm sideways). From a frontal
-camera the upper-arm direction projects onto the image plane as a vector with a
-*vertical* part (up/down) and a *lateral* part (sideways). We decompose that
-single observed direction into the two joints:
+Torso-local frame
+------------------
+NAO's joint angles are defined relative to its OWN body (e.g. "raise the arm
+forward" means forward relative to the torso, not relative to the camera).
+The old MediaPipe-era code implicitly assumed the subject stood frontal to
+the camera, so "camera right" could stand in for "subject's right". With real
+depth, the subject may face any direction, so each frame we build an
+orthonormal **torso-local basis** (``right``, ``up``, ``forward``) from the
+shoulder line and the hip-to-shoulder line:
 
-    lateral_unit = sideways component   ->  ShoulderRoll  = asin(lateral_unit)
-    vertical_unit = up component        ->  ShoulderPitch = -asin(vertical_unit)
+    right   = normalize(right_shoulder - left_shoulder)
+    up_raw  = normalize(mid_shoulder - mid_hip)
+    up      = normalize(up_raw - (up_raw . right) * right)      # orthogonalize
+    forward = normalize(right x up)                              # faces the camera when frontal
 
-so arm-down -> pitch +90 deg, arm-up -> pitch -90 deg, arm-straight-out ->
-roll +/-90 deg, and diagonals split cleanly between the two.
+Any bone vector (e.g. hip->knee) is projected onto this basis to get its
+(lateral, vertical, forward) components *relative to the subject's own body*,
+independent of which way they face the camera.
 
-Leg model (:class:`LowerBodyRetargeter`)
-----------------------------------------
-The legs used to be driven only as a symmetric averaged crouch, which threw away
-exactly the information a leg lift carries: raise one knee and the *average*
-barely moves, so the robot looked frozen. The legs are now solved **per side and
-in closed form** from the same frontal projection, using NAO's real leg chain
-order (HipYawPitch -> HipRoll -> HipPitch -> KneePitch -> AnklePitch/Roll).
+Swing-twist decomposition
+--------------------------
+Each 2-DOF joint (shoulder, hip) is solved as two sequential rotations about
+fixed local axes -- a closed-form inverse of exactly the kind of forward
+kinematics chain NAO's own joints implement. Given a bone's UNIT direction in
+the torso-local frame, decomposed into a "swept" component ``a``, a
+reference-axis component ``b`` (1.0 at zero rotation), and a "sign" component
+``c`` (picks up magnitude only once the second rotation tilts the bone out of
+the ``a``/``b`` plane)::
 
-For a thigh at hip roll ``phi`` and hip pitch ``theta``, the thigh direction in
-the torso frame is::
+    d              = clamp(b, -1, 1)
+    first_angle    = atan2(a, d)
+    second_angle   = +-acos(clamp(d / cos(first_angle), -1, 1)), sign from c
 
-    R_x(phi) . R_y(theta) . (0, 0, -1)
-      = ( -sin(theta),  sin(phi)cos(theta),  -cos(phi)cos(theta) )
-         ^ forward       ^ lateral (left)      ^ vertical (up)
+For the **legs** (hip/knee), the reference direction is straight down
+(``b = -up``), the first angle is HipRoll (``a = lateral, outward-positive``,
+about the forward axis) and the second is HipPitch (sign from ``fwd``). This
+is the same closed-form relationship the old frontal-projection code used
+(see git history) -- the difference is that ``fwd`` is now a real measurement
+instead of a noisy sign hint.
 
-A frontal camera observes the lateral and vertical components directly (the
-forward one is the foreshortened, unobservable axis), which makes the system
-*exactly solvable*::
+For the **arms** (shoulder), the reference direction is straight forward
+(``b = fwd``), the first angle is ShoulderPitch (``a = -up``, about the
+lateral axis) and the second is ShoulderRoll (sign from the outward-signed
+lateral component). Elbow flexion needs no such decomposition -- it is simply
+the angle between the upper arm and forearm vectors, which was already exact
+even in the old code (a plain dot-product angle, coordinate-frame-agnostic).
 
-    d    = -up_obs            = cos(phi) cos(theta)
-    phi  = atan2(lat_obs, d)                       # abduction, fully observable
-    theta = +/- acos(d / cos(phi))                 # magnitude from foreshortening
-
-The remaining sign of ``theta`` (thigh forward vs. backward) is the one thing a
-single frontal view cannot see, so it is taken from the landmark depth ``z`` with
-a deadband and a documented bias toward *forward* (human knee lifts are forward,
-and NAO's HipPitch range is -88..+27.7 deg, i.e. mostly forward anyway).
-
-The shank shares the hip roll and adds KneePitch about the same y axis, so the
-identical solve on the knee->ankle segment yields ``theta_h + theta_k`` and hence
-KneePitch; the sole is then levelled by ``AnklePitch = -(theta_h + theta_k)`` and
-``AnkleRoll = -phi``. Everything falls out of one consistent model instead of
-hand-tuned gains.
+Lift / crouch / ground-line
+----------------------------
+Foot-lift and crouch detection stay in CAMERA-frame vertical (``y``, assuming
+a roughly level camera) rather than the torso-local frame: the question
+"which foot is on the ground" is about real-world verticality, and answering
+it from the torso's own up axis would make a forward lean look like a foot
+lift. This mirrors what the old image-``y``-based code effectively assumed
+(a level camera), just in real millimeters instead of a normalized image
+fraction -- the lift/crouch tuning constants are already expressed as ratios
+of leg/torso length, so they carry over unchanged.
 
 Self-calibration
-----------------
-Segment *reference* lengths (unforeshortened thigh / shank, upright hip height)
-are learned from the stream by a peak-hold tracker normalized by torso length,
-so the solve is scale-invariant and needs no per-user calibration step: walk in
-front of the camera and the references settle within a second.
+------------------
+Segment lengths (thigh, shank, torso) are simply measured directly each frame
+in millimeters and lightly EMA-smoothed for jitter. The old MediaPipe-era
+``PeakHold`` scheme existed only because a 2D projection can never overstate a
+segment's true length (foreshortening only ever makes it look shorter), so
+scale had to be learned as a running maximum; MeTRAbs' distances are already
+metric, so there is nothing to learn.
 
-Everything is gated on landmark ``visibility`` so out-of-frame joints are simply
-not commanded and the driver holds their last pose. The *safety* of a leg pose
-(may the robot actually unload a foot right now?) is deliberately NOT decided
-here -- that needs the robot's own CoM/force state and lives in
-``lower_body.LowerBodyController``.
+Everything is still gated on landmark ``visibility`` so out-of-frame joints
+are simply not commanded and the driver holds their last pose. The *safety*
+of a leg pose (may the robot actually unload a foot right now?) is
+deliberately NOT decided here -- that needs the robot's own CoM/force state
+and lives in ``lower_body.LowerBodyController``.
 """
 from __future__ import annotations
 
@@ -86,25 +110,18 @@ from pose_control_utils import JointLimiter, get_default_motor_configs
 VIS_THRESHOLD = 0.5
 
 # Tuning gains (kept gentle; joint limits clamp the rest).
-ROLL_GAIN = 1.0
-PITCH_GAIN = 1.0
-HEAD_YAW_GAIN = 2.2
+HEAD_YAW_GAIN = 1.0
 HEAD_PITCH_GAIN = 1.6
 HEAD_PITCH_BASELINE = 0.9  # nose sits ~0.9 shoulder-widths above shoulder line
 
 # ---------------------------------------------------------------------------
-# Lower-body tuning
+# Lower-body tuning (unchanged from the MediaPipe-era version: these are all
+# already expressed as ratios of leg/torso length, so real metric lengths
+# carry the same tuning over unchanged).
 # ---------------------------------------------------------------------------
-# How much of the reference leg length the foot must clear before we call it a
-# lift, and how much clearance counts as a *full* lift (knee-high march).
 LIFT_DEADBAND = 0.030
 LIFT_FULL = 0.260
-# Same thing measured on the KNEES instead, for when the feet are out of frame.
-# A raised knee travels less than the foot it carries, so full scale is reached
-# sooner. See LowerBodyRetargeter._lifts for why this fallback exists at all.
 LIFT_FULL_KNEE = 0.190
-# Squat: hip height (above the ground line, in reference-leg-length units) has
-# to drop by this fraction for a full crouch, and the knees must agree.
 CROUCH_FULL_DROP = 0.28
 KNEE_STRAIGHT_DEADZONE = 0.20  # rad of knee bend treated as "standing straight"
 KNEE_BEND_RANGE = 1.30         # rad of human knee bend mapped to full crouch
@@ -112,32 +129,26 @@ KNEE_BEND_RANGE = 1.30         # rad of human knee bend mapped to full crouch
 # limit: because NAO's thigh and shank are within 3 mm of the same length, the
 # Hip = -u / Knee = +2u / Ankle = -u posture keeps the ankle under the hip -- and
 # so the CoM over the foot -- at ANY depth, with the torso vertical and the soles
-# flat throughout. The real ceiling is the knee's own 121 deg range. The old
-# 0.35 was a guess made before that geometry was checked, and it made a human
-# squat read as a barely visible dip.
+# flat throughout. The real ceiling is the knee's own 121 deg range.
 MAX_CROUCH = 0.70
 
-# Depth (``z``) is the least reliable MediaPipe channel, so it is used only to
-# pick the SIGN of the unobservable sagittal axis, and only past a deadband.
-Z_SIGN_DEADBAND = 0.06   # in reference-segment-length units
-# Below this |cos(hip_roll)| the sagittal angle is geometrically unobservable
-# (the limb points nearly straight sideways), so we report pitch 0 rather than a
-# noise-amplified value.
+# Below this |cos(first_angle)| the second angle is geometrically unobservable
+# (the limb points nearly along the rotation axis of the first joint), so we
+# report it as 0 rather than a noise-amplified value.
 MIN_COS_ROLL = 0.30
 
+# Per-frame EMA smoothing of the directly-measured segment lengths (mm).
+GEOMETRY_ALPHA = 0.25
+
 Vec = Tuple[float, float, float]
-Landmark = Tuple[float, float, float, float]  # x, y, z, visibility
+Landmark = Tuple[float, float, float, float]  # x, y, z (mm, camera frame), visibility
 
 
 # ---------------------------------------------------------------------------
-# Small vector helpers (image coords: x right, y down, z depth)
+# Small vector helpers (camera coords: x right, y down, z forward/away, mm)
 # ---------------------------------------------------------------------------
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
-
-def _asin(v: float) -> float:
-    return math.asin(_clamp(v, -1.0, 1.0))
 
 
 def _acos(v: float) -> float:
@@ -148,23 +159,61 @@ def _sub(a: Landmark, b: Landmark) -> Vec:
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
+def _scale(a: Vec, s: float) -> Vec:
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _dot(a: Vec, b: Vec) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a: Vec, b: Vec) -> Vec:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
 def _norm(v: Vec) -> float:
     return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2) + 1e-9
 
 
+def _normalize(v: Vec) -> Optional[Vec]:
+    n = _norm(v) - 1e-9
+    if n < 1e-6:
+        return None
+    return _scale(v, 1.0 / n)
+
+
 def _angle_between(a: Vec, b: Vec) -> float:
-    dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    dot = _dot(a, b)
     return math.acos(_clamp(dot / (_norm(a) * _norm(b)), -1.0, 1.0))
 
 
-def _hypot2(a: Landmark, b: Landmark) -> float:
-    """In-image-plane distance between two landmarks (depth ignored)."""
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+def _dist3(a: Landmark, b: Landmark) -> float:
+    return _norm(_sub(a, b))
 
 
 def _lift_fraction(rise: float, leg_length: float, full: float) -> float:
     """Normalize a landmark's rise above the reference into a [0, 1] lift."""
     return _clamp((rise / leg_length - LIFT_DEADBAND) / full, 0.0, 1.0)
+
+
+def _swing_twist(a_signed: float, b_ref: float, c_signed: float) -> Tuple[float, float]:
+    """Closed-form inverse of a 2-DOF "first rotate about a fixed axis, then
+    rotate about the resulting axis" joint -- see the module docstring's
+    "Swing-twist decomposition" section for the derivation and how legs/arms
+    each map their axes onto ``(a_signed, b_ref, c_signed)``.
+    """
+    d = _clamp(b_ref, -1.0, 1.0)
+    first = math.atan2(a_signed, d)
+    cos_first = math.cos(first)
+    if abs(cos_first) < MIN_COS_ROLL:
+        return first, 0.0
+    second_mag = _acos(_clamp(d / cos_first, -1.0, 1.0))
+    second = second_mag if c_signed > 0.0 else -second_mag
+    return first, second
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +243,8 @@ def _visible(kps: Dict[str, Landmark], *names: str, thr: float = VIS_THRESHOLD) 
 def _mid_point(kps: Dict[str, Landmark], *names: str) -> Optional[Landmark]:
     """Midpoint of whichever of ``names`` are visible, or None if none are.
 
-    Degrading to a single landmark (rather than requiring the pair) is what keeps
-    the lower body alive when one hip or foot is briefly occluded.
+    Degrading to a single landmark (rather than requiring the pair) is what
+    keeps the lower body alive when one hip or foot is briefly occluded.
     """
     pts = [kps[n] for n in names if _visible(kps, n)]
     if not pts:
@@ -209,61 +258,136 @@ def _mid_point(kps: Dict[str, Landmark], *names: str) -> Optional[Landmark]:
     )
 
 
+def _side_sign(side: str) -> float:
+    """Sign that turns a torso-local lateral component into an
+    outward-positive quantity for ``side`` ("L"/"R"). ``right`` (the torso
+    basis axis) points from the left shoulder to the right shoulder, i.e.
+    toward the subject's own anatomical right -- so a leg/arm swinging
+    outward on the LEFT side moves AWAY from ``right`` (negative dot
+    product), while on the RIGHT side it moves WITH ``right`` (positive)."""
+    return -1.0 if side == "L" else 1.0
+
+
+# ---------------------------------------------------------------------------
+# Torso-local reference frame
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TorsoFrame:
+    right: Vec     # subject's own anatomical-right direction
+    up: Vec        # subject's own up direction
+    forward: Vec   # subject's own chest-facing direction
+    origin: Vec    # mid-hip position (mm, camera frame) -- for height measurements
+
+
+def _torso_frame(kps: Dict[str, Landmark]) -> Optional[TorsoFrame]:
+    if not _visible(kps, "left_shoulder", "right_shoulder"):
+        return None
+    ls, rs = kps["left_shoulder"], kps["right_shoulder"]
+    mid_sh = (
+        (ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0, (ls[2] + rs[2]) / 2.0,
+    )
+    right_raw = _sub(rs, ls)
+    right_n = _normalize(right_raw)
+    if right_n is None:
+        return None
+
+    mid_hip = _mid_point(kps, "left_hip", "right_hip")
+    if mid_hip is not None:
+        up_raw = _sub(mid_sh, mid_hip[:3])
+        origin: Vec = mid_hip[:3]
+    else:
+        # Hips out of frame (e.g. a desk webcam framed from the waist up):
+        # fall back to a camera-vertical "up" reference (assumes a roughly
+        # level, roughly upright camera) so arms/head still track. Legs
+        # cannot work at all without a hip anyway (see LowerBodyRetargeter),
+        # so this fallback only ever affects the arm/head path.
+        up_raw = (0.0, -1.0, 0.0)
+        origin = mid_sh
+    up_orth = _sub(up_raw, _scale(right_n, _dot(up_raw, right_n)))
+    up_n = _normalize(up_orth)
+    if up_n is None:
+        return None
+
+    forward_n = _normalize(_cross(right_n, up_n))
+    if forward_n is None:
+        return None
+    # Re-orthogonalize to guarantee an exact right-handed orthonormal basis.
+    up_n = _cross(forward_n, right_n)
+
+    return TorsoFrame(right=right_n, up=up_n, forward=forward_n, origin=origin)
+
+
+def _to_local(frame: TorsoFrame, v: Vec) -> Vec:
+    return (_dot(v, frame.right), _dot(v, frame.up), _dot(v, frame.forward))
+
+
 # ---------------------------------------------------------------------------
 # Per-segment retargeting (upper body)
 # ---------------------------------------------------------------------------
-def _arm(kps: Dict[str, Landmark], side: str, mid_x: float) -> Dict[str, float]:
+def _arm(kps: Dict[str, Landmark], side: str, frame: TorsoFrame) -> Dict[str, float]:
     pre = "left_" if side == "L" else "right_"
     if not _visible(kps, pre + "shoulder", pre + "elbow"):
         return {}
 
     s = kps[pre + "shoulder"]
     e = kps[pre + "elbow"]
-    dx = e[0] - s[0]
-    dy = e[1] - s[1]
-    length = math.hypot(dx, dy) + 1e-9
+    unit = _normalize(_sub(e, s))
+    if unit is None:
+        return {}
+    lat, up, fwd = _to_local(frame, unit)
+    lat_outward = _side_sign(side) * lat
 
-    vertical_up = -dy / length                       # +1 elbow above shoulder
-    out_dir = 1.0 if (s[0] - mid_x) >= 0.0 else -1.0  # image side -> "outward"
-    lateral_out = (dx * out_dir) / length             # +1 arm abducted outward
-
-    pitch = -_asin(vertical_up) * PITCH_GAIN          # +down, -up
-    roll_mag = _asin(lateral_out) * ROLL_GAIN         # >=0 outward, <0 across body
+    pitch, roll_outward = _swing_twist(-up, fwd, lat_outward)
 
     out: Dict[str, float] = {}
     if side == "L":
         out["LShoulderPitch"] = pitch
-        out["LShoulderRoll"] = +roll_mag             # NAO L: positive = outward
+        out["LShoulderRoll"] = +roll_outward   # NAO L: positive = outward
     else:
         out["RShoulderPitch"] = pitch
-        out["RShoulderRoll"] = -roll_mag             # NAO R: negative = outward
+        out["RShoulderRoll"] = -roll_outward   # NAO R: negative = outward
 
-    # Elbow flexion: angle between upper arm and forearm (0 = straight).
+    # Elbow flexion: angle between upper arm and forearm (0 = straight). Pure
+    # dot-product angle -- exact regardless of coordinate frame.
     if _visible(kps, pre + "wrist"):
         w = kps[pre + "wrist"]
         bend = _angle_between(_sub(e, s), _sub(w, e))
         if side == "L":
-            out["LElbowRoll"] = -bend                # NAO L elbow bends negative
+            out["LElbowRoll"] = -bend          # NAO L elbow bends negative
         else:
-            out["RElbowRoll"] = +bend                # NAO R elbow bends positive
+            out["RElbowRoll"] = +bend          # NAO R elbow bends positive
     return out
 
 
-def _head(kps: Dict[str, Landmark]) -> Dict[str, float]:
+def _head(kps: Dict[str, Landmark], frame: TorsoFrame) -> Dict[str, float]:
     if not _visible(kps, "nose", "left_shoulder", "right_shoulder"):
         return {}
     nose = kps["nose"]
     ls = kps["left_shoulder"]
     rs = kps["right_shoulder"]
-    mid_x = (ls[0] + rs[0]) / 2.0
-    mid_y = (ls[1] + rs[1]) / 2.0
-    shoulder_w = abs(ls[0] - rs[0]) + 1e-6
+    mid_sh = ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0, (ls[2] + rs[2]) / 2.0)
+    shoulder_w = max(_dist3(ls, rs), 1e-4)
 
-    # Yaw: nose horizontal offset from the shoulder midline.
-    yaw = ((nose[0] - mid_x) / shoulder_w) * HEAD_YAW_GAIN
-    # Pitch: nose vertical offset relative to its typical above-shoulder height.
-    # Looking down brings the nose lower (toward the shoulders) -> positive pitch.
-    pitch_raw = (nose[1] - mid_y) / shoulder_w        # negative when nose is high
+    nose_offset = _sub(nose, mid_sh)
+    lat, up, _fwd = _to_local(frame, nose_offset)
+
+    yaw = 0.0
+    if _visible(kps, "left_ear", "right_ear"):
+        # Same "rigid body-fixed segment, read its rotation from the plane it
+        # sweeps" trick as the torso yaw in gait_cues.py, applied to the
+        # ear-to-ear line: 0 when the head faces the same way as the torso.
+        le, re = kps["left_ear"], kps["right_ear"]
+        ear_vec = _sub(re, le)
+        e_lat, _e_up, e_fwd = _to_local(frame, ear_vec)
+        yaw = -math.atan2(e_fwd, e_lat) * HEAD_YAW_GAIN
+    else:
+        # Fall back to the nose's lateral offset from the shoulder midline.
+        yaw = (lat / shoulder_w) * HEAD_YAW_GAIN
+
+    # Pitch: nose vertical (torso-local "up") offset relative to its typical
+    # above-shoulder-line height. Looking down brings the nose toward the
+    # shoulders (up component grows less negative) -> positive pitch.
+    pitch_raw = -(up / shoulder_w)
     pitch = (pitch_raw + HEAD_PITCH_BASELINE) * HEAD_PITCH_GAIN
     return {"HeadYaw": yaw, "HeadPitch": pitch}
 
@@ -279,38 +403,8 @@ def _knee_bend(kps: Dict[str, Landmark], side: str) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Lower body: self-calibrating, per-leg closed-form solve
+# Lower body: per-leg closed-form solve
 # ---------------------------------------------------------------------------
-class PeakHold:
-    """Running maximum of a signal: rises quickly, decays very slowly.
-
-    Used to learn the subject's *unforeshortened* body proportions from the
-    landmark stream. An instantaneous value is always <= the true length (a limb
-    can only look shorter in projection, never longer), so the running peak
-    converges on the real one. The slow decay lets the estimate follow a
-    genuinely different subject or camera distance instead of latching forever.
-    """
-
-    __slots__ = ("value", "rise", "decay")
-
-    def __init__(self, rise: float = 0.35, decay: float = 0.004,
-                 initial: Optional[float] = None) -> None:
-        self.value: Optional[float] = initial
-        self.rise = rise
-        self.decay = decay
-
-    def update(self, sample: float) -> float:
-        if not math.isfinite(sample) or sample <= 0.0:
-            return self.value if self.value is not None else 0.0
-        if self.value is None:
-            self.value = sample
-        elif sample > self.value:
-            self.value += self.rise * (sample - self.value)
-        else:
-            self.value += self.decay * (sample - self.value)
-        return self.value
-
-
 @dataclass
 class LegTarget:
     """One leg's retargeted NAO angles plus how far the human lifted that foot."""
@@ -343,110 +437,111 @@ class LowerBodyObservation:
     confidence: float = 0.0      # 0..1 overall lower-body confidence
     valid: bool = False
     # Which landmarks produced the lift signal: "feet", "knees" or "none".
-    # Surfaced so the controller can tell the user *why* a leg lift is being
-    # ignored instead of silently doing nothing.
     lift_source: str = "none"
 
     def leg(self, side: str) -> Optional[LegTarget]:
         return self.left if side == "L" else self.right
 
 
+class PeakHold:
+    """Running maximum of a signal: rises quickly, decays very slowly.
+
+    Unlike segment lengths (now measured directly in real mm, see
+    :class:`BodyGeometry`), a subject's own "standing tall" hip-height/torso
+    ratio genuinely has to be LEARNED from the stream -- there is no way to
+    know it a priori, real 3D or not. An instantaneous ratio is always <= the
+    true standing ratio (crouching can only bring the hips closer to the
+    ground line, never past standing), so the running peak converges on it;
+    the slow decay lets the estimate follow a genuinely different subject
+    instead of latching forever.
+    """
+
+    __slots__ = ("value", "rise", "decay")
+
+    def __init__(self, rise: float = 0.35, decay: float = 0.004) -> None:
+        self.value: float = 0.0
+        self.rise = rise
+        self.decay = decay
+
+    def update(self, sample: float) -> float:
+        if not math.isfinite(sample) or sample <= 0.0:
+            return self.value
+        if self.value <= 0.0:
+            self.value = sample
+        elif sample > self.value:
+            self.value += self.rise * (sample - self.value)
+        else:
+            self.value += self.decay * (sample - self.value)
+        return self.value
+
+
 @dataclass
 class BodyGeometry:
-    """Self-calibrating estimate of the subject's proportions (all normalized
-    by torso length, so the estimate is invariant to camera distance)."""
+    """Directly-measured (mm) segment lengths, lightly EMA-smoothed to reduce
+    per-frame jitter. Unlike the old MediaPipe-era self-calibration (a
+    running-maximum learned over time, needed because a 2D projection could
+    only ever look shorter than the truth), MeTRAbs gives true metric
+    distances directly -- so there is nothing to learn, only smooth."""
+    alpha: float = GEOMETRY_ALPHA
     torso: float = 0.0
-    thigh_ratio: PeakHold = field(default_factory=PeakHold)
-    shank_ratio: PeakHold = field(default_factory=PeakHold)
+    thigh: float = 0.0
+    shank: float = 0.0
     hip_height_ratio: PeakHold = field(default_factory=PeakHold)
-    _torso_ema: Optional[float] = None
+    _has_torso: bool = field(default=False, init=False, repr=False)
+    _has_thigh: bool = field(default=False, init=False, repr=False)
+    _has_shank: bool = field(default=False, init=False, repr=False)
+
+    def _ema(self, prev: float, sample: float, has_prev: bool) -> float:
+        return sample if not has_prev else prev + self.alpha * (sample - prev)
 
     def update_torso(self, kps: Dict[str, Landmark]) -> float:
         ls, rs = kps["left_shoulder"], kps["right_shoulder"]
-        mid_sh = ((ls[0] + rs[0]) * 0.5, (ls[1] + rs[1]) * 0.5, 0.0, 1.0)
+        mid_sh = ((ls[0] + rs[0]) * 0.5, (ls[1] + rs[1]) * 0.5, (ls[2] + rs[2]) * 0.5, 1.0)
         mid_hip = _mid_point(kps, "left_hip", "right_hip")
         if mid_hip is None:
             return self.torso
+        span = max(_dist3(ls, rs), 1e-4)
         # Shoulder span is a useful floor: it keeps the scale sane when the
         # subject leans and the torso projects short.
-        span = max(_hypot2(ls, rs), 1e-4)
-        raw = max(_hypot2(mid_sh, mid_hip), 0.6 * span, 1e-4)
-        self._torso_ema = raw if self._torso_ema is None else (
-            self._torso_ema + 0.15 * (raw - self._torso_ema)
-        )
-        self.torso = self._torso_ema
+        raw = max(_dist3(mid_sh, mid_hip), 0.6 * span, 1e-4)
+        self.torso = self._ema(self.torso, raw, self._has_torso)
+        self._has_torso = True
         return self.torso
 
-    @property
-    def thigh(self) -> float:
-        return max((self.thigh_ratio.value or 0.0) * self.torso, 1e-4)
+    def update_thigh(self, sample: float) -> None:
+        self.thigh = self._ema(self.thigh, sample, self._has_thigh)
+        self._has_thigh = True
+
+    def update_shank(self, sample: float) -> None:
+        self.shank = self._ema(self.shank, sample, self._has_shank)
+        self._has_shank = True
 
     @property
-    def shank(self) -> float:
-        ratio = self.shank_ratio.value
-        if ratio is None:
-            # No ankle has ever been seen -- the usual case for someone standing
-            # close to a webcam, cropped at the shins. Thigh and shank are within
-            # a few percent of each other in both the human and NAO (0.100 m vs
-            # 0.1029 m), so borrowing the thigh keeps the leg scale usable. The
-            # alternative, which this replaces, was to declare the subject
-            # uncalibrated and discard the entire lower body.
-            ratio = self.thigh_ratio.value
-        return max((ratio or 0.0) * self.torso, 1e-4)
+    def shank_or_thigh(self) -> float:
+        # No ankle has ever been seen -- the usual case for someone standing
+        # close to a webcam, cropped at the shins. Thigh and shank are within
+        # a few percent of each other in both the human and NAO (0.100 m vs
+        # 0.1029 m), so borrowing the thigh keeps the leg scale usable.
+        return self.shank if self._has_shank else self.thigh
 
     @property
     def leg_length(self) -> float:
-        return self.thigh + self.shank
+        return max(self.thigh + self.shank_or_thigh, 1e-4)
 
     @property
     def calibrated(self) -> bool:
-        # Only the torso scale and the thigh are required: the shank falls back
-        # to the thigh (see above), and the shank length is only ever used on
-        # frames where the ankle IS visible.
-        return self.torso > 1e-4 and self.thigh_ratio.value is not None
-
-
-def _solve_segment(
-    lat_obs: float, up_obs: float, roll: Optional[float], forward_hint: float
-) -> Tuple[float, float]:
-    """Solve one limb segment's (roll, pitch) from its frontal projection.
-
-    ``lat_obs`` / ``up_obs`` are the segment's lateral (outward-positive) and
-    upward components divided by its *reference* length, i.e. the observable two
-    of the three unit-vector components of
-
-        R_x(roll) . R_y(pitch) . (0, 0, -1)
-          = (-sin(pitch), sin(roll)cos(pitch), -cos(roll)cos(pitch)).
-
-    Pass ``roll=None`` to solve it (thigh: the hip has a roll DOF) or a known
-    value to reuse it (shank: the knee has none). ``forward_hint`` > 0 means the
-    depth channel says the segment points away from the camera, i.e. *backward*.
-
-    Returns ``(roll, pitch)`` in radians, with pitch 0 = segment hanging straight
-    down and negative = pointing forward (NAO's HipPitch/KneePitch sense).
-    """
-    d = _clamp(-up_obs, -1.0, 1.0)             # cos(roll) * cos(pitch)
-    if roll is None:
-        roll = math.atan2(lat_obs, d)
-    cos_roll = math.cos(roll)
-    if abs(cos_roll) < MIN_COS_ROLL:
-        # Limb is nearly horizontal-sideways: the sagittal angle is not
-        # observable from a frontal view, so claim nothing rather than amplify
-        # noise into a large bogus pitch.
-        return roll, 0.0
-    pitch_mag = _acos(_clamp(d / cos_roll, -1.0, 1.0))
-    # Depth resolves forward vs. backward; bias to forward (see module docstring).
-    backward = forward_hint > Z_SIGN_DEADBAND
-    return roll, (pitch_mag if backward else -pitch_mag)
+        # Only the torso scale and the thigh are required: the shank falls
+        # back to the thigh (see above), and the shank length is only ever
+        # used on frames where the ankle IS visible.
+        return self.torso > 1e-4 and self._has_thigh
 
 
 class LowerBodyRetargeter:
-    """Stateful per-leg retargeting of MediaPipe landmarks to NAO leg angles.
+    """Stateful per-leg retargeting of MeTRAbs landmarks to NAO leg angles.
 
-    Stateful because it self-calibrates the subject's segment lengths (see
-    :class:`PeakHold`); apart from that it is a pure function of the landmark
-    stream -- no Webots, no camera, no RNG -- so it is unit-testable
-    off-simulation.
+    Stateful only for the light EMA smoothing in :class:`BodyGeometry`;
+    apart from that it is a pure function of the landmark stream -- no
+    Webots, no camera, no RNG -- so it is unit-testable off-simulation.
     """
 
     def __init__(self) -> None:
@@ -458,12 +553,8 @@ class LowerBodyRetargeter:
         return self.observe_parsed(_parse(keypoints))
 
     def observe_parsed(self, kps: Dict[str, Landmark]) -> LowerBodyObservation:
-        # Shoulders give the scale; ONE visible hip is enough to root the legs.
-        # Requiring both used to drop the entire lower body whenever a hip was
-        # briefly occluded -- i.e. exactly when the subject turned or stepped.
-        if not _visible(kps, "left_shoulder", "right_shoulder"):
-            return LowerBodyObservation()
-        if _mid_point(kps, "left_hip", "right_hip") is None:
+        frame = _torso_frame(kps)
+        if frame is None:
             return LowerBodyObservation()
 
         self.geom.update_torso(kps)
@@ -473,8 +564,8 @@ class LowerBodyRetargeter:
 
         ground_y = self._ground_line(kps)
         lifts, lift_source = self._lifts(kps)
-        left = self._leg(kps, "L", lifts["L"])
-        right = self._leg(kps, "R", lifts["R"])
+        left = self._leg(kps, "L", frame, lifts["L"])
+        right = self._leg(kps, "R", frame, lifts["R"])
         if left is None and right is None:
             return LowerBodyObservation(lift_source=lift_source)
 
@@ -504,58 +595,46 @@ class LowerBodyRetargeter:
 
     # -- internals ---------------------------------------------------------
     def _calibrate_segments(self, kps: Dict[str, Landmark]) -> None:
-        """Learn reference thigh/shank lengths (torso-normalized peak-hold)."""
-        torso = max(self.geom.torso, 1e-4)
+        """Directly measure this frame's thigh/shank lengths (mm), EMA-smoothed."""
         for side in ("L", "R"):
             pre = "left_" if side == "L" else "right_"
             if _visible(kps, pre + "hip", pre + "knee"):
-                self.geom.thigh_ratio.update(
-                    _hypot2(kps[pre + "knee"], kps[pre + "hip"]) / torso
-                )
+                self.geom.update_thigh(_dist3(kps[pre + "knee"], kps[pre + "hip"]))
             if _visible(kps, pre + "knee", pre + "ankle"):
-                self.geom.shank_ratio.update(
-                    _hypot2(kps[pre + "ankle"], kps[pre + "knee"]) / torso
-                )
+                self.geom.update_shank(_dist3(kps[pre + "ankle"], kps[pre + "knee"]))
 
-    def _foot_y(self, kps: Dict[str, Landmark], side: str) -> Optional[float]:
-        """Image y of a foot: ankle, refined with the heel when it is visible."""
+    def _foot_height(self, kps: Dict[str, Landmark], side: str) -> Optional[float]:
+        """Camera-frame vertical (mm) of a foot. MeTRAbs' coco_19 skeleton has
+        no separate heel landmark (unlike MediaPipe's 33-point set), so this
+        is the ankle alone."""
         pre = "left_" if side == "L" else "right_"
         if not _visible(kps, pre + "ankle"):
             return None
-        ys = [kps[pre + "ankle"][1]]
-        if _visible(kps, pre + "heel"):
-            ys.append(kps[pre + "heel"][1])
-        return sum(ys) / len(ys)
+        return kps[pre + "ankle"][1]
 
     def _ground_line(self, kps: Dict[str, Landmark]) -> Optional[float]:
-        """Image y of the ground: the LOWER of the two feet.
+        """Camera-frame vertical (mm) of the ground: the LOWER of the two feet.
 
         This is the trick that makes lift detection calibration-free -- whichever
         foot is planted defines the floor, so the other foot's rise above it is
         the lift, with no need to know where the real floor is in the image.
         """
-        ys = [y for y in (self._foot_y(kps, "L"), self._foot_y(kps, "R")) if y is not None]
+        ys = [y for y in (self._foot_height(kps, "L"), self._foot_height(kps, "R")) if y is not None]
         return max(ys) if ys else None
 
     def _lifts(self, kps: Dict[str, Landmark]) -> Tuple[Dict[str, float], str]:
         """Per-side foot-lift fraction in [0, 1], and which landmarks gave it.
 
-        The trick that makes this calibration-free is that we never need to know
-        where the floor is in the image: whichever of the two feet is *lower*
-        defines the ground line, so the other foot's rise above it is the lift.
-
-        The catch is that it needs both feet in frame -- and someone standing
-        close to a webcam is usually cropped at the shins, which made the lift
-        signal identically zero however high they lifted a leg, so the robot
-        never stepped. So the same relative trick falls back to the **knees**,
-        which are in frame whenever the hips are. Knees are also the signal the
-        Python-side gait detector uses, for the same robustness reason.
+        Falls back to the KNEES (visible whenever the hips are) when the feet
+        are out of frame -- the usual case for someone standing close to a
+        webcam. Knees are also the signal the Python-side gait detector uses,
+        for the same robustness reason.
         """
-        leg_len = max(self.geom.leg_length, 1e-4)
+        leg_len = self.geom.leg_length
 
-        feet = {side: self._foot_y(kps, side) for side in ("L", "R")}
+        feet = {side: self._foot_height(kps, side) for side in ("L", "R")}
         if all(v is not None for v in feet.values()):
-            ground = max(feet.values())          # image y grows downward
+            ground = max(feet.values())          # camera y grows downward
             return ({s: _lift_fraction(ground - feet[s], leg_len, LIFT_FULL)
                      for s in ("L", "R")}, "feet")
 
@@ -571,7 +650,7 @@ class LowerBodyRetargeter:
         return ({"L": 0.0, "R": 0.0}, "none")
 
     def _leg(
-        self, kps: Dict[str, Landmark], side: str, lift: float
+        self, kps: Dict[str, Landmark], side: str, frame: TorsoFrame, lift: float
     ) -> Optional[LegTarget]:
         pre = "left_" if side == "L" else "right_"
         if not _visible(kps, pre + "hip", pre + "knee"):
@@ -580,46 +659,36 @@ class LowerBodyRetargeter:
         knee = kps[pre + "knee"]
         ankle = kps[pre + "ankle"] if _visible(kps, pre + "ankle") else None
 
-        mid_sh_x = (kps["left_shoulder"][0] + kps["right_shoulder"][0]) / 2.0
-        # "Outward" for this leg, derived from the data so the mapping is
-        # independent of whether the camera image was mirrored. With only one hip
-        # visible its own x is useless as a midline, so fall back to the
-        # shoulders'.
-        both_hips = _visible(kps, "left_hip", "right_hip")
-        mid_hip = _mid_point(kps, "left_hip", "right_hip")
-        ref_x = mid_sh_x
-        if both_hips and mid_hip is not None and abs(hip[0] - mid_hip[0]) > 1e-4:
-            ref_x = mid_hip[0]
-        out_dir = 1.0 if (hip[0] - ref_x) >= 0.0 else -1.0
-
-        thigh_len = self.geom.thigh
-        lat = ((knee[0] - hip[0]) * out_dir) / thigh_len
-        up = -(knee[1] - hip[1]) / thigh_len
-        fwd_hint = (knee[2] - hip[2]) / thigh_len       # +ve => knee further away
-        roll_mag, hip_pitch = _solve_segment(
-            _clamp(lat, -1.0, 1.0), _clamp(up, -1.0, 1.0), None, fwd_hint
-        )
+        thigh_unit = _normalize(_sub(knee, hip))
+        if thigh_unit is None:
+            return None
+        lat, up, fwd = _to_local(frame, thigh_unit)
+        lat_outward = _side_sign(side) * lat
+        roll_outward, hip_pitch = _swing_twist(lat_outward, -up, fwd)
 
         total = hip_pitch          # theta_h + theta_k, defaults to knee straight
         if ankle is not None:
-            shank_len = self.geom.shank
-            lat_s = ((ankle[0] - knee[0]) * out_dir) / shank_len
-            up_s = -(ankle[1] - knee[1]) / shank_len
-            fwd_s = (ankle[2] - knee[2]) / shank_len
-            # The shank shares the hip roll (the knee has no roll DOF), so reuse
-            # roll_mag and read out theta_h + theta_k directly.
-            _, total_signed = _solve_segment(
-                _clamp(lat_s, -1.0, 1.0), _clamp(up_s, -1.0, 1.0), roll_mag, fwd_s
-            )
-            # Knees do not hyperextend: of the two sign branches keep the one
-            # that yields a non-negative KneePitch.
-            total = total_signed if (total_signed - hip_pitch) >= 0.0 else -total_signed
+            shank_unit = _normalize(_sub(ankle, knee))
+            if shank_unit is not None:
+                _lat_s, up_s, fwd_s = _to_local(frame, shank_unit)
+                # The shank shares the hip roll (the knee has no roll DOF): reuse
+                # roll_outward (rather than re-solving it from the shank alone)
+                # and read out theta_h + theta_k = total directly.
+                d_s = _clamp(-up_s, -1.0, 1.0)
+                cos_roll = math.cos(roll_outward)
+                if abs(cos_roll) >= MIN_COS_ROLL:
+                    total_mag = _acos(_clamp(d_s / cos_roll, -1.0, 1.0))
+                    total_signed = total_mag if fwd_s > 0.0 else -total_mag
+                    # Knees do not hyperextend: of the two sign branches keep
+                    # the one that yields a non-negative KneePitch.
+                    total = total_signed if (total_signed - hip_pitch) >= 0.0 else -total_signed
         knee_pitch = max(0.0, total - hip_pitch)
         total = hip_pitch + knee_pitch
 
-        # NAO roll signs: LHipRoll positive = left leg outward, RHipRoll negative
-        # = right leg outward. AnkleRoll cancels it so the sole stays level.
-        hip_roll = roll_mag if side == "L" else -roll_mag
+        # NAO roll signs: LHipRoll positive = left leg outward, RHipRoll
+        # negative = right leg outward. AnkleRoll cancels it so the sole
+        # stays level.
+        hip_roll = roll_outward if side == "L" else -roll_outward
 
         names = [pre + "hip", pre + "knee"] + ([pre + "ankle"] if ankle else [])
         conf = sum(kps[n][3] for n in names) / len(names)
@@ -639,23 +708,20 @@ class LowerBodyRetargeter:
 
         Two independent cues must agree before the robot squats: the hips
         actually dropped toward the ground line, AND the knees are actually bent.
-        Requiring both rejects the common false positive of the subject simply
-        stepping further from the camera.
         """
         bends = [b for b in (_knee_bend(kps, "L"), _knee_bend(kps, "R")) if b is not None]
         if not bends:
             return 0.0
         # The STRAIGHTER knee, not the average: while one leg is lifted its own
-        # deep knee fold says nothing about how low the body is, and averaging it
-        # in would make every march step look like a squat.
+        # deep knee fold says nothing about how low the body is.
         knee_cue = _clamp(
             (min(bends) - KNEE_STRAIGHT_DEADZONE) / KNEE_BEND_RANGE, 0.0, 1.0
         )
 
         height_cue = 1.0
         mid_hip = _mid_point(kps, "left_hip", "right_hip")
-        if ground_y is not None and mid_hip is not None:
-            ratio = (ground_y - mid_hip[1]) / max(self.geom.torso, 1e-4)
+        if ground_y is not None and mid_hip is not None and self.geom.torso > 1e-4:
+            ratio = (ground_y - mid_hip[1]) / self.geom.torso
             ref = self.geom.hip_height_ratio.update(ratio)
             if ref > 1e-4:
                 height_cue = _clamp((1.0 - ratio / ref) / CROUCH_FULL_DROP, 0.0, 1.0)
@@ -707,7 +773,7 @@ def retarget_upper_body(
     swap_sides: bool = False,
     limiter: Optional[JointLimiter] = None,
 ) -> Dict[str, float]:
-    """Map MediaPipe landmarks to clamped NAO arm/head targets (radians).
+    """Map MeTRAbs landmarks to clamped NAO arm/head targets (radians).
 
     Only joints whose source landmarks are visible are returned; everything
     else is omitted so the caller can hold the previous pose.
@@ -716,12 +782,12 @@ def retarget_upper_body(
     kps = _parse(keypoints)
 
     targets: Dict[str, float] = {}
-    if _visible(kps, "left_shoulder", "right_shoulder"):
-        mid_x = (kps["left_shoulder"][0] + kps["right_shoulder"][0]) / 2.0
-        targets.update(_arm(kps, "L", mid_x))
-        targets.update(_arm(kps, "R", mid_x))
-    if drive_head:
-        targets.update(_head(kps))
+    frame = _torso_frame(kps)
+    if frame is not None:
+        targets.update(_arm(kps, "L", frame))
+        targets.update(_arm(kps, "R", frame))
+        if drive_head:
+            targets.update(_head(kps, frame))
 
     if swap_sides:
         targets = _swap_sides(targets)

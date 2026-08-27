@@ -27,6 +27,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTROLLER_DIR = os.path.join(REPO, "main", "controllers", "pose_imitation_controller")
 sys.path.insert(0, os.path.join(REPO, "main", "libraries"))
 
+from nao_retarget import _side_sign  # noqa: E402
 from pose_control_utils import get_default_motor_configs  # noqa: E402
 
 CONFIGS = get_default_motor_configs()
@@ -284,7 +285,17 @@ def harness(controller_module):
 # Synthetic subject
 # ---------------------------------------------------------------------------
 def subject(*, left_leg=(0.0, 0.0, 0.0), right_leg=(0.0, 0.0, 0.0), yaw=0.0):
-    """Landmarks for a subject with each leg at ``(roll_mag, hip_pitch, knee)``."""
+    """Landmarks for a subject with each leg at ``(roll_mag, hip_pitch, knee)``.
+
+    Shoulders/hips are placed so that ``nao_retarget._torso_frame`` computes
+    the identity basis (right=(1,0,0), up=(0,-1,0), forward=(0,0,-1)) at
+    yaw=0, then rotated about the vertical axis by ``yaw`` degrees -- the
+    torso-local frame is built fresh from these landmarks every frame, so a
+    non-zero yaw exercises the whole point of that upgrade (a subject who
+    doesn't face the camera). Leg segments use the same swing-twist forward
+    kinematics as ``nao_retarget._swing_twist`` inverts -- see
+    ``tests/test_nao_retarget.py``'s ``_leg_dir`` for the derivation.
+    """
     kps = {}
     a = math.radians(yaw)
     for name, half, y in (("shoulder", 0.06, 0.30), ("hip", 0.04, 0.55)):
@@ -299,24 +310,28 @@ def subject(*, left_leg=(0.0, 0.0, 0.0), right_leg=(0.0, 0.0, 0.0), yaw=0.0):
 
     for side, legs in (("L", left_leg), ("R", right_leg)):
         roll, hip, knee = legs
-        out = -1.0 if side == "L" else 1.0
         pre = "left_" if side == "L" else "right_"
         origin = kps[pre + "hip"]
-        knee_pt = _seg(origin, out, 0.18, roll, hip)
-        ankle_pt = _seg(knee_pt, out, 0.18, roll, hip + knee)
+        knee_pt = _seg(side, origin, 0.18, roll, hip)
+        ankle_pt = _seg(side, knee_pt, 0.18, roll, hip + knee)
         kps[pre + "knee"] = knee_pt
         kps[pre + "ankle"] = ankle_pt
     return kps
 
 
-def _seg(origin, out, length, roll, pitch):
-    lateral = math.sin(roll) * math.cos(pitch)
-    vertical = math.cos(roll) * math.cos(pitch)
-    forward = -math.sin(pitch)
+def _seg(side, origin, length, roll, pitch):
+    """One limb segment's endpoint at NAO angles ``(roll, pitch)``, in the
+    identity torso frame (see ``subject()``): direction
+    ``(side_sign*sin(roll)cos(pitch), cos(roll)cos(pitch), -sin(pitch))``.
+    """
+    s = _side_sign(side)
+    dx = s * math.sin(roll) * math.cos(pitch)
+    dy = math.cos(roll) * math.cos(pitch)
+    dz = -math.sin(pitch)
     return [
-        origin[0] + out * length * lateral,
-        origin[1] + length * vertical,
-        origin[2] - length * forward,
+        origin[0] + length * dx,
+        origin[1] + length * dy,
+        origin[2] + length * dz,
         1.0,
     ]
 

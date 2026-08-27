@@ -2,13 +2,22 @@
 # This file is kept for documentation purposes.
 # To install dependencies, use:
 #   conda env create -f environment.yml -y
-#   conda run -n py312 pip install mediapipe==0.10.13
+#
+# Pose estimation now runs on MeTRAbs (https://github.com/isarandi/metrabs)
+# instead of MediaPipe: a GPU-accelerated absolute-3D pose model loaded via
+# TensorFlow-Hub (no PyPI package of its own). Needs a CUDA-enabled
+# TensorFlow build matching the target machine's driver -- exact TF/CUDA/cuDNN
+# version compatibility must be verified on that machine (this was written
+# without GPU access to test against). The pretrained model WEIGHTS are
+# non-commercial-use only per their training-data license (code itself is
+# MIT) -- see https://github.com/isarandi/metrabs/blob/master/docs/MODELS_6_DATASETS.md
 
-# Runtime dependencies (Python 3.10 - 3.12 supported by mediapipe)
+# Runtime dependencies
 numpy>=1.26,<2.1
 opencv-python>=4.9,<5.0
 PyYAML>=6.0,<7.0
-mediapipe>=0.10.13,<0.11
+tensorflow>=2.12,<2.16      # install a GPU build matching the target machine's CUDA/cuDNN
+tensorflow-hub>=0.15,<0.17
 scipy>=1.11,<2.0
 
 # Analysis / plotting

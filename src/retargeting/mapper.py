@@ -1,3 +1,21 @@
+"""Simple legacy joint-angle fallback mapper.
+
+This is the reduced-scope Python-side fallback path (see
+``src/webots_bridge.py``: raw landmarks are the PRIMARY channel and the
+Webots controller does its own full-body retargeting from them via
+``main/libraries/nao_retarget.py`` -- this mapper's ``joint_angles_rad`` are
+only used when no landmarks are present).
+
+Keypoints are MeTRAbs' absolute 3D coordinates in millimeters, camera frame
+(x right, y down, z forward/away from the camera) -- see
+``src/type_defs.Keypoint``. Unlike the old MediaPipe-era version, the depth
+component ``z`` is now trustworthy, so the "horizontal extent" of a limb is
+measured as ``hypot(x, z)`` (lateral-or-forward) rather than just ``abs(x)``
+(lateral-only, which silently assumed the subject stood frontal to the
+camera). This mapper still does not build a full torso-local frame (see
+``nao_retarget.py`` for that) -- it is a deliberately small fallback, so it
+still assumes a roughly camera-facing subject.
+"""
 from __future__ import annotations
 
 import math
@@ -13,6 +31,14 @@ def _vector(a: Keypoint, b: Keypoint) -> Tuple[float, float, float]:
 
 def _norm(v: Tuple[float, float, float]) -> float:
     return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2) + 1e-8
+
+
+def _horizontal_extent(v: Tuple[float, float, float]) -> float:
+    """Lateral-or-forward magnitude of a vector, ignoring its vertical (y)
+    component. Using both x and z (rather than just x, as the old
+    MediaPipe-era code did) correctly measures a limb's swing even when it
+    points toward/away from the camera instead of purely sideways."""
+    return math.hypot(v[0], v[2])
 
 
 def _angle_between(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
@@ -67,15 +93,15 @@ class RetargetingMapper:
         right_knee_vec = _vector(kp["right_hip"], kp["right_knee"])
 
         raw = {
-            "LShoulderPitch": math.atan2(-left_upper[1], abs(left_upper[0]) + 1e-6),
-            "RShoulderPitch": math.atan2(-right_upper[1], abs(right_upper[0]) + 1e-6),
+            "LShoulderPitch": math.atan2(-left_upper[1], _horizontal_extent(left_upper) + 1e-6),
+            "RShoulderPitch": math.atan2(-right_upper[1], _horizontal_extent(right_upper) + 1e-6),
             "LElbowRoll": math.pi - _angle_between(left_upper, left_lower),
             "RElbowRoll": -(math.pi - _angle_between(right_upper, right_lower)),
-            "LHipPitch": math.atan2(left_knee_vec[1], abs(left_knee_vec[0]) + 1e-6),
-            "RHipPitch": math.atan2(right_knee_vec[1], abs(right_knee_vec[0]) + 1e-6),
+            "LHipPitch": math.atan2(left_knee_vec[1], _horizontal_extent(left_knee_vec) + 1e-6),
+            "RHipPitch": math.atan2(right_knee_vec[1], _horizontal_extent(right_knee_vec) + 1e-6),
             "TorsoPitch": 0.5 * (
-                math.atan2(-left_hip_to_shoulder[1], abs(left_hip_to_shoulder[0]) + 1e-6)
-                + math.atan2(-right_hip_to_shoulder[1], abs(right_hip_to_shoulder[0]) + 1e-6)
+                math.atan2(-left_hip_to_shoulder[1], _horizontal_extent(left_hip_to_shoulder) + 1e-6)
+                + math.atan2(-right_hip_to_shoulder[1], _horizontal_extent(right_hip_to_shoulder) + 1e-6)
             ),
         }
 

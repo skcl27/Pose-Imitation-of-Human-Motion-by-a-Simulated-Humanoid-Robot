@@ -11,22 +11,23 @@ from src.type_defs import JointCommand, Keypoint
 # A curated subset keeps the UDP packet small (low latency, NFR-1) while still
 # covering every joint the controller maps: arms, head and legs.
 #
-# The heels and toes are included on purpose: the controller locates the "ground
-# line" as the lower of the two feet, and averaging the ankle with the heel makes
-# that line -- and therefore single-leg lift detection -- markedly steadier than
-# the ankle landmark alone.
+# MeTRAbs' coco_19 skeleton has no separate heel/toe points (unlike MediaPipe's
+# 33-landmark set) -- the controller's ground-line/lift detection falls back to
+# ankle-only (see main/libraries/nao_retarget.py's LowerBodyRetargeter, which
+# already degrades gracefully when heel landmarks are absent). ``neck`` and
+# ``pelvis`` are included because the Webots-side retargeter uses them to build
+# a per-frame torso-local reference frame from real 3D geometry.
 KEYPOINTS_TO_STREAM = (
     "nose",
     "left_eye", "right_eye",
     "left_ear", "right_ear",
+    "neck", "pelvis",
     "left_shoulder", "right_shoulder",
     "left_elbow", "right_elbow",
     "left_wrist", "right_wrist",
     "left_hip", "right_hip",
     "left_knee", "right_knee",
     "left_ankle", "right_ankle",
-    "left_heel", "right_heel",
-    "left_foot_index", "right_foot_index",
 )
 
 

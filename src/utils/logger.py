@@ -5,27 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List
 
+from src.perception.landmarks import POSE_LANDMARKS
 from src.type_defs import JointCommand, PoseFrame
-
-# All 33 MediaPipe pose landmarks (fixed schema)
-MEDIAPIPE_POSE_LANDMARKS = [
-    "nose",
-    "left_eye_inner", "left_eye", "left_eye_outer",
-    "right_eye_inner", "right_eye", "right_eye_outer",
-    "left_ear", "right_ear",
-    "mouth_left", "mouth_right",
-    "left_shoulder", "right_shoulder",
-    "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist",
-    "left_pinky", "right_pinky",
-    "left_index", "right_index",
-    "left_thumb", "right_thumb",
-    "left_hip", "right_hip",
-    "left_knee", "right_knee",
-    "left_ankle", "right_ankle",
-    "left_heel", "right_heel",
-    "left_foot_index", "right_foot_index",
-]
 
 
 @dataclass
@@ -43,7 +24,7 @@ class CsvRunLogger:
         pose_path = self.run_dir / "pose_keypoints.csv"
         self._pose_fp = pose_path.open("w", newline="", encoding="utf-8")
         fieldnames: List[str] = ["frame_index", "timestamp_s"]
-        for name in MEDIAPIPE_POSE_LANDMARKS:
+        for name in POSE_LANDMARKS:
             fieldnames.extend([f"{name}_x", f"{name}_y", f"{name}_z", f"{name}_visibility"])
         self._pose_writer = csv.DictWriter(self._pose_fp, fieldnames=fieldnames)
         self._pose_writer.writeheader()
@@ -62,7 +43,7 @@ class CsvRunLogger:
             "frame_index": pose.frame_index,
             "timestamp_s": pose.timestamp_s,
         }
-        for name in MEDIAPIPE_POSE_LANDMARKS:
+        for name in POSE_LANDMARKS:
             if name in pose.keypoints:
                 keypoint = pose.keypoints[name]
                 row[f"{name}_x"] = keypoint.x

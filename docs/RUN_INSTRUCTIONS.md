@@ -3,7 +3,15 @@
 This guide shows how to run the project from both sides: the Python pipeline in VS Code, and the Webots robot controller.
 **All dependencies are managed via Conda.** No pip or external package managers needed.
 
-> **Environment**: Ubuntu 22.04 / 24.04, Python 3.12 in Conda env `py312`, MediaPipe 0.10.13 (installed via pip within conda), Webots R2024a
+> **Environment**: Ubuntu 22.04 / 24.04, Python 3.12 in Conda env `py312`, TensorFlow + TensorFlow-Hub running [MeTRAbs](https://github.com/isarandi/metrabs) (installed via pip within conda), Webots R2024a
+>
+> **GPU required.** MeTRAbs needs a CUDA-enabled TensorFlow build for real-time
+> inference -- see step 2.4. Without a GPU, either run on a different machine or
+> set `pose.allow_synthetic_fallback: true` in `configs/default.yaml` (the robot
+> will NOT follow you in that mode; it's only useful to smoke-test the rest of
+> the pipeline). The pretrained model weights are non-commercial-use only
+> (training-data license) -- see MeTRAbs'
+> [MODELS_6_DATASETS.md](https://github.com/isarandi/metrabs/blob/master/docs/MODELS_6_DATASETS.md).
 
 ---
 
@@ -63,19 +71,40 @@ cd /home/<user>/CS_Group_C_2026/Pose-Imitation-of-Human-Motion-by-a-Simulated-Hu
 conda env create -f environment.yml -y
 ```
 
-### 2.4 Install MediaPipe via conda's pip (one-time)
+### 2.4 Install TensorFlow + TensorFlow-Hub via conda's pip (one-time)
+Install a TensorFlow build matching this machine's CUDA/cuDNN driver version
+(check with `nvidia-smi`, then see the
+[TensorFlow GPU install guide](https://www.tensorflow.org/install/pip) for the
+matching version pin -- this project was written without GPU access to verify
+an exact version, see `requirements.txt`):
 ```bash
 conda activate py312
-conda run -n py312 pip install mediapipe==0.10.13
+conda run -n py312 pip install "tensorflow>=2.12,<2.16" "tensorflow-hub>=0.15,<0.17"
 ```
 
 ### 2.5 Verify installation
 ```bash
 conda activate py312
-python -c "import mediapipe as mp; print('MediaPipe version:', mp.__version__); print('Has solutions:', hasattr(mp, 'solutions'))"
+python -c "import tensorflow as tf; print('TF version:', tf.__version__); print('GPUs:', tf.config.list_physical_devices('GPU'))"
 ```
 
-You should see: `MediaPipe version: 0.10.13` and `Has solutions: True`
+You should see a TensorFlow version and a non-empty GPU list, e.g.
+`GPUs: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')]`. If
+the list is empty, the pipeline will refuse to start (see the GPU note above)
+-- fix the CUDA/cuDNN install before continuing.
+
+### 2.6 First model download + skeleton check (one-time)
+The first run downloads and caches the MeTRAbs model (this can take a few
+minutes). Also confirms `src/perception/landmarks.py`'s joint-name mapping
+actually matches this model (see that file's docstring for why this matters):
+```bash
+python scripts/inspect_metrabs_skeleton.py
+```
+It should print `OK: every canonical landmark matched, no leftover raw names.`
+at the end. If it instead lists `MISSING canonical landmarks`, fix
+`CANONICAL_TO_RAW_ALIASES` in `src/perception/landmarks.py` using the raw
+names the script printed before doing anything else -- every downstream joint
+lookup depends on that mapping being correct.
 
 ---
 
@@ -203,7 +232,7 @@ pose_imitation_controller
 3. **Move in front of the camera** — the robot will follow your movements
 
 ### What happens behind the scenes
-- VS Code Python pipeline (conda `py312`) detects your pose using MediaPipe
+- VS Code Python pipeline (conda `py312`) detects your pose using MeTRAbs (GPU)
 - Camera feed with landmarks appears on screen
 - Joint commands are sent over UDP port `8765` to Webots
 - The Webots controller (using the same `py312` env) receives commands and moves the robot
@@ -215,8 +244,8 @@ pose_imitation_controller
 
 ### In VS Code
 - The camera window appears
-- HUD shows `Source: MediaPipe`
-- `Landmarks: XX/33` updates
+- HUD shows `Source: MeTRAbs`
+- `Landmarks: XX/19` updates
 - `Status: ✓ HUMAN DETECTED`
 
 ### In Webots
@@ -275,14 +304,18 @@ input:
   flip_horizontal: true
 
 pose:
-  use_mediapipe: true
-  model_complexity: 1
-  min_detection_confidence: 0.35
-  min_tracking_confidence: 0.35
+  use_metrabs: true
+  model_url: "https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_eff2s_y4.zip"
+  skeleton: coco_19
+  default_fov_degrees: 55.0
+  detector_threshold: 0.3
+  num_aug: 1
+  max_detections: 1
+  require_gpu: true
   allow_synthetic_fallback: false
 ```
 
-Important: keep `allow_synthetic_fallback: false` so the system uses real MediaPipe pose tracking.
+Important: keep `allow_synthetic_fallback: false` so the system uses real MeTRAbs pose tracking.
 
 ---
 
@@ -291,8 +324,10 @@ Important: keep `allow_synthetic_fallback: false` so the system uses real MediaP
 | Symptom | Fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'cv2'` | Run `conda env create -f environment.yml -y` to install all conda dependencies. |
-| `AttributeError: module 'mediapipe' has no attribute 'solutions'` | Ensure correct MediaPipe version: `conda run -n py312 pip install mediapipe==0.10.13` |
-| HUD shows `Source: SYNTHETIC` | MediaPipe not loaded. Verify: `python -c "import mediapipe; print(hasattr(mediapipe, 'solutions'))"` |
+| `MetrabsUnavailableError: No GPU visible to TensorFlow` | Fix the CUDA/cuDNN install (see step 2.4-2.5), or run on a machine with a GPU. |
+| `ModuleNotFoundError: No module named 'tensorflow_hub'` | `conda run -n py312 pip install "tensorflow>=2.12,<2.16" "tensorflow-hub>=0.15,<0.17"` |
+| `PoseEstimatorError: ... joint names did not match ...` | Run `python scripts/inspect_metrabs_skeleton.py` and fix `CANONICAL_TO_RAW_ALIASES` in `src/perception/landmarks.py` using the raw names it prints. |
+| HUD shows `Source: SYNTHETIC` | MeTRAbs not loaded (see the log line above the HUD for why -- usually the GPU check or a skeleton mismatch). |
 | Skeleton does not follow movement | Ensure `--no-webots` is NOT used. If using it, camera-only mode is expected (no Webots). |
 | Robot does not move in Webots | (1) Webots is playing (▶), (2) controller is `pose_imitation_controller`, (3) Python command set correctly. |
 | Webots controller fails to start | Verify Webots Python command: `Tools → Preferences → Python command = /home/CSPM26/miniconda3/envs/py312/bin/python` |
@@ -350,15 +385,15 @@ python -m py_compile src/perception/pose_estimator.py
 
 - **All commands use conda**: `conda activate py312` before running any Python code
 - **Environment file**: `environment.yml` is the single source of truth for all dependencies
-- **MediaPipe version**: Fixed at `0.10.13` for Python 3.12 compatibility  
+- **TensorFlow/GPU**: MeTRAbs needs a CUDA-enabled TensorFlow build matching this machine's driver -- see step 2.4
 - **Webots UDP port**: Controller listens on `8765` (do not change)
 - **Pipeline sends automatically**: Joint commands to Webots start immediately when camera detects motion
 - **Camera-only testing**: Use `--no-webots` flag to test perception without starting Webots
-- **No pip in workspace**: All deps are managed via conda (MediaPipe installed via conda's pip for compatibility)
+- **No pip in workspace**: All deps are managed via conda (TensorFlow/TensorFlow-Hub installed via conda's pip for compatibility)
 
 | `ImportError: libGL.so.1` | `sudo apt install -y libgl1 libglib2.0-0`. |
 | `qt.qpa.plugin: could not load` | `sudo apt install -y libxcb-xinerama0`. |
-| Low FPS | Drop `input.width/height` to `640×480`; set `pose.model_complexity: 0`. |
+| Low FPS | Drop `input.width/height` to `640×480`; switch `pose.model_url` to a smaller/faster backbone (e.g. `metrabs_rn18_y4` or `metrabs_mob3s_y4`); lower `pose.num_aug` (already 1 by default). |
 | Webots Python errors | Set Webots `Python command` to `which python` from the active `y313` conda env (Step 8.2.4). |
 | UDP packets not received | Same host; firewall must allow `127.0.0.1:8765/udp`. |
 

@@ -8,7 +8,7 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 WorldInfo {
   info [
     "Pose imitation of human motion by a simulated humanoid robot (NAO H25)."
-    "Real time: MediaPipe pose -> UDP 8765 -> pose_imitation_controller."
+    "Real time: MeTRAbs 3D pose (GPU) -> UDP 8765 -> pose_imitation_controller."
     ""
     "DO NOT REMOVE THE contactProperties NODE BELOW - it is not cosmetic."
     "Nao.proto tags its soles with the contact material 'NAO foot material'."

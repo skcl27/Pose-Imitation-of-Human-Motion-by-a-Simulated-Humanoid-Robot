@@ -1,11 +1,18 @@
 """Tests for full-body retargeting (main/libraries/nao_retarget.py).
 
-The leg solve is checked by *round trip*: a synthetic camera projection is built
-from known NAO joint angles, and the retargeter has to recover those angles from
-the projected landmarks. That is a much stronger check than asserting on
-hand-picked numbers -- it verifies the actual geometry (NAO's HipRoll -> HipPitch
--> KneePitch chain, the ankle levelling, the mirrored roll signs) rather than
-just that the code runs.
+The leg solve is checked by *round trip*: a synthetic camera-frame 3D pose
+(mm, camera coordinates -- see nao_retarget.py's module docstring) is built
+from known NAO joint angles via the same swing-twist forward-kinematics
+relationship the retargeter inverts, and the retargeter has to recover those
+angles from the projected landmarks. That is a much stronger check than
+asserting on hand-picked numbers -- it verifies the actual geometry (NAO's
+HipRoll -> HipPitch -> KneePitch chain, the ankle levelling, the mirrored
+roll signs) rather than just that the code runs.
+
+Unlike the MediaPipe-era version of this test file, landmarks here are
+absolute 3D (mm) rather than a 2D image-plane projection, so there is no
+approximation/foreshortening error to tolerate in the round trip -- the
+recovered angles should match the input angles almost exactly.
 """
 from __future__ import annotations
 
@@ -18,48 +25,44 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "librar
 from nao_retarget import (  # noqa: E402
     LowerBodyRetargeter,
     PeakHold,
+    _side_sign,
     crouch_posture,
     retarget_full_body,
     retarget_upper_body,
 )
 
-# Synthetic subject geometry, in normalized image units.
-TORSO = 0.25
-THIGH = 0.18
-SHANK = 0.18
-HIP_Y = 0.55
-HALF_HIP = 0.04
-HALF_SHOULDER = 0.06
-# Image axis mapping used by the projection below (see _project_leg):
-#   NAO +y (robot's left) -> image -x        NAO +z (up) -> image -y
-#   NAO +x (forward, toward camera) -> image -z
-_IMG_OUT = {"L": -1.0, "R": +1.0}
+# Synthetic subject geometry, in millimeters.
+TORSO = 250.0
+THIGH = 180.0
+SHANK = 180.0
+HIP_Y = 550.0
+HALF_HIP = 40.0
+HALF_SHOULDER = 60.0
+CENTER_X = 500.0
 
-
-def _segment(origin, out_dir, length, roll_mag, pitch, z_scale=1.0):
-    """Project one limb segment onto the synthetic camera.
-
-    The segment direction in the torso frame is
-    ``R_x(roll) . R_y(pitch) . (0, 0, -1)``
-    ``= (-sin(pitch), sin(roll)cos(pitch), -cos(roll)cos(pitch))``.
-    """
-    x, y, z = origin
-    lateral = math.sin(roll_mag) * math.cos(pitch)
-    vertical = math.cos(roll_mag) * math.cos(pitch)
-    forward = -math.sin(pitch)
+# The synthetic shoulders/hips below are placed so that ``_torso_frame``
+# computes exactly this identity basis: right=(1,0,0), up=(0,-1,0),
+# forward=(0,0,-1). Note this is a construction choice for the test (it does
+# not assert anything about which way a real subject faces the camera -- see
+# gait_cues.py for that empirical, separately-flagged convention) -- it only
+# needs to be internally self-consistent with the forward-kinematics helpers
+# below, which is what the round trip actually checks.
+def _leg_dir(side, roll, pitch):
+    s = _side_sign(side)
     return (
-        x + out_dir * length * lateral,
-        y + length * vertical,
-        z - z_scale * length * forward,
+        s * math.sin(roll) * math.cos(pitch),
+        math.cos(roll) * math.cos(pitch),
+        -math.sin(pitch),
     )
 
 
 def _leg_landmarks(side, roll_mag, hip_pitch, knee_pitch):
     """Landmarks for one leg posed at the given NAO angles."""
-    out = _IMG_OUT[side]
-    hip = (0.5 + out * HALF_HIP, HIP_Y, 0.0)
-    knee = _segment(hip, out, THIGH, roll_mag, hip_pitch)
-    ankle = _segment(knee, out, SHANK, roll_mag, hip_pitch + knee_pitch)
+    hip = (CENTER_X + _side_sign(side) * HALF_HIP, HIP_Y, 0.0)
+    d1 = _leg_dir(side, roll_mag, hip_pitch)
+    knee = tuple(hip[i] + THIGH * d1[i] for i in range(3))
+    d2 = _leg_dir(side, roll_mag, hip_pitch + knee_pitch)
+    ankle = tuple(knee[i] + SHANK * d2[i] for i in range(3))
     pre = "left_" if side == "L" else "right_"
     return {
         pre + "hip": [hip[0], hip[1], hip[2], 1.0],
@@ -72,15 +75,15 @@ def figure(left=(0.0, 0.0, 0.0), right=(0.0, 0.0, 0.0)):
     """A whole synthetic subject; each leg is ``(roll_mag, hip_pitch, knee)``."""
     sh_y = HIP_Y - TORSO
     kps = {
-        "left_shoulder": [0.5 - HALF_SHOULDER, sh_y, 0.0, 1.0],
-        "right_shoulder": [0.5 + HALF_SHOULDER, sh_y, 0.0, 1.0],
+        "left_shoulder": [CENTER_X - HALF_SHOULDER, sh_y, 0.0, 1.0],
+        "right_shoulder": [CENTER_X + HALF_SHOULDER, sh_y, 0.0, 1.0],
         # Arms hanging down, elbows and wrists included so the upper-body
-        # retarget has something to solve.
-        "left_elbow": [0.5 - HALF_SHOULDER - 0.01, sh_y + 0.11, 0.0, 1.0],
-        "right_elbow": [0.5 + HALF_SHOULDER + 0.01, sh_y + 0.11, 0.0, 1.0],
-        "left_wrist": [0.5 - HALF_SHOULDER - 0.02, sh_y + 0.22, 0.0, 1.0],
-        "right_wrist": [0.5 + HALF_SHOULDER + 0.02, sh_y + 0.22, 0.0, 1.0],
-        "nose": [0.5, sh_y - 0.12, 0.0, 1.0],
+        # retarget has something to solve (not round-trip tested here).
+        "left_elbow": [CENTER_X - HALF_SHOULDER - 10.0, sh_y + 110.0, 0.0, 1.0],
+        "right_elbow": [CENTER_X + HALF_SHOULDER + 10.0, sh_y + 110.0, 0.0, 1.0],
+        "left_wrist": [CENTER_X - HALF_SHOULDER - 20.0, sh_y + 220.0, 0.0, 1.0],
+        "right_wrist": [CENTER_X + HALF_SHOULDER + 20.0, sh_y + 220.0, 0.0, 1.0],
+        "nose": [CENTER_X, sh_y - 120.0, 0.0, 1.0],
     }
     kps.update(_leg_landmarks("L", *left))
     kps.update(_leg_landmarks("R", *right))
@@ -88,7 +91,7 @@ def figure(left=(0.0, 0.0, 0.0), right=(0.0, 0.0, 0.0)):
 
 
 def warm(retargeter, frames=80):
-    """Let the self-calibration converge on the standing reference lengths."""
+    """Let the geometry EMA settle on the standing reference lengths."""
     obs = None
     for _ in range(frames):
         obs = retargeter.observe(figure())
@@ -101,7 +104,7 @@ def test_peak_hold_rises_fast_and_decays_slowly() -> None:
     ph.update(1.0)
     assert ph.update(2.0) > 1.4          # rises quickly toward a new peak
     before = ph.value
-    ph.update(0.1)                        # a foreshortened frame
+    ph.update(0.1)                        # a low sample
     assert ph.value > 0.9 * before        # barely moves the reference
     assert ph.update(float("nan")) == ph.value
 
@@ -109,9 +112,11 @@ def test_peak_hold_rises_fast_and_decays_slowly() -> None:
 def test_calibration_recovers_segment_lengths() -> None:
     r = LowerBodyRetargeter()
     warm(r)
-    assert abs(r.geom.torso - TORSO) < 1e-3
-    assert abs(r.geom.thigh - THIGH) < 5e-3
-    assert abs(r.geom.shank - SHANK) < 5e-3
+    # Real mm measurements, EMA-smoothed but not foreshortened -- tight
+    # tolerance compared to the old MediaPipe-era scale-recovery test.
+    assert abs(r.geom.torso - TORSO) < 1e-2
+    assert abs(r.geom.thigh - THIGH) < 1e-2
+    assert abs(r.geom.shank - SHANK) < 1e-2
     assert r.geom.calibrated
 
 
@@ -148,9 +153,9 @@ def test_round_trip_recovers_hip_and_knee_angles() -> None:
         warm(r)
         obs = r.observe(figure(left=(roll, hip, knee)))
         leg = obs.left
-        assert abs(leg.hip_roll - roll) < 0.03, (roll, hip, knee, leg.hip_roll)
-        assert abs(leg.hip_pitch - hip) < 0.05, (roll, hip, knee, leg.hip_pitch)
-        assert abs(leg.knee_pitch - knee) < 0.06, (roll, hip, knee, leg.knee_pitch)
+        assert abs(leg.hip_roll - roll) < 0.01, (roll, hip, knee, leg.hip_roll)
+        assert abs(leg.hip_pitch - hip) < 0.01, (roll, hip, knee, leg.hip_pitch)
+        assert abs(leg.knee_pitch - knee) < 0.01, (roll, hip, knee, leg.knee_pitch)
 
 
 def test_roll_signs_are_mirrored_between_legs() -> None:
@@ -230,13 +235,18 @@ def test_the_crouch_keeps_the_ankle_under_the_hip_at_any_depth() -> None:
             assert abs(total) < 1e-12          # torso vertical, sole flat
 
 
-def test_lift_ignores_the_subject_moving_away_from_the_camera() -> None:
-    """Scale invariance: the whole figure shrinking must not read as a lift."""
+def test_lift_is_invariant_to_camera_distance() -> None:
+    """Real 3D coordinates are already metric, so moving the whole subject
+    farther from the camera (a uniform z shift) must not read as a lift --
+    unlike MediaPipe's foreshortened 2D projection, there is no scale
+    ambiguity left to introduce spurious lift, but a uniform depth offset is
+    still worth checking since the leg solve uses z for the fwd/backward
+    sign."""
     r = LowerBodyRetargeter()
     warm(r)
     far = {}
     for name, v in figure().items():
-        far[name] = [0.5 + (v[0] - 0.5) * 0.6, 0.5 + (v[1] - 0.5) * 0.6, v[2], v[3]]
+        far[name] = [v[0], v[1], v[2] + 1500.0, v[3]]
     obs = r.observe(far)
     assert obs.left.lift < 0.1 and obs.right.lift < 0.1
 
@@ -267,6 +277,17 @@ def test_upper_body_returns_no_leg_joints() -> None:
     targets = retarget_upper_body(figure())
     assert targets
     assert not any("Hip" in n or "Knee" in n or "Ankle" in n for n in targets)
+
+
+def test_upper_body_needs_no_hips_visible() -> None:
+    """A desk-framed webcam (waist up only) should still drive arms/head --
+    see nao_retarget._torso_frame's camera-vertical fallback."""
+    kps = figure()
+    for name in ("left_hip", "right_hip", "left_knee", "right_knee",
+                 "left_ankle", "right_ankle"):
+        kps.pop(name, None)
+    targets = retarget_upper_body(kps)
+    assert "LShoulderPitch" in targets and "RShoulderPitch" in targets
 
 
 def test_full_body_includes_legs_only_when_asked() -> None:

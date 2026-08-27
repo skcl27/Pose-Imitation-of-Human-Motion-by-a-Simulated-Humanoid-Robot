@@ -12,12 +12,14 @@ from typing import Deque, Optional
 
 import cv2
 
+from src.perception import metrabs_model
 from src.perception.gait_cues import GaitCueExtractor
+from src.perception.landmarks import POSE_LANDMARKS
 from src.perception.pose_estimator import PoseEstimator
 from src.perception.video_input import VideoSource
 from src.perception.visualizer import SkeletonOverlay
 from src.retargeting.mapper import RetargetingMapper, default_joint_limits
-from src.type_defs import JointCommand
+from src.type_defs import JointCommand, Keypoint, PoseFrame
 from src.utils.config import Config
 from src.utils.filtering import ExponentialSmoother
 from src.utils.fps import AdaptiveFPSController
@@ -25,6 +27,33 @@ from src.utils.logger import CsvRunLogger
 from src.webots_bridge import WebotsBridge
 
 logger = logging.getLogger(__name__)
+
+
+class _KeypointSmoother:
+    """Light per-joint EMA smoothing of raw 3D keypoints.
+
+    MeTRAbs, unlike MediaPipe (``smooth_landmarks=True``), does not smooth
+    across frames itself -- each frame's pose is estimated independently. This
+    reuses ``ExponentialSmoother`` (one instance per x/y/z channel) to damp
+    frame-to-frame jitter. ``visibility`` passes through unsmoothed since it
+    reflects the current frame's detection quality, not a lagging quantity.
+    """
+
+    def __init__(self, alpha: float) -> None:
+        self._x = ExponentialSmoother(alpha=alpha)
+        self._y = ExponentialSmoother(alpha=alpha)
+        self._z = ExponentialSmoother(alpha=alpha)
+
+    def update(self, keypoints: dict) -> dict:
+        if not keypoints:
+            return keypoints
+        xs = self._x.update({n: kp.x for n, kp in keypoints.items()})
+        ys = self._y.update({n: kp.y for n, kp in keypoints.items()})
+        zs = self._z.update({n: kp.z for n, kp in keypoints.items()})
+        return {
+            n: Keypoint(x=xs[n], y=ys[n], z=zs[n], visibility=kp.visibility)
+            for n, kp in keypoints.items()
+        }
 
 
 @dataclass
@@ -72,18 +101,22 @@ class PoseImitationPipeline:
             preferred_fps=fps_controller.current_fps,
         )
         estimator = PoseEstimator(
-            use_mediapipe=bool(cfg.get("pose.use_mediapipe", True)),
-            model_complexity=int(cfg.get("pose.model_complexity", 1)),
-            min_detection_confidence=float(cfg.get("pose.min_detection_confidence", 0.5)),
-            min_tracking_confidence=float(cfg.get("pose.min_tracking_confidence", 0.5)),
-            smooth_landmarks=bool(cfg.get("pose.smooth_landmarks", True)),
+            use_metrabs=bool(cfg.get("pose.use_metrabs", True)),
+            model_url=str(cfg.get("pose.model_url", metrabs_model.DEFAULT_MODEL_URL)),
+            skeleton=str(cfg.get("pose.skeleton", metrabs_model.DEFAULT_SKELETON)),
+            default_fov_degrees=float(cfg.get("pose.default_fov_degrees", 55.0)),
+            detector_threshold=float(cfg.get("pose.detector_threshold", 0.3)),
+            num_aug=int(cfg.get("pose.num_aug", 1)),
+            max_detections=int(cfg.get("pose.max_detections", 1)),
+            require_gpu=bool(cfg.get("pose.require_gpu", True)),
             allow_synthetic_fallback=bool(cfg.get("pose.allow_synthetic_fallback", False)),
         )
+        keypoint_smoother = _KeypointSmoother(alpha=float(cfg.get("pose.smoothing_alpha", 0.5)))
         if estimator.is_real:
             logger.info(
-                "Pose estimator: MediaPipe (real human tracking active). "
-                "Detection threshold: %.2f, Tracking threshold: %.2f",
-                estimator.min_detection_confidence, estimator.min_tracking_confidence
+                "Pose estimator: MeTRAbs (real human tracking active). "
+                "Skeleton: %s, detector threshold: %.2f",
+                estimator.skeleton, estimator.detector_threshold,
             )
         else:
             logger.error(
@@ -139,6 +172,12 @@ class PoseImitationPipeline:
                 start = time.perf_counter()
                 image = cv2.flip(frame.image_bgr, 1) if flip_horizontal else frame.image_bgr
                 pose = estimator.estimate(image, frame.timestamp_s, frame.frame_index)
+                if pose.keypoints:
+                    pose = PoseFrame(
+                        timestamp_s=pose.timestamp_s,
+                        keypoints=keypoint_smoother.update(pose.keypoints),
+                        frame_index=pose.frame_index,
+                    )
                 run_logger.log_pose(pose)
 
                 gait_cmd = gait_extractor.update(pose)
@@ -176,15 +215,17 @@ class PoseImitationPipeline:
                     )
                     hud = [
                         f"Target FPS: {fps_controller.current_fps:5.1f}",
-                        f"Joints: {n_joints}   Visible: {visible_landmarks}/33",
-                        "Source: MediaPipe" if estimator.is_real else "Source: SYNTHETIC",
+                        f"Joints: {n_joints}   Visible: {visible_landmarks}/{len(POSE_LANDMARKS)}",
+                        "Source: MeTRAbs" if estimator.is_real else "Source: SYNTHETIC",
                         f"Gait: {gait_cmd.state:5s} {gait_cmd.cadence_hz:.2f}Hz "
                         f"conf {gait_cmd.conf:.2f}",
                         f"Body yaw: {math.degrees(gait_cmd.body_yaw_rad):+6.1f} deg "
                         f"conf {gait_cmd.yaw_conf:.2f}",
                     ]
+                    h, w = image.shape[:2]
                     canvas = overlay.draw(
                         image, pose,
+                        intrinsics=estimator.intrinsics_for(w, h),
                         fps=effective_fps,
                         latency_ms=avg_latency,
                         extra_hud=hud,

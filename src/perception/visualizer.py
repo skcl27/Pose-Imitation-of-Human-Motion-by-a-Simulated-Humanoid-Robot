@@ -2,60 +2,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Tuple
+from typing import Iterable
 
 import cv2
 import numpy as np
 
-from src.perception.landmarks import MEDIAPIPE_POSE_LANDMARKS
+from src.perception.landmarks import POSE_CONNECTIONS, POSE_LANDMARKS
+from src.perception.metrabs_model import project_point
 from src.type_defs import PoseFrame
 
 logger = logging.getLogger(__name__)
-
-# Edges follow MediaPipe's POSE_CONNECTIONS layout (33-landmark skeleton).
-POSE_CONNECTIONS: Tuple[Tuple[str, str], ...] = (
-    # Face
-    ("left_ear", "left_eye_outer"),
-    ("left_eye_outer", "left_eye"),
-    ("left_eye", "left_eye_inner"),
-    ("left_eye_inner", "nose"),
-    ("nose", "right_eye_inner"),
-    ("right_eye_inner", "right_eye"),
-    ("right_eye", "right_eye_outer"),
-    ("right_eye_outer", "right_ear"),
-    ("mouth_left", "mouth_right"),
-    # Torso
-    ("left_shoulder", "right_shoulder"),
-    ("left_shoulder", "left_hip"),
-    ("right_shoulder", "right_hip"),
-    ("left_hip", "right_hip"),
-    # Left arm
-    ("left_shoulder", "left_elbow"),
-    ("left_elbow", "left_wrist"),
-    ("left_wrist", "left_pinky"),
-    ("left_wrist", "left_index"),
-    ("left_wrist", "left_thumb"),
-    ("left_index", "left_pinky"),
-    # Right arm
-    ("right_shoulder", "right_elbow"),
-    ("right_elbow", "right_wrist"),
-    ("right_wrist", "right_pinky"),
-    ("right_wrist", "right_index"),
-    ("right_wrist", "right_thumb"),
-    ("right_index", "right_pinky"),
-    # Left leg
-    ("left_hip", "left_knee"),
-    ("left_knee", "left_ankle"),
-    ("left_ankle", "left_heel"),
-    ("left_heel", "left_foot_index"),
-    ("left_ankle", "left_foot_index"),
-    # Right leg
-    ("right_hip", "right_knee"),
-    ("right_knee", "right_ankle"),
-    ("right_ankle", "right_heel"),
-    ("right_heel", "right_foot_index"),
-    ("right_ankle", "right_foot_index"),
-)
 
 LANDMARK_COLOR = (0, 200, 255)   # cyan-orange landmarks
 SKELETON_COLOR = (255, 255, 255) # white bones
@@ -64,7 +20,13 @@ LOW_VIS_THRESHOLD = 0.3          # Lowered threshold to show more detected landm
 
 
 class SkeletonOverlay:
-    """Draws keypoints, bones, and HUD onto a BGR frame."""
+    """Draws keypoints, bones, and HUD onto a BGR frame.
+
+    Keypoints are now 3D (mm, camera frame) rather than normalized [0,1] image
+    coordinates, so drawing them requires projecting back to pixels with the
+    same pinhole intrinsic matrix the estimator used for inference (see
+    ``PoseEstimator.intrinsics_for``), passed into :meth:`draw`.
+    """
 
     def __init__(
         self,
@@ -84,13 +46,20 @@ class SkeletonOverlay:
         self,
         frame_bgr: np.ndarray,
         pose: PoseFrame,
+        intrinsics: np.ndarray,
         fps: float = 0.0,
         latency_ms: float = 0.0,
         extra_hud: Iterable[str] = (),
     ) -> np.ndarray:
-        h, w = frame_bgr.shape[:2]
         canvas = frame_bgr.copy()
         keypoints = pose.keypoints
+
+        pixels = {
+            name: project_point(
+                np.array([kp.x, kp.y, kp.z], dtype=np.float32), intrinsics
+            )
+            for name, kp in keypoints.items()
+        }
 
         # Draw bones
         for a_name, b_name in POSE_CONNECTIONS:
@@ -100,16 +69,16 @@ class SkeletonOverlay:
                 continue
             if a.visibility < LOW_VIS_THRESHOLD or b.visibility < LOW_VIS_THRESHOLD:
                 continue
-            pa = (int(a.x * w), int(a.y * h))
-            pb = (int(b.x * w), int(b.y * h))
+            pa = (int(pixels[a_name][0]), int(pixels[a_name][1]))
+            pb = (int(pixels[b_name][0]), int(pixels[b_name][1]))
             cv2.line(canvas, pa, pb, SKELETON_COLOR, 2, cv2.LINE_AA)
 
         # Draw landmarks
-        for name in MEDIAPIPE_POSE_LANDMARKS:
+        for name in POSE_LANDMARKS:
             kp = keypoints.get(name)
             if kp is None or kp.visibility < LOW_VIS_THRESHOLD:
                 continue
-            cx, cy = int(kp.x * w), int(kp.y * h)
+            cx, cy = int(pixels[name][0]), int(pixels[name][1])
             cv2.circle(canvas, (cx, cy), 4, LANDMARK_COLOR, -1, cv2.LINE_AA)
 
         # HUD
@@ -125,7 +94,7 @@ class SkeletonOverlay:
         extra_hud: Iterable[str],
     ) -> None:
         detected = sum(1 for kp in pose.keypoints.values() if kp.visibility >= LOW_VIS_THRESHOLD)
-        total = len(MEDIAPIPE_POSE_LANDMARKS)
+        total = len(POSE_LANDMARKS)
         # Consider human detected if we see 20% or more of the body
         has_human = detected >= total * 0.2 and len(pose.keypoints) > 0
         status = "✓ HUMAN DETECTED" if has_human else "✗ NO HUMAN DETECTED"

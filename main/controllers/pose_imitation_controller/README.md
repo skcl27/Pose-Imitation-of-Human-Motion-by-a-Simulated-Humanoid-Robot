@@ -15,7 +15,7 @@ axes, signs, limits, balance, gait) lives here, on the robot side.
 ```
 Python pipeline (src/)                    Webots controller (this folder)
 ──────────────────────                    ────────────────────────────────
-MediaPipe 33 landmarks                    pose_imitation_controller.py
+MeTRAbs 3D landmarks (mm, GPU)            pose_imitation_controller.py
   ├─ raw landmarks ───────── UDP 8765 ──►    ├─ arms + head
   ├─ gait cues (cadence,                     │    nao_retarget.retarget_upper_body
   │   phase, body_yaw_rad)                   └─ legs: EXACTLY ONE of ↓
@@ -27,6 +27,13 @@ MediaPipe 33 landmarks                    pose_imitation_controller.py
                                                    NaoPoseDriver
                                                    clamp → smooth → setPosition
 ```
+
+Landmarks are now absolute 3D (millimeters, camera frame -- see
+`src/perception/pose_estimator.py`), not MediaPipe's normalized 2D image
+coordinates plus a weak depth channel. That changes what `nao_retarget.py` has
+to do (§2) but nothing downstream of it -- `lower_body.py`, `balance.py`,
+`gait.py` and `walk_motion.py` only ever see already-retargeted NAO joint
+angles or the abstract gait-command dict, never raw landmarks.
 
 **Exactly one layer commands the 12 leg joints on any given simulation step.**
 Two at once means they fight each other and the robot falls; that single rule is
@@ -58,39 +65,53 @@ dev machine that has no Webots installed (`pytest -q`).
 | Elbow bend | `ElbowRoll` | angle between upper-arm and forearm |
 | Head turn / nod | `HeadYaw`, `HeadPitch` | nose vs. shoulder midline |
 
-NAO's 2-DOF shoulder is recovered from the single observed arm direction by
-splitting it into a vertical part (pitch) and a lateral part (roll). Depth-free,
-so it is robust for a frontal camera.
+NAO's 2-DOF shoulder is recovered from the observed 3D arm direction by the same
+swing-twist decomposition used for the legs below (reference direction: arm
+pointing straight forward).
 
 ### Legs — the closed-form per-leg solve
 
-For a thigh at hip roll `φ` and hip pitch `θ`, its direction in the torso frame is
+MeTRAbs gives real 3D, so this is no longer a *reconstruction* from a 2D
+projection plus a noisy depth sign (the MediaPipe-era version of this section)
+-- it is an exact closed-form decomposition of a real 3D bone direction.
+
+Because the subject may now face any direction relative to the camera (not just
+frontally, which the old 2D-projection approach implicitly assumed), each frame
+`nao_retarget.py` first builds an orthonormal **torso-local basis**
+(`right`, `up`, `forward`) from the shoulder line and the hip-to-shoulder line.
+Every bone vector is projected onto this basis before solving, so the angles
+that come out are relative to the subject's own body, not the camera.
+
+For a thigh at hip roll `φ` and hip pitch `θ`, its UNIT direction in that
+torso-local frame is
 
 ```
-R_x(φ) · R_y(θ) · (0,0,−1) = ( −sin θ , sin φ·cos θ , −cos φ·cos θ )
-                                ^forward  ^lateral      ^vertical
+(lat, up, fwd) = ( sin φ·cos θ , −cos φ·cos θ , sin θ )
+                    ^lateral      ^vertical       ^forward
 ```
 
-A frontal camera observes the **lateral** and **vertical** components directly —
-forward is the foreshortened, unobservable axis — which makes the system exactly
-solvable:
+which is now directly measured (all three components), not just two of three
+approximated from foreshortening. The closed-form inverse ("swing-twist
+decomposition", `nao_retarget._swing_twist`) is:
 
 ```
-d  = −up_obs        = cos φ·cos θ
-φ  = atan2(lat_obs, d)                  ← abduction, fully observable
-θ  = ± acos(d / cos φ)                  ← magnitude from foreshortening
+d  = −up             = cos φ·cos θ
+φ  = atan2(lat, d)                      ← abduction (HipRoll)
+θ  = ± acos(d / cos φ), sign from fwd   ← flexion (HipPitch)
 ```
-
-The only ambiguity a single frontal view leaves is the **sign** of `θ` (thigh
-forward or backward). That comes from the landmark depth `z` with a deadband and
-a documented bias toward *forward* — human knee lifts are forward, and NAO's
-`HipPitch` range (−88°…+27.7°) is mostly forward anyway.
 
 The shank shares the hip roll and adds `KneePitch` about the same axis, so the
 identical solve on knee→ankle yields `θ_hip + θ_knee`; the sole is then levelled
-by `AnklePitch = −(θ_hip + θ_knee)` and `AnkleRoll = −φ`. Segment reference
-lengths are learned from the stream by a peak-hold tracker normalized by torso
-length, so there is **no calibration step** and the result is scale-invariant.
+by `AnklePitch = −(θ_hip + θ_knee)` and `AnkleRoll = −φ`. Segment lengths (thigh,
+shank, torso) are measured directly in millimeters each frame and lightly
+smoothed for jitter -- there is no foreshortening left to correct for, so
+unlike the old MediaPipe-era peak-hold scheme there is nothing to *learn*, only
+to smooth.
+
+Foot-lift and crouch detection deliberately stay in camera-frame vertical
+(assuming a roughly level camera) rather than the torso-local frame: "which
+foot is on the ground" is a real-world-verticality question, and answering it
+from the torso's own up axis would make a forward lean read as a foot lift.
 
 #### When the camera crops your legs
 
@@ -336,15 +357,20 @@ An earlier version took `abs()` of the lateral term, which folded the two halves
 together and bounded the estimate to ±90° — so the robot could never be asked to
 turn round, however far you turned.
 
-The term is `left.x − right.x`, not the other way about: MediaPipe labels a
-person facing the camera with their *left* shoulder on the image's **right**.
-Measured on recorded runs, `right.x − left.x` is negative on 67% of frames with
-both shoulders clearly visible (median −0.085), and 99% of those frames have both
-ears visible — a face-on view. The hips agree, so it is a labelling convention
-rather than noise, and it holds whether or not the preview is mirrored (MediaPipe
-cannot tell a mirrored subject from a real one, so it labels by appearance either
-way). With the sign inverted, someone looking straight at the camera was reported
-as turned 180° away.
+The term is `left.x − right.x`, not the other way about: pose estimators
+conventionally label a person facing the camera with their *left* shoulder on
+the image's **right** (anatomical left/right; MeTRAbs' `coco_19` follows the
+same COCO convention MediaPipe did). Measured on recorded MediaPipe runs,
+`right.x − left.x` was negative on 67% of frames with both shoulders clearly
+visible (median −0.085), and 99% of those frames had both ears visible — a
+face-on view. The hips agreed, so it reflected a labelling convention rather
+than noise, and it held whether or not the preview was mirrored (the estimator
+cannot tell a mirrored subject from a real one, so it labels by appearance
+either way). With the sign inverted, someone looking straight at the camera
+was reported as turned 180° away. **This has not been re-measured against
+real MeTRAbs output** (written without GPU access) — worth a quick sanity
+check ("stand facing the camera, confirm yaw reads ~0°") the first time this
+runs on the target machine; see `gait_cues.py`'s module docstring.
 
 ### Why the yaw is filtered so carefully
 
@@ -467,11 +493,10 @@ UDP JSON on **port 8765**:
   "frame_index": 45,
   "joint_angles_rad": { "LShoulderPitch": 0.5, "RElbowRoll": -1.1 },
   "keypoints": {
-    "left_shoulder": [0.40, 0.40, -0.1, 0.99],
-    "left_hip":      [0.46, 0.55, -0.1, 0.98],
-    "left_knee":     [0.46, 0.73, -0.1, 0.97],
-    "left_ankle":    [0.46, 0.91, -0.1, 0.95],
-    "left_heel":     [0.45, 0.93, -0.1, 0.93]
+    "left_shoulder": [-160.2, -580.4, 1980.1, 0.99],
+    "left_hip":      [-108.6, 15.2, 1975.3, 0.98],
+    "left_knee":     [-114.8, 428.7, 2010.5, 0.97],
+    "left_ankle":    [-119.3, 826.9, 2005.1, 0.95]
   },
   "gait": {
     "state": "march", "cadence_hz": 0.95, "phase": 1.83, "swing_side": 1,
@@ -481,12 +506,17 @@ UDP JSON on **port 8765**:
 }
 ```
 
-- **`keypoints`** *(preferred)* — MediaPipe landmarks `name → [x, y, z, visibility]`
-  in normalized image coordinates (`x` right, `y` down, both 0–1). The controller
-  retargets these itself. ~21 landmarks are streamed (head, shoulders, elbows,
-  wrists, hips, knees, ankles, **heels and toes**) to keep packets small. The
-  heels matter: the controller finds the "ground line" as the lower of the two
-  feet, and averaging ankle with heel makes lift detection markedly steadier.
+- **`keypoints`** *(preferred)* — MeTRAbs landmarks `name → [x, y, z, visibility]`
+  in absolute METRIC camera-frame coordinates (millimeters; `x` right, `y` down,
+  `z` forward/away from the camera) -- see `src/type_defs.Keypoint`. This
+  replaces MediaPipe's normalized [0,1] image coordinates plus a weak depth
+  channel. `visibility` is a PROXY (in-frame/in-box confidence), not a true
+  per-joint occlusion estimate -- MeTRAbs has no per-joint confidence output.
+  The controller retargets these itself. 19 landmarks are streamed (head,
+  shoulders, elbows, wrists, hips, knees, ankles, neck, pelvis) to keep packets
+  small. MeTRAbs' `coco_19` skeleton has no separate heel/toe landmarks (unlike
+  MediaPipe's 33-point set) -- the controller's ground-line/lift detection falls
+  back to ankle-only (see `nao_retarget.LowerBodyRetargeter._foot_height`).
 - **`joint_angles_rad`** *(fallback)* — used only when no `keypoints` are present.
 - **`gait`** *(optional)* — cadence/phase/stop for the march engine, plus
   `body_yaw_rad` (**an angle**, so the controller can close a heading loop on it)
