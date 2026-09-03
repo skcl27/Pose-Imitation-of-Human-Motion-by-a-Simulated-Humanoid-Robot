@@ -611,9 +611,25 @@ class PoseImitationController:
         if not all(math.isfinite(v) for v in (raw_roll, raw_pitch)):
             return
         if fsr:
-            total = float(fsr.get("L", 0.0)) + float(fsr.get("R", 0.0))
-            if total < IMU_CALIBRATION_MIN_LOAD_N:
+            left = float(fsr.get("L", 0.0))
+            right = float(fsr.get("R", 0.0))
+            # TOTAL load is not evidence of standing: measured on a fallen robot
+            # after a reset, one foot alone carried 25.85 N against 0.72 N on the
+            # other -- 26.6 N of "standing" that sailed past a 20 N total check
+            # and latched a zero 17.4 deg out, worth ~90 mm of phantom CoM shift.
+            # Both soles must be loaded, which a robot lying on its side is not.
+            if min(left, right) < IMU_CALIBRATION_MIN_SOLE_LOAD_N:
                 return
+            if (left + right) < IMU_CALIBRATION_MIN_LOAD_N:
+                return
+        # Independent of the foot sensors: forward kinematics with the tilt taken
+        # as zero gives the height the head WOULD be at if upright. A standing
+        # robot reads ~0.459 m; every bad calibration in the logs read 0.049 to
+        # 0.205 m, so this separates them with an enormous margin and does not
+        # depend on the very tilt estimate being calibrated.
+        height = self.head_height(0.0, 0.0)
+        if height is not None and height < IMU_CALIBRATION_MIN_HEAD_M:
+            return
         if self._imu_cal_started is None:
             self._imu_cal_started = now
         self._imu_cal.append((raw_roll, raw_pitch))
