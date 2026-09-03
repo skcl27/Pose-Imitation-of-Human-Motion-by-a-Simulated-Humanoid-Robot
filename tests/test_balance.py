@@ -3,9 +3,13 @@ import math
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
 from balance import (  # noqa: E402
+    TILT_PITCH_SIGN,
+    TILT_ROLL_SIGN,
     BalanceController,
     NaoCoMModel,
     fibonacci_spiral,
@@ -56,11 +60,16 @@ def test_balanced_pose_needs_no_correction() -> None:
     assert all(abs(v) < 1e-6 for v in corr.values())
 
 
-# On this NAO the InertialUnit reports a FORWARD tilt as a negative pitch --
-# measured from a session where the robot fell forward while imu_pitch went to
-# -0.52. Naming it here keeps the raw sign out of every individual test.
-FORWARD = -1.0
-BACKWARD = +1.0
+# On this NAO a FORWARD tilt reads as a POSITIVE pitch: Nao.proto mounts the
+# InertialUnit rolled +90 deg, Webots decomposes its attitude as
+# Z(yaw) Y(pitch) X(roll), so the reported pitch is the torso's rotation about its
+# own +y (left) axis -- nose-down positive. Derived in
+# test_pitch_sign_matches_webots_convention_for_the_mounted_sensor below and
+# confirmed by the unrotated Gyro and by 19 of 20 logged pitch-fall onsets (see
+# balance.TILT_PITCH_SIGN). Naming it here keeps the raw sign out of every
+# individual test.
+FORWARD = +1.0
+BACKWARD = -1.0
 
 
 def _com_in_foot(model, angles) -> float:
@@ -385,3 +394,141 @@ def test_the_roll_window_is_shorter_than_the_pitch_window() -> None:
     """The whole point: the two axes fall on different timescales."""
     from balance import BalanceController
     assert BalanceController.DIVERGENCE_S["roll"] < BalanceController.DIVERGENCE_S["pitch"]
+
+
+# ---------------------------------------------------------------------------
+# Sensor conventions, from first principles
+# ---------------------------------------------------------------------------
+def _rot_x(a: float):
+    import numpy as np
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=float)
+
+
+def _rot_y(a: float):
+    import numpy as np
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=float)
+
+
+def _quat_xyzw(R):
+    """Rotation matrix -> unit quaternion (x, y, z, w), Webots' component order."""
+    t = R[0, 0] + R[1, 1] + R[2, 2]
+    if t > 0:
+        s = math.sqrt(t + 1.0) * 2.0
+        return ((R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s,
+                (R[1, 0] - R[0, 1]) / s, 0.25 * s)
+    i = max(range(3), key=lambda k: R[k, k])
+    j, k = (i + 1) % 3, (i + 2) % 3
+    s = math.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2.0
+    q = [0.0, 0.0, 0.0, 0.0]
+    q[i] = 0.25 * s
+    q[j] = (R[j, i] + R[i, j]) / s
+    q[k] = (R[k, i] + R[i, k]) / s
+    q[3] = (R[k, j] - R[j, k]) / s
+    return tuple(q)
+
+
+def _webots_enu_rpy(q):
+    """Exactly wb_inertial_unit_get_roll_pitch_yaw for an ENU world
+    (src/controller/c/inertial_unit.c, Webots R2025a): e = Z(yaw) Y(pitch) X(roll)."""
+    roll = math.atan2(2.0 * (q[3] * q[0] + q[1] * q[2]),
+                      1.0 - 2.0 * (q[0] * q[0] + q[1] * q[1]))
+    t2 = max(-1.0, min(1.0, 2.0 * (q[3] * q[1] - q[2] * q[0])))
+    pitch = math.asin(t2)
+    yaw = math.atan2(2.0 * (q[3] * q[2] + q[0] * q[1]),
+                     1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2]))
+    return roll, pitch, yaw
+
+
+def test_pitch_sign_matches_webots_convention_for_the_mounted_sensor() -> None:
+    """Derive the tilt signs from the sensor mounting instead of from a remembered
+    fall. Nao.proto mounts the InertialUnit ``rotation 1 0 0 1.5708`` (rolled +90
+    deg about the torso x axis); Webots' ENU API decomposes the sensor's world
+    attitude as Z(yaw) Y(pitch) X(roll). So tilt a torso and see what the API
+    would report.
+
+    The previous value (-1) was the single most expensive bug on this project: it
+    turned both CoM shifters into positive feedback in pitch, and every pitch fall
+    in the 2026-09-03 logs shows their clamps saturated in the direction of the
+    fall.
+    """
+    mount = _rot_x(math.pi / 2)
+    upright = _webots_enu_rpy(_quat_xyzw(mount))
+    assert upright[0] == pytest.approx(math.pi / 2, abs=1e-9)   # the raw roll the
+    assert upright[1] == pytest.approx(0.0, abs=1e-9)           # controller zeroes
+
+    for b in (0.1, 0.3):
+        # Rotation about the torso's +y axis by +b sends the forward axis x to
+        # (cos b, 0, -sin b): the nose goes DOWN. A forward tilt.
+        nose_down = _rot_y(b) @ mount
+        roll, pitch, _ = _webots_enu_rpy(_quat_xyzw(nose_down))
+        assert pitch == pytest.approx(b, abs=1e-9)              # reads POSITIVE
+        assert roll - math.pi / 2 == pytest.approx(0.0, abs=1e-9)
+        # Rotation about +x by +a sends the up axis z to (0, -sin a, cos a): the top
+        # of the robot moves toward -y, i.e. to the RIGHT.
+        right = _rot_x(b) @ mount
+        roll, pitch, _ = _webots_enu_rpy(_quat_xyzw(right))
+        assert roll - math.pi / 2 == pytest.approx(b, abs=1e-9)  # reads POSITIVE
+        assert pitch == pytest.approx(0.0, abs=1e-9)
+
+    # Hence a positive pitch is a forward tilt, whose gravity projection moves the
+    # CoM FORWARD (+x); a positive roll is a right tilt, whose projection moves it
+    # to the RIGHT (-y). The model must displace the CoM the same way.
+    assert TILT_PITCH_SIGN == +1.0
+    assert TILT_ROLL_SIGN == +1.0
+    m = NaoCoMModel()
+    level = m.tilted_com_xy({}, (0.0, 0.0))
+    forward = m.tilted_com_xy({}, (0.0, +0.1))
+    right = m.tilted_com_xy({}, (+0.1, 0.0))
+    assert forward[0] > level[0] + 0.02                          # ~31 mm forward
+    assert right[1] < level[1] - 0.02                            # ~31 mm to the right
+
+
+def test_the_tilt_lever_arm_follows_the_squat() -> None:
+    """A deep squat lowers the CoM; the tilt term must not charge it the standing
+    lever arm. Standing measures ~0.31 m, the deepest squat ~0.27 m."""
+    m = NaoCoMModel()
+    stand = m.frames({})
+    h_stand = m.com_height(stand, m.com({}, stand))
+    u = 0.70
+    deep = {"LHipPitch": -u, "RHipPitch": -u, "LKneePitch": 2 * u, "RKneePitch": 2 * u,
+            "LAnklePitch": -u, "RAnklePitch": -u}
+    frames = m.frames(deep)
+    h_deep = m.com_height(frames, m.com(deep, frames))
+    assert 0.29 < h_stand < 0.33
+    assert h_deep < h_stand - 0.02
+
+
+def test_the_correction_is_rate_limited() -> None:
+    """The hip motors deliver at most ~1.8 rad/s under the driver's caps; a
+    correction that moves faster than that runs ahead of the joint and then
+    corrects its own tracking lag. One 20 ms call may move at most max_rate*dt."""
+    bc = BalanceController(NaoCoMModel())
+    cap = bc.params.max_rate * 0.02
+    prev = dict(bc._state)
+    for _ in range(40):
+        bc.compute_correction(standing(), (0.0, BACKWARD * 0.35), dt_s=0.02)
+        for k in prev:
+            assert abs(bc._state[k] - prev[k]) <= cap + 1e-9, (k, bc._state, prev)
+        prev = dict(bc._state)
+    assert abs(bc._state["pitch"]) > 0.05          # and it did get somewhere
+
+
+def test_gyro_lead_makes_the_loop_act_early() -> None:
+    """Level right now but tipping backward fast: with the rate term the loop
+    already corrects; without it (lead 0) it would sit still until the tilt
+    itself crosses the margin."""
+    model = NaoCoMModel()
+    with_lead = BalanceController(model)
+    for _ in range(25):
+        with_lead.compute_correction(standing(), (0.0, 0.0),
+                                     tilt_rate=(0.0, BACKWARD * 2.0), dt_s=0.02)
+    assert with_lead._state["pitch"] > 0.02, with_lead._state   # CoM pushed forward
+
+    from balance import BalanceParams
+    no_lead = BalanceController(model, BalanceParams(tilt_lead_s=0.0))
+    for _ in range(25):
+        no_lead.compute_correction(standing(), (0.0, 0.0),
+                                   tilt_rate=(0.0, BACKWARD * 2.0), dt_s=0.02)
+    assert abs(no_lead._state["pitch"]) < 1e-6

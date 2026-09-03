@@ -405,6 +405,7 @@ class NaoPoseDriver:
         self.base_targets: dict[str, float] = {}
         self.stats = DriverStats()
         self._last_command_time: float | None = None
+        self._last_balance_time: float | None = None
 
         # Model-based CoM balance feedback (Option 2: FK + known link masses).
         # Imported lazily and guarded so the driver still runs if numpy/balance
@@ -578,12 +579,45 @@ class NaoPoseDriver:
         self.stats.stale = False
         return applied
 
-    def balance_tick(self, torso_rp: tuple = (0.0, 0.0)) -> int:
+    def _balance_feedback(self, state: dict[str, float], torso_rp: tuple,
+                          tilt_rate: tuple, now_s: float | None,
+                          fsr: dict[str, float] | None = None) -> dict[str, float]:
+        """One BalanceController cycle on the MEASURED posture; {} if off/failed.
+
+        ``tilt_rate`` is the gyro (roll_rate, pitch_rate) the loop uses as lead
+        compensation. The control period is taken from ``now_s`` so the loop's
+        rate limit is honoured whatever the step size.
+        """
+        if self.balance is None:
+            return {}
+        dt = 0.02
+        if now_s is not None:
+            if self._last_balance_time is not None:
+                dt = max(0.0, min(0.1, now_s - self._last_balance_time))
+            self._last_balance_time = now_s
+        try:
+            from balance import contact_from_fsr
+            contact = contact_from_fsr(fsr)
+        except Exception:  # noqa: BLE001
+            contact = None
+        try:
+            return self.balance.compute_correction(
+                state, torso_rp, tilt_rate=tilt_rate, dt_s=dt, contact=contact
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Balance step failed, disabling ({exc})")
+            self.balance = None
+            return {}
+
+    def balance_tick(self, torso_rp: tuple = (0.0, 0.0),
+                     tilt_rate: tuple = (0.0, 0.0),
+                     now_s: float | None = None) -> int:
         """Run one CoM balance cycle: re-command the legs as base + correction.
 
         Called every control step (not just on new pose frames) so balance is
         maintained continuously. ``torso_rp`` is the InertialUnit (roll, pitch)
-        in rad. Returns the number of joints nudged. No-op if balance is off.
+        in rad and ``tilt_rate`` the gyro rates. Returns the number of joints
+        nudged. No-op if balance is off.
         """
         if self.balance is None or self.suspended:
             return 0
@@ -591,11 +625,8 @@ class NaoPoseDriver:
         # last commanded angle.
         state = dict(self.commanded)
         state.update(self.measured)
-        try:
-            corr = self.balance.compute_correction(state, torso_rp)
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"Balance step failed, disabling ({exc})")
-            self.balance = None
+        corr = self._balance_feedback(state, torso_rp, tilt_rate, now_s)
+        if not corr:
             return 0
 
         applied = 0
@@ -615,6 +646,7 @@ class NaoPoseDriver:
         torso_rp: tuple = (0.0, 0.0),
         fsr: dict[str, float] | None = None,
         yaw_bias: float = 0.0,
+        tilt_rate: tuple = (0.0, 0.0),
     ) -> int:
         """Advance the per-leg pose imitation one control step.
 
@@ -635,38 +667,32 @@ class NaoPoseDriver:
             return 0
         state = dict(self.commanded)
         state.update(self.measured)
+
+        # The balance FEEDBACK loop runs whenever a clip is not driving the legs,
+        # in single support too: its objective is "keep the CoM inside whatever
+        # support polygon the current stance actually has" (balance.support_margins
+        # filters by foot contact). It is computed FIRST, from the measured posture,
+        # the IMU tilt and the gyro, and then handed INTO the lower body, which
+        # folds it into the same sole-flat pelvis shift as its own feed-forward
+        # compensation -- summed, clamped and rate-limited in one place.
+        #
+        # It used to be added here, on top of the returned targets. That made two
+        # independent controllers with independent clamps (0.30 + 0.25 rad) answer
+        # the same tilt on the same joints: recorded as HipPitch +0.45 /
+        # AnklePitch -0.65 -- both saturated -- before every pitch fall, and a
+        # 0.4 rad lateral pelvis lurch inside 0.2 s before every lateral one.
+        corr = self._balance_feedback(state, torso_rp, tilt_rate, now_s, fsr)
+        feedback = (float(corr.get("LHipPitch", 0.0)), float(corr.get("LHipRoll", 0.0)))
         try:
             targets, meta = self.lower_body.step(
-                now_s, torso_rp=torso_rp, fsr=fsr, measured=state, yaw_bias=yaw_bias
+                now_s, torso_rp=torso_rp, fsr=fsr, measured=state,
+                yaw_bias=yaw_bias, feedback=feedback,
             )
         except Exception as exc:  # noqa: BLE001
             self.log(f"Lower-body step failed, disabling ({exc})")
             self.lower_body = None
             return 0
         self._lb_meta = meta
-
-        # The balance FEEDBACK loop now runs whenever a clip is not driving the
-        # legs, not only in quiet double support. It used to be gated on
-        # balance_ok because its objective was "centre the CoM between the feet",
-        # which is simply wrong while deliberately leaning onto one foot. The
-        # objective is now "keep the CoM inside whatever support polygon the
-        # current stance actually has" (balance.support_margins, which filters by
-        # foot contact), and that is correct in single support too -- so gating it
-        # was throwing away balance exactly when it was most needed.
-        if self.balance is not None:
-            try:
-                corr = self.balance.compute_correction(state, torso_rp)
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"Balance step failed, disabling ({exc})")
-                self.balance = None
-                corr = {}
-            for name, delta in corr.items():
-                targets[name] = self.limiter.clamp_angle(
-                    name, targets.get(name, 0.0) + delta
-                )
-            # The balance loop's roll terms are not sole-tilt-neutral, so the
-            # lower body's tilt guarantee has to be re-applied once they are in.
-            self.lower_body.apply_sole_tilt_limit(targets)
 
         applied = 0
         for name, value in targets.items():
@@ -806,7 +832,8 @@ class NaoPoseDriver:
         return ceiling * self.velocity_scale * self.gait_leg_velocity_factor
 
     def gait_tick(self, now_s: float, torso_rp: tuple = (0.0, 0.0),
-                  fsr: dict[str, float] | None = None) -> int:
+                  fsr: dict[str, float] | None = None,
+                  tilt_rate: tuple = (0.0, 0.0)) -> int:
         """Advance the walk engine one step and command the legs.
 
         When walking is enabled this REPLACES ``balance_tick`` for the lower
@@ -833,12 +860,7 @@ class NaoPoseDriver:
         self._gait_meta = meta
 
         if self.balance is not None and not meta.get("single_support", False):
-            try:
-                corr = self.balance.compute_correction(state, torso_rp)
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"Balance step failed, disabling ({exc})")
-                self.balance = None
-                corr = {}
+            corr = self._balance_feedback(state, torso_rp, tilt_rate, now_s, fsr)
             for name, delta in corr.items():
                 targets[name] = self.limiter.clamp_angle(
                     name, targets.get(name, 0.0) + delta

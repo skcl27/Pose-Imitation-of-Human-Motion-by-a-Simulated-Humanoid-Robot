@@ -95,17 +95,43 @@ FOOT_CONTACT_TOL = 0.002   # m; within a grounded foot, which corners touch
 # COM_HEIGHT_M is the lever arm -- a CoM at height h tilted by theta moves its
 # ground projection by h*sin(theta). NAO's CoM stands about 0.30 m above the soles.
 #
-# TILT_PITCH_SIGN = -1 is MEASURED, not chosen: in a session where the robot fell
-# forward, imu_pitch went monotonically to -0.52 rad while the soles stayed loaded,
-# so on this model a forward tilt reads NEGATIVE while the real CoM moves FORWARD
-# (+x, the direction the sole is long). With the sign the other way the balance
-# loop drove the CoM further forward at its clamp for 70 seconds -- it was not
-# failing to correct, it was pushing the robot over.
+# The two signs are DERIVED from how the sensor is mounted and then checked
+# against the logs -- they are not tuning knobs.
 #
-# TILT_ROLL_SIGN is NOT yet confirmed against a lateral fall; the divergence
-# detector in BalanceController is what will catch it if it is wrong.
+#   * Nao.proto (Webots R2025a) mounts the InertialUnit with
+#     ``rotation 1 0 0 1.5708``: rolled +90 deg about the torso's x axis. That is
+#     why its raw roll reads +pi/2 on an upright robot (the value the controller
+#     measures and zeroes at startup).
+#   * Webots' ENU API decomposes the sensor's world attitude as
+#     Z(yaw) Y(pitch) X(roll)  (src/controller/c/inertial_unit.c), so
+#         R_world_sensor = R_world_torso * Rx(pi/2) = Rz(yaw) Ry(pitch) Rx(roll+pi/2)
+#     and the reported PITCH is the torso's own rotation about its +y (left) axis.
+#     By the right-hand rule a positive rotation about +y tips the nose DOWN: a
+#     FORWARD tilt reads POSITIVE. The zeroed ROLL is the torso's rotation about
+#     +x (forward): positive tips the top of the robot toward -y, to the RIGHT.
+#   * The Gyro node is mounted UNROTATED (torso frame), so it is an independent
+#     witness: over the 2026-09-03 sessions d(imu_pitch)/dt agrees in sign with
+#     gyro_y in 81% of 13,759 samples (r = +0.57) and d(imu_roll)/dt with gyro_x
+#     in 85% of 9,527 (r = +0.39).
+#   * The falls agree too: at 19 of 20 pitch-fall onsets the model's own FK centre
+#     of mass sat at the TOE edge of the sole while imu_pitch grew POSITIVE.
+#
+# A forward tilt moves the real CoM forward (+x), so the model displaces it by
+# +sin(pitch); a right tilt moves it to -y, so by -sin(roll).
+#
+# History: TILT_PITCH_SIGN used to be -1, inferred from one session whose fall
+# direction was assumed rather than measured. Inverted, the term put the modelled
+# CoM BEHIND the feet whenever the robot tilted forward, so both CoM shifters
+# pushed the pelvis further FORWARD -- positive feedback. Every pitch fall in the
+# 2026-09-03 logs carries its signature: HipPitch commanded to +0.45 and
+# AnklePitch to -0.65 (both shifters at their clamps, CoM as far forward as they
+# can put it) while the pitch grows from +0.2 to +0.6 rad.
+#
+# tests/test_balance.py::test_pitch_sign_matches_webots_convention_for_the_mounted_sensor
+# re-derives both signs from the mounting and the API's formula, so they cannot
+# silently regress.
 COM_HEIGHT_M = 0.30
-TILT_PITCH_SIGN = -1.0
+TILT_PITCH_SIGN = 1.0
 TILT_ROLL_SIGN = 1.0
 
 
@@ -257,7 +283,8 @@ class NaoCoMModel:
 
     def support_margin(self, angles: dict[str, float],
                        frames: dict[str, np.ndarray] | None = None,
-                       com_xy: np.ndarray | None = None) -> float:
+                       com_xy: np.ndarray | None = None,
+                       contact: dict[str, bool] | None = None) -> float:
         """Signed distance (m) of the CoM *inside* the DOUBLE-support region.
 
         Positive means the centre of mass projects inside the area bounded by both
@@ -281,7 +308,7 @@ class NaoCoMModel:
         which is acceptable here because the hip-yaw authority is small and the
         IMU-tilt term below is deliberately pessimistic.
         """
-        return min(self.support_margins(angles, frames, com_xy))
+        return min(self.support_margins(angles, frames, com_xy, contact))
 
     def tilted_com_xy(self, angles: dict[str, float],
                       torso_rp: tuple[float, float],
@@ -299,25 +326,41 @@ class NaoCoMModel:
         frames = frames if frames is not None else self.frames(angles)
         com = self.com(angles, frames)
         roll, pitch = torso_rp
-        k = weight * COM_HEIGHT_M
+        k = weight * self.com_height(frames, com)
         return np.array([
             com[0] + k * TILT_PITCH_SIGN * math.sin(pitch),
             com[1] - k * TILT_ROLL_SIGN * math.sin(roll),
         ])
 
+    def com_height(self, frames: dict[str, np.ndarray], com: np.ndarray) -> float:
+        """Lever arm of the tilt term: height of the CoM above the lowest sole (m).
+
+        Read off the same forward kinematics as everything else rather than fixed
+        at COM_HEIGHT_M, so a deep squat -- which brings the CoM 40 mm closer to
+        the floor -- is not charged the standing lever arm. A 0.1 rad pelvis shift
+        moves the CoM about 16 mm, so overstating this by 40 mm at 0.3 rad of tilt
+        is a 12 mm error the loop would then chase. Falls back to the nominal value
+        if the geometry is degenerate (a fallen robot, no feet under the body).
+        """
+        soles = [float(self.foot_sole_center(side, frames)[2]) for side in ("L", "R")]
+        height = float(com[2]) - min(soles)
+        return height if 0.10 < height < 0.50 else COM_HEIGHT_M
+
     def support_margins_tilted(self, angles: dict[str, float],
                                torso_rp: tuple[float, float],
                                frames: dict[str, np.ndarray] | None = None,
-                               weight: float = 1.0) -> tuple[float, float]:
+                               weight: float = 1.0,
+                               contact: dict[str, bool] | None = None) -> tuple[float, float]:
         """``support_margins`` with the gravity correction applied. One call, so
         the two layers that need it cannot disagree about the signs."""
         frames = frames if frames is not None else self.frames(angles)
         com_xy = self.tilted_com_xy(angles, torso_rp, frames, weight)
-        return self.support_margins(angles, frames, com_xy)
+        return self.support_margins(angles, frames, com_xy, contact)
 
     def support_margins(self, angles: dict[str, float],
                         frames: dict[str, np.ndarray] | None = None,
-                        com_xy: np.ndarray | None = None) -> tuple[float, float]:
+                        com_xy: np.ndarray | None = None,
+                        contact: dict[str, bool] | None = None) -> tuple[float, float]:
         """``(fore_aft, lateral)`` margins inside the double-support region.
 
         Reported per axis rather than only as their minimum, because the two are
@@ -328,6 +371,16 @@ class NaoCoMModel:
         a sideways disturbance at all -- it would keep working on the axis that was
         already the tightest. Each axis is instead defended against its own
         threshold (see BalanceParams.desired_margin_x / _y).
+
+        ``contact`` -- ``{"L": bool, "R": bool}`` from the foot force sensors
+        (see :func:`contact_from_fsr`) -- says which feet actually carry load.
+        The kinematic contact test below can only judge the COMMANDED geometry:
+        a pose whose two soles are both nominally flat is counted as double
+        support however the robot is really standing. An offline replay of a
+        recorded lateral fall found this model reporting 30-110 mm of margin
+        while the sensors read 55 N on one foot and 1 N on the other: the robot
+        was on one sole's edge and the polygon still spanned both feet. A foot
+        the sensors say is unloaded does not bound the support region.
         """
         frames = frames if frames is not None else self.frames(angles)
         if com_xy is None:
@@ -340,7 +393,10 @@ class NaoCoMModel:
         # of height would GROW as the ankles rolled -- rewarding the loop for
         # standing the robot on the edges of its feet, which is the one thing the
         # sole-tilt budget exists to prevent.
-        feet = {side: self.foot_corners(side, frames) for side in ("L", "R")}
+        sides = [s for s in ("L", "R") if contact is None or contact.get(s, True)]
+        if not sides:
+            sides = ["L", "R"]
+        feet = {side: self.foot_corners(side, frames) for side in sides}
         floor = min(float(c[:, 2].min()) for c in feet.values())
         contact = []
         for corners in feet.values():
@@ -402,6 +458,25 @@ def fibonacci_spiral(n: int, scale: float) -> list[tuple[float, float]]:
     return pts
 
 
+# A foot carrying less than this share of the total sole load is not supporting
+# the robot, whatever the commanded geometry says. Below ``min_total`` newtons
+# the sensors are not reading a standing robot at all and the mask is left open.
+CONTACT_SHARE_MIN = 0.08
+
+
+def contact_from_fsr(fsr: dict[str, float] | None, min_share: float = CONTACT_SHARE_MIN,
+                     min_total: float = 10.0) -> dict[str, bool] | None:
+    """``{"L": bool, "R": bool}`` from per-foot vertical loads, or None if unknown."""
+    if not fsr:
+        return None
+    left = float(fsr.get("L", 0.0) or 0.0)
+    right = float(fsr.get("R", 0.0) or 0.0)
+    total = left + right
+    if total < min_total:
+        return None
+    return {"L": left / total >= min_share, "R": right / total >= min_share}
+
+
 @dataclass
 class BalanceParams:
     """Tuning for :class:`BalanceController`."""
@@ -447,6 +522,26 @@ class BalanceParams:
     # divergence detector shouts if it is ever wrong again, so the honest value is
     # used.
     tilt_weight: float = 1.0
+    # Lead compensation on the measured tilt: the model is fed
+    # tilt + tilt_lead_s * gyro_rate instead of the raw tilt. An inverted pendulum
+    # with NAO's CoM height diverges with a time constant of ~0.17 s
+    # (omega = sqrt(g / 0.31 m) = 5.6 rad/s), while the command path -- EMA
+    # smoothing, the motor velocity cap and Webots' position tracking -- adds
+    # 60-100 ms of lag. A purely proportional loop on the tilt therefore acts on
+    # where the robot WAS; the rate term makes it act on where it is going, which
+    # is the damping every ankle-strategy balancer in the literature carries. The
+    # controller's clip-abort logic already trusts the same formula with 0.25 s;
+    # here 0.12 s is enough to lead the actuation lag without amplifying gyro
+    # noise. Zero disables it.
+    tilt_lead_s: float = 0.12
+    # Fastest the correction may move, in rad/s of pelvis shift. The spiral +
+    # slew above could otherwise step 0.045 rad per 20 ms tick (2.25 rad/s), which
+    # the hip motors cannot follow (cap 1.77 rad/s): the command ran ahead of the
+    # joint, the measured posture lagged by up to 0.2 rad, and the loop then
+    # corrected the lag as if it were a new error. 0.8 rad/s is ~130 mm/s of CoM
+    # travel -- faster than the pendulum grows for any recoverable disturbance and
+    # still inside what the motors deliver.
+    max_rate: float = 0.8
 
 
 @dataclass
@@ -501,26 +596,17 @@ class BalanceController:
             out[ar] = angles.get(ar, 0.0) - c["roll"]
         return out
 
-    # InertialUnit sign conventions, i.e. which way the CoM ground projection moves
-    # for a positive reading. These are NOT free parameters -- getting one wrong
-    # turns the loop into positive feedback -- so each is recorded with its
-    # evidence.
-    #
-    # PITCH_SIGN = -1: measured. In a session where the robot fell FORWARD,
-    # imu_pitch went monotonically to -0.52 rad over 70 s while the soles stayed
-    # loaded, so on this model a forward tilt reads NEGATIVE. A forward tilt moves
-    # the real CoM forward (+x, the direction the sole is long), so the model must
-    # displace it by -pitch. With the old +1 the loop drove the CoM further forward
-    # at its clamp (+0.25 rad, saturated) for the whole 70 s -- it was not failing
-    # to correct, it was actively pushing the robot over.
-    PITCH_SIGN = -1.0
-    # ROLL_SIGN = 1.0 is NOT yet confirmed against a lateral fall; the divergence
-    # detector below is what will catch it if it is wrong.
-    ROLL_SIGN = 1.0
-    NOMINAL_COM_HEIGHT = 0.30  # m; lever arm used to convert tilt to a ground shift
+    # InertialUnit sign conventions live at module level (TILT_PITCH_SIGN /
+    # TILT_ROLL_SIGN, derived from the sensor mounting -- see the comment there)
+    # because lower_body's feed-forward shift uses the same model helper. They are
+    # mirrored here only for the divergence message.
+    PITCH_SIGN = TILT_PITCH_SIGN
+    ROLL_SIGN = TILT_ROLL_SIGN
+    NOMINAL_COM_HEIGHT = COM_HEIGHT_M  # m; fallback lever arm (see NaoCoMModel.com_height)
 
     def _imbalance(self, angles: dict[str, float],
-                   torso_rp: tuple[float, float]) -> tuple[float, float]:
+                   torso_rp: tuple[float, float],
+                   contact: dict[str, bool] | None = None) -> tuple[float, float]:
         """Return ``(cost, margin)``. Cost 0 means "inside the support polygon
         with room to spare"; larger cost = closer to tipping.
 
@@ -539,7 +625,7 @@ class BalanceController:
         """
         frames = self.model.frames(angles)
         mx, my = self.model.support_margins_tilted(
-            angles, torso_rp, frames, self.params.tilt_weight
+            angles, torso_rp, frames, self.params.tilt_weight, contact
         )
         # Sum of per-axis deficits, so a disturbance on either axis is answered on
         # that axis. Zero when both are comfortable, which is the state a standing
@@ -548,45 +634,89 @@ class BalanceController:
                 + max(0.0, self.params.desired_margin_y - my))
         return float(cost), float(min(mx, my))
 
+    def _deficits(self, angles: dict[str, float], torso_rp: tuple[float, float],
+                  contact: dict[str, bool] | None = None) -> tuple[float, float]:
+        """How far each axis is short of its desired margin (>= 0 each)."""
+        frames = self.model.frames(angles)
+        mx, my = self.model.support_margins_tilted(
+            angles, torso_rp, frames, self.params.tilt_weight, contact
+        )
+        return (max(0.0, self.params.desired_margin_x - mx),
+                max(0.0, self.params.desired_margin_y - my))
+
     def _score(self, angles: dict[str, float], corr: dict[str, float],
-               torso_rp: tuple[float, float]) -> float:
+               torso_rp: tuple[float, float],
+               contact: dict[str, bool] | None = None) -> float:
         """Search objective: balance deficit plus a penalty on correction size."""
-        cost = self._imbalance(self._apply_corr(angles, corr), torso_rp)[0]
+        dx, dy = self._deficits(self._apply_corr(angles, corr), torso_rp, contact)
         effort = sum(abs(v) for v in corr.values())
-        return cost + self.params.effort_weight * effort
+        return dx + dy + self.params.effort_weight * effort
 
     def compute_correction(self, angles: dict[str, float],
-                           torso_rp: tuple[float, float] = (0.0, 0.0)) -> dict[str, float]:
-        """Joint deltas (rad) keeping the CoM over the feet; {} if already safe."""
-        base_cost, _ = self._imbalance(angles, torso_rp)
+                           torso_rp: tuple[float, float] = (0.0, 0.0), *,
+                           tilt_rate: tuple[float, float] = (0.0, 0.0),
+                           dt_s: float = 0.02,
+                           contact: dict[str, bool] | None = None) -> dict[str, float]:
+        """Joint deltas (rad) keeping the CoM over the feet; all zero if safe.
+
+        ``torso_rp`` is the torso tilt (roll, pitch); ``tilt_rate`` the gyro
+        (roll_rate, pitch_rate) in rad/s, used as lead compensation (see
+        BalanceParams.tilt_lead_s); ``dt_s`` the control period, which bounds how
+        far the correction may move this call (BalanceParams.max_rate);
+        ``contact`` which feet the force sensors say carry load (see
+        :func:`contact_from_fsr`).
+        """
+        p = self.params
+        roll, pitch = torso_rp
+        d_roll, d_pitch = tilt_rate
+        predicted = (roll + p.tilt_lead_s * d_roll, pitch + p.tilt_lead_s * d_pitch)
+        step_cap = p.max_rate * max(0.0, dt_s)
+
+        deficit_x, deficit_y = self._deficits(angles, predicted, contact)
+        base_cost = deficit_x + deficit_y
         if base_cost <= 0.0:
             # Inside the support polygon with room to spare: relax any standing
             # correction back toward zero rather than holding a posture we no
             # longer need. This is the branch a STANDING robot should sit in, and
-            # the reason the loop now does nothing while the robot is upright.
+            # the reason the loop does nothing while the robot is upright.
             for k in self._state:
-                self._state[k] *= (1.0 - self.params.slew)
+                self._state[k] = _toward(self._state[k],
+                                         self._state[k] * (1.0 - p.slew), step_cap)
             return self._expand_state()
 
-        # Search corrections on a Fibonacci spiral around the last one.
+        # Search corrections on a Fibonacci spiral around the last one -- but only
+        # along the axes that are actually short of margin. The spiral perturbs
+        # pitch and roll together, and a replay of the recorded sessions found the
+        # roll correction moving in 84% of its active frames with NO lateral
+        # deficit at all: a candidate whose pitch component bought margin was
+        # accepted with whatever roll component it happened to carry, since the
+        # effort penalty (0.01 per rad) is smaller than the pitch gain. That roll
+        # then stacked on the imitation's lean. An axis with nothing to fix stays
+        # where it is and relaxes, as in the idle branch above.
         c0 = self._state
         best = dict(c0)
-        best_cost = self._score(angles, c0, torso_rp)
-        p = self.params
-        # Spiral in ankle space; hips follow at a fraction (ankle strategy first).
+        best_cost = self._score(angles, c0, predicted, contact)
+        move_pitch, move_roll = deficit_x > 0.0, deficit_y > 0.0
         for dx, dy in fibonacci_spiral(p.search_points, p.search_scale):
             cand = {
-                "pitch": _clamp(c0["pitch"] + dx, -p.max_pitch_corr, p.max_pitch_corr),
-                "roll":  _clamp(c0["roll"] + dy, -p.max_roll_corr, p.max_roll_corr),
+                "pitch": _clamp(c0["pitch"] + (dx if move_pitch else 0.0),
+                                -p.max_pitch_corr, p.max_pitch_corr),
+                "roll":  _clamp(c0["roll"] + (dy if move_roll else 0.0),
+                                -p.max_roll_corr, p.max_roll_corr),
             }
-            cost = self._score(angles, cand, torso_rp)
+            cost = self._score(angles, cand, predicted, contact)
             if cost < best_cost:
                 best_cost, best = cost, cand
+        if not move_pitch:
+            best["pitch"] = c0["pitch"] * (1.0 - p.slew)
+        if not move_roll:
+            best["roll"] = c0["roll"] * (1.0 - p.slew)
 
-        # Slew toward the best candidate so corrections ease in (no jolt).
-        s = self.params.slew
+        # Slew toward the best candidate so corrections ease in, and never faster
+        # than the motors can follow (see max_rate).
         for k in self._state:
-            self._state[k] += s * (best[k] - self._state[k])
+            target = self._state[k] + p.slew * (best[k] - self._state[k])
+            self._state[k] = _toward(self._state[k], target, step_cap)
         return self._expand_state()
 
     # Divergence detector. A balance loop with an inverted sign does not fail
@@ -668,3 +798,8 @@ class BalanceController:
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _toward(current: float, target: float, max_delta: float) -> float:
+    """``current`` moved toward ``target`` by at most ``max_delta`` (>= 0)."""
+    return current + _clamp(target - current, -max_delta, max_delta)

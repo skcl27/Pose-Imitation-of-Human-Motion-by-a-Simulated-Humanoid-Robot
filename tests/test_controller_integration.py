@@ -1309,10 +1309,14 @@ def test_recovery_drops_the_state_that_described_the_fallen_robot(harness) -> No
     harness.spin(120, STANDING, IDLE_GAIT)
     c._turning = True
     c._tilt_risk = 0.3
+    zero = c._imu_zero
     c._reset_for_new_episode()
     assert c._turning is False
     assert c._tilt_risk == 0.0
-    assert c._imu_zero is None          # re-earned against the new pose
+    # The tilt zero is how the sensor is MOUNTED, not a property of the episode:
+    # it survives. Re-learning it after every reset produced 4-6 different zeros
+    # per recorded session, each latched from a robot still settling on its feet.
+    assert c._imu_zero == zero
     assert c.yaw_servo.latched is False
     assert c.driver.lower_body_meta["mode"] == "double" or True
 
@@ -1425,3 +1429,78 @@ def test_the_shipped_default_is_imitation_not_locomotion() -> None:
     else:
         raise AssertionError("LEG_CONTROL not found")
     assert importlib.util.find_spec is not None       # keep the import meaningful
+
+
+# ---------------------------------------------------------------------------
+# Stuck / off-its-feet detection and the shared CoM shift
+# ---------------------------------------------------------------------------
+def test_a_sustained_lean_past_every_gate_is_treated_as_a_fall(harness) -> None:
+    """Recorded: 40 s at 0.37 rad of tilt, both CoM shifters at their clamps, the
+    soles carrying 0.4 and 5 N, the head still 0.35 m up -- above the fall
+    threshold, so nothing recovered it. A tilt no stand-down gate allows, held for
+    seconds, is a robot propped on something, and a reset is the only way up."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c._imu_zero is not None and c.robot.resets == 0
+    tilt = mod_const(harness, "STUCK_TILT_RAD") + 0.05
+    c.imu.rpy = [c._imu_zero[0] + tilt, c._imu_zero[1], 0.0]
+    # The head is still high: the head-height test alone would not fire.
+    height = c.head_height(*c._corrected_tilt(*c._imu_rpy()[:2]))
+    assert height is not None and height > mod_const(harness, "FALL_HEAD_HEIGHT_M")
+    steps = int((mod_const(harness, "STUCK_CONFIRM_S") + 0.5) / 0.02)
+    harness.spin(steps, STANDING, IDLE_GAIT)
+    assert c.robot.resets == 1, "a robot stuck leaning was never recovered"
+
+
+def test_a_brief_wobble_past_the_stuck_limit_is_not_a_fall(harness) -> None:
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    c.imu.rpy = [c._imu_zero[0] + 0.45, c._imu_zero[1], 0.0]
+    harness.spin(40, STANDING, IDLE_GAIT)          # 0.8 s, under STUCK_CONFIRM_S
+    c.imu.rpy = [c._imu_zero[0], c._imu_zero[1], 0.0]
+    harness.spin(40, STANDING, IDLE_GAIT)
+    assert c.robot.resets == 0
+
+
+def test_feet_carrying_nothing_for_seconds_is_treated_as_a_fall(harness, monkeypatch) -> None:
+    """Recorded: head 0.255 m (just above the old 0.25 threshold), soles at 0.04 N
+    for the rest of the episode. Whatever the head height says, a robot whose
+    feet carry nothing is not standing."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c.robot.resets == 0
+    monkeypatch.setattr(FakeFsr, "TOTAL_N", 0.5)     # off its feet
+    steps = int((mod_const(harness, "FALL_UNLOADED_S") + 0.5) / 0.02)
+    harness.spin(steps, STANDING, IDLE_GAIT)
+    assert c.robot.resets == 1
+
+
+def test_the_balance_feedback_is_folded_into_the_lower_body_shift(harness) -> None:
+    """One CoM manager: the balance loop's correction is handed INTO the lower
+    body and reported by it, not added on top afterwards."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    meta = c.driver.lower_body_meta
+    assert "com_fb_pitch" in meta and "com_fb_roll" in meta
+    # Tip the torso back a little: the feedback loop should answer, through the
+    # lower body, and the total shift must respect the lower body's single clamp.
+    c.imu.rpy = [c._imu_zero[0], c._imu_zero[1] - 0.20, 0.0]
+    harness.spin(100, STANDING, IDLE_GAIT)
+    meta = c.driver.lower_body_meta
+    p = c.driver.lower_body.params
+    assert abs(meta["com_fb_pitch"]) > 0.01, meta
+    assert abs(meta["com_shift_pitch"] + meta["com_fb_pitch"]) <= p.com_shift_max_pitch + 1e-6
+    # Sign: a BACKWARD tilt (negative pitch) moves the CoM forward (hip +c).
+    assert meta["com_fb_pitch"] > 0.0
+
+
+def test_the_log_attributes_the_pelvis_shift(harness, tmp_path) -> None:
+    c = harness.ctl
+    cols = set(harness.mod.DIAGNOSTIC_COLUMNS)
+    for name in ("lb_ff_pitch", "lb_ff_roll", "lb_ff_width", "lb_fb_pitch",
+                 "lb_fb_roll", "lb_com_margin", "cop_share_l"):
+        assert name in cols, name
+    harness.spin(60, STANDING, IDLE_GAIT)
+    diag = c._diagnostics(*c._corrected_tilt(*c._imu_rpy()[:2]), 0.0)
+    assert diag["lb_fb_pitch"] is not None
+    assert 0.0 <= diag["cop_share_l"] <= 1.0

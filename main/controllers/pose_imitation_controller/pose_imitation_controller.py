@@ -130,10 +130,25 @@ STALE_AFTER_S = 0.5       # hold pose if no command for this long
 # deepest squat the robot will ever be asked for. Negative values -- feet above
 # head -- are covered by the same test.
 AUTO_RELOAD_ON_FALL = True
-FALL_HEAD_HEIGHT_M = 0.25
+# 0.30, not 0.25: a recorded fall came to rest with the head at 0.255 m (soles
+# carrying 0.04 N, i.e. the robot on its arms) and sat there, unrecovered, for
+# the rest of the episode. The deepest squat is 0.41 m, so 0.30 still clears every
+# legitimate posture by 110 mm.
+FALL_HEAD_HEIGHT_M = 0.30
 FALL_CONFIRM_S = 1.0        # must hold this long: no reloading on a transient
 FALL_RELOAD_COOLDOWN_S = 10.0
 FALL_MAX_RELOADS = 20       # a broken setup must not reload forever
+# Two further ways to be "down" that the head-height test misses, both recorded:
+#   * STUCK: the torso tilted 0.37 rad for 40 s, both CoM shifters at their
+#     clamps, the soles carrying 0.4 and 5 N -- the robot propped on an arm,
+#     head still 0.35 m up. Nothing the balance loop can do from there.
+#   * UNLOADED: soles carrying almost nothing for seconds on end -- the robot is
+#     resting on something other than its feet. A hop or a rocking foot unloads
+#     for a fraction of a second; single support keeps ~50 N on the stance foot.
+STUCK_TILT_RAD = 0.35       # rad; past every stand-down gate, short of a topple
+STUCK_CONFIRM_S = 3.0       # s; the balance loop gets this long to recover
+FALL_UNLOADED_N = 8.0       # N; total sole load below this = not standing on the feet
+FALL_UNLOADED_S = 2.0       # s
 
 # --- IMU tilt zero ---------------------------------------------------------
 # The InertialUnit's roll/pitch are used as "how tipped over is the robot", which
@@ -158,10 +173,20 @@ FALL_MAX_RELOADS = 20       # a broken setup must not reload forever
 IMU_AUTO_ZERO = True
 IMU_CALIBRATION_S = 1.0        # settle window at startup
 IMU_CALIBRATION_MIN_SAMPLES = 20
-# Soles must carry at least this much for a sample to count as "standing". NAO
-# weighs ~5.2 kg, so a loaded pair reads ~50 N; 20 N is comfortably clear of noise
-# while still rejecting a robot lying down.
+# Soles must carry at least this much IN TOTAL for a sample to count as
+# "standing". NAO weighs ~5.2 kg, so a loaded pair reads ~50 N.
 IMU_CALIBRATION_MIN_LOAD_N = 20.0
+# ...and EACH sole must carry at least this much. The total alone is not
+# evidence of standing: a fallen robot resting on one foot logged 25.85 N on the
+# right against 0.72 N on the left and passed the total check, latching a zero
+# 17.4 deg out. A standing robot splits its weight (measured 25.26/25.26 N), so
+# 10 N per foot passes every genuine stance and rejects a one-footed sprawl.
+IMU_CALIBRATION_MIN_SOLE_LOAD_N = 10.0
+# ...and the head must be about where a standing robot's head is, by forward
+# kinematics with tilt taken as zero (so it does not depend on the estimate being
+# calibrated). Standing reads ~0.459 m and the deepest squat 0.41; every bad
+# calibration in the logs read 0.049-0.205 m.
+IMU_CALIBRATION_MIN_HEAD_M = 0.40
 
 # --- Balance ---------------------------------------------------------------
 # Model-based CoM feedback recovers the depth/balance information a 2D camera
@@ -263,6 +288,16 @@ DIAGNOSTIC_COLUMNS = (
     "lb_mode", "lb_shift", "lb_lift", "lb_gate", "lb_stance_margin",
     "lb_lean_scale", "lb_crouch_u", "lb_crouch_cue", "lb_conf",
     "lb_lift_source", "lb_rejected", "lb_why",
+    # Where every radian of pelvis shift came from: the lower body's feed-forward
+    # term (ff), the balance loop's feedback term (fb), and the static margin the
+    # sum achieved. Without these the 2026-09-03 falls could only be attributed by
+    # arithmetic on the joint columns (both shifters at their clamps read as
+    # HipPitch +0.45 / AnklePitch -0.65), which took a day to notice.
+    "lb_ff_pitch", "lb_ff_roll", "lb_ff_width", "lb_fb_pitch", "lb_fb_roll",
+    "lb_com_margin",
+    # Lateral centre of pressure from the foot sensors, as the left foot's share
+    # of the total load: the one direct measurement of where the weight really is.
+    "cop_share_l",
     "support_margin_x", "support_margin_y", "head_height", "reloads",
     "clip_planned", "clip_status", "clips_available", "yaw_stable",
     "yaw_error", "yaw_latched",
@@ -504,6 +539,8 @@ class PoseImitationController:
             self._imu_zero = (0.0, 0.0)
         # Fall detection / recovery state.
         self._fall_since: float | None = None
+        self._stuck_since: float | None = None
+        self._unloaded_since: float | None = None
         self._reloads = 0
         self._last_reload: float | None = None
         self._head_height: float | None = None
@@ -690,35 +727,69 @@ class PoseImitationController:
         except Exception:  # noqa: BLE001 - a diagnostic must never break control
             return None
 
-    def _fallen(self, now: float, roll: float, pitch: float) -> bool:
+    def _fallen(self, now: float, roll: float, pitch: float,
+                fsr: dict[str, float] | None = None) -> bool:
         """Has the robot been down for long enough to be worth recovering?
 
-        Requires the condition to hold for ``FALL_CONFIRM_S`` so a stumble that
-        the balance loop catches is not treated as a fall.
+        Three independent tests, each with its own confirmation time so a stumble
+        the balance loop catches is not treated as a fall:
+
+        * the head is low (a topple; ``FALL_HEAD_HEIGHT_M`` / ``FALL_CONFIRM_S``),
+        * the torso has been tilted past every stand-down gate for seconds
+          (``STUCK_TILT_RAD`` / ``STUCK_CONFIRM_S``): the robot is propped on
+          something, not standing, however high its head still is,
+        * the soles have carried almost nothing for seconds
+          (``FALL_UNLOADED_N`` / ``FALL_UNLOADED_S``).
         """
         if self._imu_zero is None:
             # Tilt is not yet meaningful, so neither is any test built on it.
-            self._fall_since = None
+            self._fall_since = self._stuck_since = self._unloaded_since = None
             return False
         height = self.head_height(roll, pitch)
         self._head_height = height
+        tilt = max(abs(roll), abs(pitch))
         if height is not None:
             down = height < FALL_HEAD_HEIGHT_M
         else:
             # No kinematics available: tilt alone. Well past the abort limit, so it
             # cannot fire on a posture the balance loop might still save.
-            down = max(abs(roll), abs(pitch)) > 1.0
-        if not down:
+            down = tilt > 1.0
+
+        confirmed = False
+        if down:
+            if self._fall_since is None:
+                self._fall_since = now
+                reason = (f"head only {height:.3f} m above the soles"
+                          if height is not None else f"tilt {tilt:.2f} rad")
+                logger.error("FALL DETECTED (%s). Confirming for %.1fs...",
+                             reason, FALL_CONFIRM_S)
+            confirmed |= (now - self._fall_since) >= FALL_CONFIRM_S
+        else:
             self._fall_since = None
-            return False
-        if self._fall_since is None:
-            self._fall_since = now
-            reason = (f"head only {height:.3f} m above the soles"
-                      if height is not None else
-                      f"tilt {max(abs(roll), abs(pitch)):.2f} rad")
-            logger.error("FALL DETECTED (%s). Confirming for %.1fs...",
-                         reason, FALL_CONFIRM_S)
-        return (now - self._fall_since) >= FALL_CONFIRM_S
+
+        if tilt > STUCK_TILT_RAD:
+            if self._stuck_since is None:
+                self._stuck_since = now
+            elif (now - self._stuck_since) >= STUCK_CONFIRM_S:
+                if not confirmed:
+                    logger.error("STUCK: torso tilted %.2f rad for %.1fs; treating "
+                                 "as a fall.", tilt, now - self._stuck_since)
+                confirmed = True
+        else:
+            self._stuck_since = None
+
+        total = None if not fsr else float(fsr.get("L", 0.0)) + float(fsr.get("R", 0.0))
+        if total is not None and total < FALL_UNLOADED_N:
+            if self._unloaded_since is None:
+                self._unloaded_since = now
+            elif (now - self._unloaded_since) >= FALL_UNLOADED_S:
+                if not confirmed:
+                    logger.error("OFF ITS FEET: soles carried %.1f N for %.1fs; "
+                                 "treating as a fall.", total, now - self._unloaded_since)
+                confirmed = True
+        else:
+            self._unloaded_since = None
+        return confirmed
 
     def _recover_from_fall(self, now: float) -> bool:
         """Put the robot back on its feet by resetting the simulation.
@@ -730,8 +801,17 @@ class PoseImitationController:
         """
         if not AUTO_RELOAD_ON_FALL:
             return False
+        # WALL time, not ``now``: ``now`` is robot.getTime(), which simulationReset()
+        # rewinds to zero. Stamping the cooldown with it meant the next recovery had
+        # to wait until the NEW episode's clock passed the OLD episode's reload time,
+        # so the wait grew by 10 s every fall. The logs show it exactly -- resets at
+        # sim 3.32, 16.82, 26.82, 36.82, each one 10 s after the previous stamp --
+        # and a run that first fell at sim 46.60 needed sim > 56.6 to be picked up,
+        # never reached it, and lay on the floor for the rest of the session. A rate
+        # limit on a real-world action belongs on a clock that does not rewind.
+        wall_now = time.time()
         if self._last_reload is not None and \
-                (now - self._last_reload) < FALL_RELOAD_COOLDOWN_S:
+                (wall_now - self._last_reload) < FALL_RELOAD_COOLDOWN_S:
             return False
         if self._reloads >= FALL_MAX_RELOADS:
             if self._reloads == FALL_MAX_RELOADS:
@@ -745,8 +825,8 @@ class PoseImitationController:
             return False
 
         self._reloads += 1
-        self._last_reload = now
-        self._fall_since = None
+        self._last_reload = wall_now
+        self._fall_since = self._stuck_since = self._unloaded_since = None
         logger.error("Reloading the simulation to stand the robot back up "
                      "(recovery %d/%d).", self._reloads, FALL_MAX_RELOADS)
         # Hand every layer back a clean slate first: whether or not Webots
@@ -773,15 +853,26 @@ class PoseImitationController:
         """Drop all state that describes the old, fallen robot."""
         self.motion.abort()
         self.driver.reclaim_from_motion()
+        # Return the COMMANDED pose to neutral. The reset puts the robot back
+        # upright, but the driver's base_targets still held the collapsed pose it
+        # fell in, so the first step of the new episode drove it straight back
+        # into that shape -- which is what put the topple inside the IMU
+        # calibration window and taught the balance loop a fallen "upright".
+        self.driver.upper_body_stand_down()
+        self.driver.lower_body_stand_down()
         if self.driver.lower_body is not None:
             self.driver.lower_body.reset()
         self.yaw_servo.reset()
         self._turning = False
         self._tilt_risk = 0.0
         self._last_risk_update = None
-        # The robot is about to be somewhere else entirely, so the learned tilt
-        # zero is re-earned rather than carried over.
-        self._imu_zero = None if IMU_AUTO_ZERO else (0.0, 0.0)
+        # The tilt zero is KEPT. It measures how the InertialUnit is mounted on the
+        # torso (Nao.proto: rolled +pi/2 about x), a property of the robot that a
+        # reset cannot change. Re-learning it here is what produced 4-6 different
+        # zeros per session, up to 2.6 deg apart (13 mm of phantom CoM error, with
+        # a 39 mm fore/aft margin), each latched from a robot that had just been
+        # stood back up and was still settling. The first zero of a session, taken
+        # from the world file's clean spawn, is also the cleanest.
         self._imu_cal.clear()
         self._imu_cal_started = None
 
@@ -965,6 +1056,7 @@ class PoseImitationController:
         :meth:`_corrected_tilt`), never the raw InertialUnit reading.
         """
         torso_rp = (roll, pitch)
+        tilt_rate = self._tilt_rate()
         if fsr is None:
             fsr = self._read_fsr()
         falling = self._falling(roll, pitch)
@@ -999,7 +1091,7 @@ class PoseImitationController:
 
         if self.leg_control == "off":
             self.leg_mode = "stand"
-            self.driver.balance_tick(torso_rp)
+            self.driver.balance_tick(torso_rp, tilt_rate=tilt_rate, now_s=now)
             return
 
         # (2) Real locomotion: walk/turn with a pre-balanced clip.
@@ -1075,7 +1167,7 @@ class PoseImitationController:
             and (clip_declined or "forward" not in self.motion.available)
         ):
             self.leg_mode = f"march:{WALK_TIER}"
-            self.driver.gait_tick(now, torso_rp, fsr=fsr)
+            self.driver.gait_tick(now, torso_rp, fsr=fsr, tilt_rate=tilt_rate)
             return
 
         # (4) Default: per-leg pose imitation (squat, single-leg lift).
@@ -1084,12 +1176,13 @@ class PoseImitationController:
             # hip yaw while the (coarse) stepping turn has not fired yet.
             self.leg_mode = "pose"
             self.driver.lower_body_tick(
-                now, torso_rp, fsr=fsr, yaw_bias=self.yaw_servo.error(yaw)
+                now, torso_rp, fsr=fsr, yaw_bias=self.yaw_servo.error(yaw),
+                tilt_rate=tilt_rate,
             )
             return
 
         self.leg_mode = "stand"
-        self.driver.balance_tick(torso_rp)
+        self.driver.balance_tick(torso_rp, tilt_rate=tilt_rate, now_s=now)
 
     def _settled(self, roll: float, pitch: float) -> bool:
         """Is the robot upright and calm enough to hand over to a clip?
@@ -1189,6 +1282,17 @@ class PoseImitationController:
             # Quoted-safe: the CSV writer escapes it, and it is the one field that
             # names the limiting factor in words.
             "lb_why": m.get("why"),
+            "lb_ff_pitch": m.get("com_shift_pitch"),
+            "lb_ff_roll": m.get("com_shift_roll"),
+            "lb_ff_width": m.get("com_shift_width"),
+            "lb_fb_pitch": m.get("com_fb_pitch"),
+            "lb_fb_roll": m.get("com_fb_roll"),
+            "lb_com_margin": m.get("com_margin"),
+            "cop_share_l": (
+                fsr["L"] / (fsr["L"] + fsr["R"])
+                if fsr.get("L") is not None and fsr.get("R") is not None
+                and (fsr["L"] + fsr["R"]) > 1.0 else None
+            ),
             "head_height": self._head_height,
             "reloads": self._reloads,
             "clip_planned": self._clip_planned,
@@ -1332,7 +1436,7 @@ class PoseImitationController:
         fsr = self._read_fsr()
         self._calibrate_imu(now, raw_roll, raw_pitch, fsr)
         roll, pitch = self._corrected_tilt(raw_roll, raw_pitch)
-        if self._fallen(now, roll, pitch) and self._recover_from_fall(now):
+        if self._fallen(now, roll, pitch, fsr) and self._recover_from_fall(now):
             return
         self._update_tilt_risk(now, roll, pitch)
         if self.driver.balance is not None:

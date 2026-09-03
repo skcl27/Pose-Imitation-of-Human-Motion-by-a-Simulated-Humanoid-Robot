@@ -141,8 +141,14 @@ them the same way was wrong:
   all*, and a wider stance makes the support polygon **bigger**. They are safer
   than standing, so they pass at **full authority, 1:1 with you**.
 * **Antisymmetric** — both legs rolled the same way (a lean), or one leg forward
-  and one back. These do move the CoM over the feet, so they stay limited
-  (`asymmetric_gain`).
+  and one back. These do move the CoM over the feet. They are followed 1:1 too,
+  but the robot **shifts its pelvis to make the pose holdable** (§3a) rather than
+  attenuating it, and three guards bound them: the lean is capped at
+  `max_lean_dev` (0.45 rad, ~72 mm of CoM travel), the antisymmetric channels
+  are rate-limited (`asym_rate_limit`, 1.2 rad/s — a marching human's leg swing
+  copied onto two planted feet is otherwise a rocking excitation), and when the
+  pelvis has run out of travel the pose is scaled back as a last resort
+  (`_limit_asymmetry`, slewed so it cannot flap).
 
 While a foot is genuinely off the ground the split is dropped: the swing leg is
 unloaded and free to take your pose at whatever the safety gate allows, and the
@@ -152,8 +158,8 @@ stance leg stays near the balanced crouch because it is carrying the robot.
 |---|---|---|
 | Squat | 1:1 to 40° hip / 80° knee | knee range, not balance — see below |
 | Spread your legs | 1:1 to ~30°, saturating at 31.4° per leg | the **ankle** plus a bounded sole tilt — see below |
-| Lean sideways | ~35% of your lean | moves the CoM; gated on purpose |
-| Split stance (one leg fwd) | ~35% | same |
+| Lean sideways | 1:1 up to 0.45 rad, pelvis shifted to hold it | `max_lean_dev`, then pelvis travel (§3a) |
+| Split stance (one leg fwd) | 1:1, rate-limited to 1.2 rad/s | pelvis travel (§3a) |
 | **Raise one leg** | full lift once the weight has transferred | the CoM model (§3) |
 | Walk / march | walk clips, or the march engine | §4 |
 | **Turn your body** | stepping turn (heading servo) | §5 |
@@ -171,15 +177,18 @@ the sole against the hip's abduction — so past 22.8° the sole cannot be kept 
 Refusing to go further turned out to be too strict. Recorded runs show subjects
 spreading to ~25° routinely and 34° at the extreme, so the robot saturated just
 below the human and it read as *"it spreads, but not as much as me"*. A small
-explicit `sole_tilt_budget` (0.15 rad) is spent instead: the hip may abduct that
-much further than the ankle can level, leaving each sole a few degrees off flat
-and the robot on the inner part of each foot — a good trade for the extra width
-(the outer edge of a 76 mm foot lifts about 11 mm).
+explicit `sole_tilt_budget` (0.05 rad) is spent instead: the hip may abduct that
+much further than the ankle can level, leaving each sole a couple of degrees off
+flat (the outer edge of a 76 mm foot lifts about 4 mm). It used to be 0.15 rad;
+at that angle only the inner corners of each sole touch, the contact-filtered
+support polygon shrinks to the strip between them, and the 2026-09-03 logs show
+the robot standing on its foot edges right before every lateral fall.
 
-The budget is enforced as a **post-condition on the final commanded angles**, not
-just on this layer's output — the CoM balance correction is folded in afterwards
-and its roll terms are not tilt-neutral, so the guarantee is re-applied at the
-point of command. When the budget binds, stance width gives way, never sole
+The budget is enforced as a **post-condition on the final commanded angles**.
+The hip gives way first; whatever the hip's hardware stop will not absorb comes
+off the ankle (`LHipRoll` bottoms out at −21.7° where `RHipRoll` reaches −45.3°,
+and with the hip pinned the old version left the ankle running — recorded as a
+sole 0.18 rad off flat). When the budget binds, stance width gives way, never sole
 contact.
 
 **The squat is one degree of freedom, read off the solve.** Depth is the smallest
@@ -247,6 +256,45 @@ below what you asked for and reads as "the leg only moves a little".
 
 Tuning lives in `LowerBodyParams` in [`lower_body.py`](../../libraries/lower_body.py).
 
+### 3a. One centre-of-mass manager
+
+Two things move the pelvis to keep the CoM over the feet, and they act on the
+**same** degree of freedom (hip +c / ankle −c on both legs, which translates the
+pelvis with the soles kept flat):
+
+| Term | Answers | Computed from | Where |
+|---|---|---|---|
+| feed-forward | *is the COMMANDED pose statically holdable?* | forward kinematics of the commanded targets, **no tilt term** | `lower_body._shift_com` |
+| feedback | *is the robot actually tipping?* | the MEASURED posture, the InertialUnit tilt **plus 0.12 s of gyro lead**, rate-limited to 0.8 rad/s | `balance.BalanceController` |
+
+The driver computes the feedback first and hands it **into**
+`LowerBodyController.step(feedback=...)`, where it is summed with the
+feed-forward term, clamped **once** (`com_shift_max_pitch` 0.30 / `_roll` 0.25
+rad) and rate-limited (`com_shift_max_step`, 1 rad/s). When the budget is short
+the feed-forward term yields and the pose is scaled back; the feedback loop is
+the safety net.
+
+They used to be independent: this layer evaluated the IMU tilt too, and the
+driver added the feedback on top afterwards with its own clamp. Two controllers
+answered every tilt in full, their clamps summed to 0.55 rad (~85 mm of CoM
+travel at 16 mm per 0.1 rad, against a 40–60 mm margin), and every fall in the
+2026-09-03 logs shows both at their clamps: `HipPitch` +0.45 / `AnklePitch`
+−0.65. `scripts/analyze_run.py` now flags that pattern ("the pelvis shift
+exceeds what ONE clamp allows").
+
+**Which way is up.** The tilt term's signs are *derived*, not tuned:
+`Nao.proto` mounts the InertialUnit rolled +90° about the torso's x axis (raw
+roll reads +π/2 upright), and Webots' ENU API decomposes attitude as
+Z(yaw)·Y(pitch)·X(roll), so the reported pitch is the torso's rotation about its
+own left axis — **a forward tilt reads positive**, and a right tilt reads as
+positive roll. The Gyro node is mounted unrotated and agrees (sign agreement 81%
+/ 85% on recorded data). `balance.TILT_PITCH_SIGN` shipped as −1 for a while,
+inferred from one session whose fall direction was assumed; inverted, it turned
+both shifters into positive feedback in pitch.
+`tests/test_balance.py::test_pitch_sign_matches_webots_convention_for_the_mounted_sensor`
+re-derives the signs from the mounting so they cannot regress, and
+`analyze_run.py` cross-checks every log's IMU against its gyro.
+
 ### Tuning for more pose fidelity
 
 If you want the robot to follow you harder, these are the knobs, most useful
@@ -254,9 +302,10 @@ first — each trades stability margin for faithfulness:
 
 | Knob | Raise it to… | Cost |
 |---|---|---|
-| `asymmetric_gain` (0.35) | follow leans and split stances more closely | moves the CoM with no single-foot polygon to verify it against |
+| `max_lean_dev` (0.45) | lean further | more CoM travel for the pelvis shift to pay back; past ~0.55 the robot would have to step |
+| `asym_rate_limit` (1.2 rad/s) | follow fast leg swings | rocking: both feet are planted, so a fast split stance shakes the robot |
 | `max_crouch_u` (0.70) | squat deeper | approaches the knee's 121° limit |
-| `sole_tilt_budget` (0.15) | spread wider still | the soles sit further off flat, onto their inner edges |
+| `sole_tilt_budget` (0.05) | spread wider still | the soles sit off flat, onto their inner edges; at 0.15 the robot stood on its foot edges before every lateral fall |
 | `fsr_min_gain` (0.40) | trust the CoM model over the foot sensors | loses the load-transfer cross-check |
 | `margin_min` (0.002) | start lifting sooner | starts unloading a foot with less margin |
 

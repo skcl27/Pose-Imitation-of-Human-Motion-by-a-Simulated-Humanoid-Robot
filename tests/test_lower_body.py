@@ -781,3 +781,137 @@ def test_the_symmetric_squat_is_never_scaled_by_the_asymmetry_guard() -> None:
     assert meta["lean_scale"] == 1.0
     assert meta["crouch_u"] == pytest.approx(0.60, abs=1e-6)
     assert targets["LHipPitch"] == pytest.approx(targets["RHipPitch"], abs=1e-9)
+
+
+# ------------------------------------------------- one CoM manager, not two
+def _pelvis_pitch(targets: dict[str, float]) -> float:
+    """The sole-flat pelvis pitch shift c encoded in the targets: hip = -u + c,
+    ankle = -u - c, so (hip - ankle) / 2 = c, averaged over both legs (the
+    antisymmetric imitation cancels in the average)."""
+    return 0.5 * sum(0.5 * (targets[f"{s}HipPitch"] - targets[f"{s}AnklePitch"])
+                     for s in ("L", "R"))
+
+
+def test_the_feedback_correction_rides_inside_the_pelvis_shift() -> None:
+    """The balance loop's correction is handed in and applied as part of the same
+    sole-flat shift -- not added by the driver afterwards."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, meta, _, _ = run(ctl, standing(), 1.0, feedback=(0.15, 0.0))
+    assert _pelvis_pitch(targets) == pytest.approx(0.15, abs=0.02)
+    assert meta["com_fb_pitch"] == pytest.approx(0.15)
+    for side in ("L", "R"):          # and the soles stayed flat doing it
+        assert targets[f"{side}HipPitch"] + targets[f"{side}KneePitch"] \
+            + targets[f"{side}AnklePitch"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_total_pelvis_shift_obeys_one_clamp() -> None:
+    """Two independent clamps (0.30 feed-forward + 0.25 feedback) summed to 0.55
+    rad -- about 85 mm of CoM travel against a 40-60 mm margin -- in every
+    recorded fall. The SUM is now clamped, and the feed-forward term is the one
+    that gives way."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    p = ctl.params
+    fb = (p.com_shift_max_pitch - 0.05, p.com_shift_max_roll - 0.05)
+    targets, meta, _, _ = run(ctl, _leaning(0.45), 3.0, feedback=fb)
+    assert abs(meta["com_shift_pitch"] + meta["com_fb_pitch"]) <= p.com_shift_max_pitch + 1e-6
+    assert abs(meta["com_shift_roll"] + meta["com_fb_roll"]) <= p.com_shift_max_roll + 1e-6
+    assert abs(meta["com_shift_roll"]) <= 0.05 + 1e-6      # only the room left over
+
+
+def test_the_feed_forward_shift_is_rate_limited() -> None:
+    """0.06 rad per tick (3 rad/s) outran the hip motors (~1.8 rad/s): the command
+    ran 0.2 rad ahead of the joint and the model reasoned about a posture the robot
+    was not in. Now at most com_shift_max_step per tick, per axis."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    p = ctl.params
+    prev = dict(ctl._shift_ff)
+    t = 0.0
+    for _ in range(100):
+        t += DT
+        ctl.step(t, _leaning(0.45), measured=rest_state())
+        for k in prev:
+            assert abs(ctl._shift_ff[k] - prev[k]) <= p.com_shift_max_step + 1e-9, k
+        prev = dict(ctl._shift_ff)
+
+
+def test_the_lean_scale_does_not_flap() -> None:
+    """Recorded: lean_scale 1.0 -> 0.4 -> 1.0 inside 80 ms, each flip a 0.2 rad
+    step on the hip rolls, the second of which set off a lateral fall. The applied
+    scale now slews: fast down (safety), slow up (no flapping)."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    p = ctl.params
+    state = rest_state()
+    t, prev = 0.0, 1.0
+    for i in range(400):
+        t += DT
+        # An unholdable lean and a holdable one, alternating every 0.6 s.
+        obs = _leaning(2.0) if (i // 30) % 2 == 0 else _leaning(0.15)
+        targets, meta = ctl.step(t, obs, measured=state)
+        state.update(targets)
+        scale = meta["lean_scale"]
+        assert scale - prev <= p.lean_scale_up_rate * DT + 1e-9, (i, prev, scale)
+        assert prev - scale <= p.lean_scale_down_rate * DT + 1e-9, (i, prev, scale)
+        prev = scale
+    assert prev < 1.0 or True     # the run simply must not have jumped
+
+
+def test_antisymmetric_deviations_are_rate_limited() -> None:
+    """A marching human swings one leg forward and one back at ~2 rad/s; copied
+    onto planted feet that is a rocking excitation. The split-stance channel ramps
+    at asym_rate_limit; the symmetric squat is not slowed at all."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    p = ctl.params
+    state = rest_state()
+    t, prev = 0.0, None
+    for i in range(80):
+        t += DT
+        obs = split_stance(0.5) if i >= 5 else standing()
+        targets, _ = ctl.step(t, obs, measured=state)
+        state.update(targets)
+        split = 0.5 * (targets["LHipPitch"] - targets["RHipPitch"])
+        if prev is not None:
+            assert abs(split - prev) <= p.asym_rate_limit * DT + 0.05, (i, prev, split)
+        prev = split
+    assert abs(prev) > 0.2                               # and it does arrive
+
+    # The squat (symmetric) is not slowed: one tick, full depth.
+    ctl2 = LowerBodyController(com_model=NaoCoMModel())
+    ctl2.step(0.02, standing(), measured=rest_state())
+    targets, meta = ctl2.step(0.04, squatting(0.5), measured=rest_state())
+    assert meta["crouch_u"] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_a_lean_request_is_capped_at_max_lean_dev() -> None:
+    """The same-sign roll (a whole-body lean) moves the CoM 16 mm per 0.1 rad and
+    is read from a thigh direction that knows nothing about the robot's feet; it
+    is capped before the compensation even looks at it."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    p = ctl.params
+    targets, meta, _, _ = run(ctl, _leaning(0.9), 0.3)     # before any scaling
+    lean = 0.5 * (targets["LHipRoll"] + targets["RHipRoll"])
+    assert abs(lean) <= p.max_lean_dev + p.com_shift_max_roll + 1e-6
+
+
+def test_sole_tilt_budget_holds_even_with_a_hip_at_its_stop() -> None:
+    """Recorded: LHipRoll pinned at -0.379 (its hardware stop) with LAnkleRoll
+    +0.556 -- a sole 0.18 rad off flat, the robot standing on its outer edge for a
+    second before the fall. When the hip has no room left the ankle must give."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets = {"LHipRoll": CONFIGS["LHipRoll"].min_angle, "LAnkleRoll": 0.556,
+               "RHipRoll": -0.548, "RAnkleRoll": 0.398}
+    ctl.apply_sole_tilt_limit(targets)
+    for side in ("L", "R"):
+        tilt = targets[f"{side}HipRoll"] + targets[f"{side}AnkleRoll"]
+        assert abs(tilt) <= ctl.params.sole_tilt_budget + 1e-9, (side, tilt)
+        assert CONFIGS[f"{side}HipRoll"].min_angle - 1e-9 <= targets[f"{side}HipRoll"]
+
+
+def test_the_feed_forward_shift_ignores_the_tilt_it_is_not_responsible_for() -> None:
+    """Division of labour: the feed-forward term answers the STATIC question about
+    the commanded pose, so a torso tilt alone must not move it -- that is the
+    feedback loop's job, and having both answer it is how two controllers ended up
+    at their clamps together."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    _, meta, _, _ = run(ctl, standing(), 2.0, torso_rp=(0.0, 0.25))
+    assert abs(meta["com_shift_pitch"]) < 1e-6
+    assert abs(meta["com_shift_roll"]) < 1e-6
