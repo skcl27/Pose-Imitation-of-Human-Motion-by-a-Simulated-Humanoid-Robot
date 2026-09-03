@@ -50,13 +50,20 @@ import os
 import socket
 import sys
 import time
-from typing import Dict, List, Optional
 
 try:
     from controller import Motion, Robot  # type: ignore
 except ImportError:
     print("Error: Webots controller module not found. Run this only in Webots.")
     sys.exit(1)
+
+try:
+    # Supervisor is a Robot subclass, so everything else in this file is
+    # unaffected. It is needed only to RELOAD the world after a fall; detection
+    # needs no special privileges. Absent on older builds, hence the guard.
+    from controller import Supervisor  # type: ignore
+except ImportError:  # pragma: no cover - depends on the Webots build
+    Supervisor = None  # type: ignore
 
 # Make the shared library importable regardless of Webots' working directory.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "libraries"))
@@ -66,6 +73,7 @@ from walk_motion import (  # noqa: E402
     YawServo,
     default_motion_search_dirs,
     find_motion_files,
+    motion_joints,
     plan_action,
 )
 
@@ -85,7 +93,13 @@ SOCKET_RCVBUF = 1 << 16
 # "engine" march engine + pose imitation, never the motion clips (use this to
 #          keep the robot on the spot).
 # "off"    legs held in the standing posture; upper body only.
-LEG_CONTROL = "auto"
+# Default is "pose": the legs IMITATE, continuously and in real time, and balance
+# is handled by shifting the centre of mass to make the imitated pose holdable
+# rather than by attenuating it (see lower_body._shift_com). Locomotion clips are
+# a 2-3 second commitment during which the camera is ignored for the leg joints,
+# which is the opposite of real-time imitation -- set "auto" to re-enable them when
+# covering ground matters more than following the legs.
+LEG_CONTROL = "pose"
 
 DRIVE_HEAD = True         # head yaw/pitch follow the human head
 SWAP_SIDES = False        # True = mirror-image mapping (robot's left <-> your right)
@@ -93,6 +107,61 @@ SMOOTHING_ALPHA = 0.4     # EMA factor for arm/head targets (0..1, higher = snap
 VELOCITY_SCALE = 0.5      # fraction of each joint's hardware max velocity
 LEG_VELOCITY_FACTOR = 0.5 # extra slow-down on leg joints when merely posturing
 STALE_AFTER_S = 0.5       # hold pose if no command for this long
+
+# --- Fall recovery ---------------------------------------------------------
+# When the robot goes down it stays down: every layer correctly stands itself
+# down, and the rest of a test session is then spent driving a robot lying on the
+# floor. A recorded session lost 170 of its 178 seconds that way.
+#
+# The test is the one that needs no conventions: how far the head sits above the
+# soles, measured along the world vertical. Forward kinematics gives both in the
+# torso frame and the (calibrated) InertialUnit gives the vertical, so no
+# Supervisor is needed to DETECT a fall -- only to recover from one.
+#
+# The threshold separates cleanly from every legitimate posture, because NAO's
+# crouch keeps the torso vertical and so barely lowers the head:
+#
+#     standing                0.460 m       tipped 30 deg      0.398 m
+#     base crouch  u=0.10     0.459 m       tipped 60 deg      0.228 m
+#     DEEPEST squat u=0.70    0.412 m       on its side       -0.000 m
+#                                           face down          0.035 m
+#
+# 0.25 m is ~57 deg of tilt: far past any recoverable posture, and 40% below the
+# deepest squat the robot will ever be asked for. Negative values -- feet above
+# head -- are covered by the same test.
+AUTO_RELOAD_ON_FALL = True
+FALL_HEAD_HEIGHT_M = 0.25
+FALL_CONFIRM_S = 1.0        # must hold this long: no reloading on a transient
+FALL_RELOAD_COOLDOWN_S = 10.0
+FALL_MAX_RELOADS = 20       # a broken setup must not reload forever
+
+# --- IMU tilt zero ---------------------------------------------------------
+# The InertialUnit's roll/pitch are used as "how tipped over is the robot", which
+# assumes they read zero when it stands upright. On this NAO model they do not:
+# measured on a standing robot at rest, roll reads +1.618 rad (93 deg) while the
+# foot sensors carry its full 50 N of body weight and the gyro sits at
+# 0.007 rad/s. The sensor frame is mounted rotated; the robot is fine.
+#
+# Every lower-body symptom on this project traced back to that one number:
+#   * balance displaces the CoM by tilt_weight * height * roll = 291 mm of
+#     phantom lateral error, against an 88 mm support half-width, so the loop
+#     leans the robot onto one foot permanently (measured 47.6 N vs 2.8 N);
+#   * lower_body's tilt_abort_rad (0.28) can never be satisfied, so leg imitation
+#     stands down every frame and the legs stay bit-identical;
+#   * _falling() is permanently true, so no walk clip or march ever starts.
+#
+# So the zero is LEARNED at startup instead of assumed. The world file always
+# spawns the robot standing, and the foot sensors confirm it independently -- soles
+# carrying roughly body weight mean "standing", whatever the IMU claims. Samples
+# are only accepted while that holds, so a controller restarted on an
+# already-fallen robot will not latch the fall as its new upright.
+IMU_AUTO_ZERO = True
+IMU_CALIBRATION_S = 1.0        # settle window at startup
+IMU_CALIBRATION_MIN_SAMPLES = 20
+# Soles must carry at least this much for a sample to count as "standing". NAO
+# weighs ~5.2 kg, so a loaded pair reads ~50 N; 20 N is comfortably clear of noise
+# while still rejecting a robot lying down.
+IMU_CALIBRATION_MIN_LOAD_N = 20.0
 
 # --- Balance ---------------------------------------------------------------
 # Model-based CoM feedback recovers the depth/balance information a 2D camera
@@ -133,11 +202,12 @@ MOTION_SEARCH_DIRS_EXTRA = [os.path.join(os.path.dirname(__file__), "motions")]
 TILT_ABORT_RAD = 0.40
 TILT_RATE_LEAD_S = 0.25
 
-# HARD WATCHDOG on motion playback. While a clip runs it owns the whole body, so
-# per-joint commanding is suspended -- which means anything that stops the clip
-# from ever reporting "over" freezes the ENTIRE robot, not just the legs. Webots'
-# walk clips are a few seconds long, so any suspension beyond this is a bug, not
-# a long clip: we take the body back and stop trusting clips.
+# HARD WATCHDOG on motion playback. While a clip runs it owns the joints it
+# declares -- for Webots' walk clips, the 12 leg joints -- and per-joint
+# commanding is suspended for those, so anything that stops the clip from ever
+# reporting "over" freezes the legs indefinitely. Webots' walk clips are a few
+# seconds long, so any suspension beyond this is a bug, not a long clip: we take
+# the joints back and stop trusting clips.
 MOTION_WATCHDOG_S = 8.0
 # Consecutive locomotion attempts that end badly (watchdog trip, tilt abort, or
 # the robot still tipped when the clip finishes) before clips are abandoned for
@@ -179,6 +249,27 @@ ENABLE_TRAJECTORY_LOG = True
 LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "logs"))
 STATUS_EVERY = 100  # frames
 
+# Per-step controller state written alongside the joint angles. A log of joint
+# angles alone says what the body did but not what the controller believed, and
+# every diagnosis on this project has needed both halves: the permanent lean was
+# only identifiable because the roll channels could be compared, and its CAUSE
+# needed the support margin, which was not recorded at all.
+DIAGNOSTIC_COLUMNS = (
+    "imu_roll", "imu_pitch", "imu_yaw",
+    "imu_roll_raw", "imu_pitch_raw", "imu_zero_roll", "imu_zero_pitch",
+    "gyro_roll_rate", "gyro_pitch_rate",
+    "tilt_risk", "predicted_tilt",
+    "leg_mode", "stale",
+    "lb_mode", "lb_shift", "lb_lift", "lb_gate", "lb_stance_margin",
+    "lb_lean_scale", "lb_crouch_u", "lb_crouch_cue", "lb_conf",
+    "lb_lift_source", "lb_rejected", "lb_why",
+    "support_margin_x", "support_margin_y", "head_height", "reloads",
+    "clip_planned", "clip_status", "clips_available", "yaw_stable",
+    "yaw_error", "yaw_latched",
+    "fsr_l", "fsr_r",
+    "gait_state", "gait_cadence", "gait_conf", "body_yaw",
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)-7s | %(message)s",
@@ -207,23 +298,24 @@ class MotionPlayer:
     exists for the one case worth breaking that rule: an incipient fall.
     """
 
-    def __init__(self, files: Dict[str, str],
-                 log: Optional[object] = None) -> None:
+    def __init__(self, files: dict[str, str],
+                 log: object | None = None) -> None:
         self._files = dict(files)
-        self._cache: Dict[str, object] = {}
+        self._cache: dict[str, object] = {}
+        self._joints: dict[str, list[str]] = {}
         self._log = log or (lambda *_a, **_k: None)
-        self.action: Optional[str] = None
-        self._motion: Optional[object] = None
+        self.action: str | None = None
+        self._motion: object | None = None
 
     @property
-    def available(self) -> Dict[str, str]:
+    def available(self) -> dict[str, str]:
         return dict(self._files)
 
     @property
     def active(self) -> bool:
         return self._motion is not None
 
-    def _load(self, action: str) -> Optional[object]:
+    def _load(self, action: str) -> object | None:
         if action in self._cache:
             return self._cache[action]
         path = self._files.get(action)
@@ -277,7 +369,7 @@ class MotionPlayer:
             return False
         return True
 
-    def duration_s(self) -> Optional[float]:
+    def duration_s(self) -> float | None:
         """Clip length in seconds, or None if Webots will not tell us."""
         if self._motion is None:
             return None
@@ -287,16 +379,32 @@ class MotionPlayer:
             return None
         return ms / 1000.0 if math.isfinite(ms) and ms > 0.0 else None
 
-    def drop(self, action: Optional[str] = None) -> None:
+    def joints(self, action: str | None = None) -> list[str]:
+        """Joints the clip for ``action`` drives, or [] if that is not knowable.
+
+        Read from the clip's header (see ``walk_motion.motion_joints``) and cached,
+        so the controller can suspend per-joint commanding for exactly those and
+        leave the rest -- the arms and head -- imitating throughout the clip.
+        """
+        target = action or self.action
+        if target is None:
+            return []
+        if target not in self._joints:
+            self._joints[target] = motion_joints(self._files.get(target))
+        return list(self._joints[target])
+
+    def drop(self, action: str | None = None) -> None:
         """Stop using ``action`` (or every clip) for the rest of the session."""
         target = action or self.action
         self.abort()
         if target is None:
             self._files.clear()
             self._cache.clear()
+            self._joints.clear()
         else:
             self._files.pop(target, None)
             self._cache.pop(target, None)
+            self._joints.pop(target, None)
 
     def abort(self) -> None:
         """Stop mid-clip. Only for a safety abort -- see the class docstring."""
@@ -320,7 +428,12 @@ class PoseImitationController:
     """Webots glue and lower-body arbiter around :class:`NaoPoseDriver`."""
 
     def __init__(self) -> None:
-        self.robot = Robot()
+        # A Supervisor when the world allows it (the Nao node needs
+        # `supervisor TRUE`), so a fall can be recovered from automatically. It
+        # behaves as a plain Robot for everything else, and falls back to one when
+        # the class is unavailable.
+        self.robot = Supervisor() if (AUTO_RELOAD_ON_FALL and Supervisor is not None) \
+            else Robot()
         self.timestep = int(self.robot.getBasicTimeStep())
         logger.info("Initializing NAO pose controller (timestep: %dms)", self.timestep)
         if self.timestep > 24:
@@ -359,10 +472,11 @@ class PoseImitationController:
         self.trajectory_log = None
         if ENABLE_TRAJECTORY_LOG:
             self.trajectory_log = JointTrajectoryLogger(
-                LOG_DIR, self.driver.logged_joints, logger=logger.info
+                LOG_DIR, self.driver.logged_joints,
+                diagnostics=DIAGNOSTIC_COLUMNS, logger=logger.info,
             )
 
-        self.gait_cmd: Optional[Dict] = None
+        self.gait_cmd: dict | None = None
         self.leg_mode = "stand"
         self.frame_count = 0
         self._last_log_time = time.time()
@@ -372,14 +486,34 @@ class PoseImitationController:
         self._turning = False
         # Motion-playback watchdog state. Suspension hands the WHOLE body to a
         # clip, so it must always be bounded in time and in failure count.
-        self._motion_started_at: Optional[float] = None
-        self._motion_deadline: Optional[float] = None
+        self._motion_started_at: float | None = None
+        self._motion_deadline: float | None = None
         self._motion_failures = 0
         self._errors = 0
         # Continuous tilt-risk EMA (see _update_tilt_risk / _settled): runs every
         # tick regardless of which leg-control layer is active.
         self._tilt_risk = 0.0
-        self._last_risk_update: Optional[float] = None
+        self._last_risk_update: float | None = None
+        # Learned IMU tilt zero (see IMU_AUTO_ZERO). None until calibrated; tilt is
+        # reported as level in the meantime so nothing aborts on a reading we do
+        # not yet understand.
+        self._imu_zero: tuple | None = None
+        self._imu_cal: list[tuple] = []
+        self._imu_cal_started: float | None = None
+        if not IMU_AUTO_ZERO:
+            self._imu_zero = (0.0, 0.0)
+        # Fall detection / recovery state.
+        self._fall_since: float | None = None
+        self._reloads = 0
+        self._last_reload: float | None = None
+        self._head_height: float | None = None
+        # What the locomotion layer wanted and what became of it. Recorded because
+        # "the robot never walks" has several indistinguishable causes -- no clips
+        # on disk, a clip Webots refuses to load, the settle gate never opening, or
+        # the turn servo starving forward motion -- and none of them are visible
+        # from the joint angles.
+        self._clip_planned = ""
+        self._clip_status = "idle"
         self._report_startup()
 
     def _report_startup(self) -> None:
@@ -419,11 +553,15 @@ class PoseImitationController:
                     else "OFF  <-- turning disabled")
         logger.info("  foot force sensors: %d",
                     len(self.fsr["L"]) + len(self.fsr["R"]))
-        if d.lower_body is None or d.balance is None:
-            logger.warning(
-                "A layer is OFF above. If that was not intended, check that "
-                "Webots' Python interpreter has NumPy: Tools > Preferences > "
-                "Python command."
+        for reason in d.degraded:
+            logger.error("DEGRADED: %s", reason)
+        if d.degraded:
+            logger.error(
+                "The layer(s) above are NOT running. The usual cause is that "
+                "Webots is launching this controller with an interpreter that "
+                "has no NumPy -- check Tools > Preferences > Python command and "
+                "point it at the project's environment. This message is repeated "
+                "on the status line so it cannot scroll away."
             )
         logger.info("Waiting for pose commands on %s:%d ...", UDP_HOST, UDP_PORT)
         logger.info("=" * 68)
@@ -459,6 +597,184 @@ class PoseImitationController:
             return (0.0, 0.0, 0.0)
         return (roll, pitch, yaw)
 
+    def _calibrate_imu(self, now: float, raw_roll: float, raw_pitch: float,
+                       fsr: dict[str, float] | None) -> None:
+        """Learn what "upright" reads on this robot's InertialUnit.
+
+        Only accepts samples while the foot sensors say the robot is standing, so
+        the zero cannot be latched from a fallen pose. Where no foot sensors
+        resolve it falls back to trusting the world file's spawn -- which does
+        place the robot upright -- and the startup log says which happened.
+        """
+        if self._imu_zero is not None:
+            return
+        if not all(math.isfinite(v) for v in (raw_roll, raw_pitch)):
+            return
+        if fsr:
+            total = float(fsr.get("L", 0.0)) + float(fsr.get("R", 0.0))
+            if total < IMU_CALIBRATION_MIN_LOAD_N:
+                return
+        if self._imu_cal_started is None:
+            self._imu_cal_started = now
+        self._imu_cal.append((raw_roll, raw_pitch))
+        if (now - self._imu_cal_started) < IMU_CALIBRATION_S:
+            return
+        if len(self._imu_cal) < IMU_CALIBRATION_MIN_SAMPLES:
+            return
+        rolls = sorted(v[0] for v in self._imu_cal)
+        pitches = sorted(v[1] for v in self._imu_cal)
+        mid = len(rolls) // 2
+        samples = len(self._imu_cal)
+        self._imu_zero = (rolls[mid], pitches[mid])
+        self._imu_cal.clear()
+        magnitude = max(abs(self._imu_zero[0]), abs(self._imu_zero[1]))
+        emit = logger.warning if magnitude > 0.05 else logger.info
+        emit(
+            "IMU tilt zero learned from %d standing samples: roll %+.3f, pitch "
+            "%+.3f rad. Tilt is measured relative to this from now on.%s",
+            samples, self._imu_zero[0], self._imu_zero[1],
+            "" if magnitude <= 0.05 else
+            f" That is {math.degrees(magnitude):.0f} deg, so this model's "
+            f"InertialUnit is mounted rotated: without the correction every tilt "
+            f"gate and the balance loop read a robot standing still as falling.",
+        )
+
+    # ------------------------------------------------------------ fall recovery
+    def head_height(self, roll: float, pitch: float) -> float | None:
+        """Height of the head above the soles along the WORLD vertical, in metres.
+
+        Forward kinematics places the head and both soles in the torso frame; the
+        calibrated InertialUnit supplies the vertical. Upright that is ~0.46 m and
+        a deep squat only takes it to 0.41 m, because NAO's crouch keeps the torso
+        vertical -- so it is a clean fall test rather than a proxy for one.
+
+        Returns None when there is no CoM model to do the kinematics with (no
+        NumPy in Webots' interpreter), in which case the caller falls back to tilt.
+        """
+        balance = self.driver.balance
+        if balance is None:
+            return None
+        try:
+            import numpy as np
+
+            state = dict(self.driver.commanded)
+            state.update(self.driver.measured)
+            frames = balance.model.frames(state)
+            cr, sr = math.cos(roll), math.sin(roll)
+            cp, sp = math.cos(pitch), math.sin(pitch)
+            # Only the world-z row of the torso->world rotation is needed.
+            rot_z = np.array([-sp * cr, sr, cr * cp])
+            head_z = float(rot_z @ frames["HeadPitch"][:3, 3])
+            soles = []
+            for side in ("L", "R"):
+                T = frames[f"{side}AnkleRoll"]
+                sole = T[:3, :3] @ np.array([0.035, 0.0, -0.04519]) + T[:3, 3]
+                soles.append(float(rot_z @ sole))
+            return head_z - sum(soles) / len(soles)
+        except Exception:  # noqa: BLE001 - a diagnostic must never break control
+            return None
+
+    def _fallen(self, now: float, roll: float, pitch: float) -> bool:
+        """Has the robot been down for long enough to be worth recovering?
+
+        Requires the condition to hold for ``FALL_CONFIRM_S`` so a stumble that
+        the balance loop catches is not treated as a fall.
+        """
+        if self._imu_zero is None:
+            # Tilt is not yet meaningful, so neither is any test built on it.
+            self._fall_since = None
+            return False
+        height = self.head_height(roll, pitch)
+        self._head_height = height
+        if height is not None:
+            down = height < FALL_HEAD_HEIGHT_M
+        else:
+            # No kinematics available: tilt alone. Well past the abort limit, so it
+            # cannot fire on a posture the balance loop might still save.
+            down = max(abs(roll), abs(pitch)) > 1.0
+        if not down:
+            self._fall_since = None
+            return False
+        if self._fall_since is None:
+            self._fall_since = now
+            reason = (f"head only {height:.3f} m above the soles"
+                      if height is not None else
+                      f"tilt {max(abs(roll), abs(pitch)):.2f} rad")
+            logger.error("FALL DETECTED (%s). Confirming for %.1fs...",
+                         reason, FALL_CONFIRM_S)
+        return (now - self._fall_since) >= FALL_CONFIRM_S
+
+    def _recover_from_fall(self, now: float) -> bool:
+        """Put the robot back on its feet by resetting the simulation.
+
+        Returns True if a reset was issued. Rate-limited and capped: a setup that
+        falls immediately every time must not reload in a loop, it must stop and
+        say so, because an endless reload is harder to diagnose than a robot lying
+        still.
+        """
+        if not AUTO_RELOAD_ON_FALL:
+            return False
+        if self._last_reload is not None and \
+                (now - self._last_reload) < FALL_RELOAD_COOLDOWN_S:
+            return False
+        if self._reloads >= FALL_MAX_RELOADS:
+            if self._reloads == FALL_MAX_RELOADS:
+                self._reloads += 1     # log this once, then stay quiet
+                logger.error(
+                    "Robot has fallen %d times; not reloading again. Something is "
+                    "wrong that a reload will not fix -- run "
+                    "scripts/analyze_run.py on this session's log.",
+                    FALL_MAX_RELOADS,
+                )
+            return False
+
+        self._reloads += 1
+        self._last_reload = now
+        self._fall_since = None
+        logger.error("Reloading the simulation to stand the robot back up "
+                     "(recovery %d/%d).", self._reloads, FALL_MAX_RELOADS)
+        # Hand every layer back a clean slate first: whether or not Webots
+        # restarts this controller, the state must not describe the fallen robot.
+        self._reset_for_new_episode()
+        for method in ("simulationReset", "worldReload"):
+            call = getattr(self.robot, method, None)
+            if call is None:
+                continue
+            try:
+                call()
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s() failed (%s); trying the next option.",
+                               method, exc)
+        logger.error(
+            "Cannot reset the simulation: this controller is not a Supervisor. Add "
+            "`supervisor TRUE` to the Nao node in the world file, or press "
+            "Ctrl+Shift+R in Webots to reload by hand."
+        )
+        return False
+
+    def _reset_for_new_episode(self) -> None:
+        """Drop all state that describes the old, fallen robot."""
+        self.motion.abort()
+        self.driver.reclaim_from_motion()
+        if self.driver.lower_body is not None:
+            self.driver.lower_body.reset()
+        self.yaw_servo.reset()
+        self._turning = False
+        self._tilt_risk = 0.0
+        self._last_risk_update = None
+        # The robot is about to be somewhere else entirely, so the learned tilt
+        # zero is re-earned rather than carried over.
+        self._imu_zero = None if IMU_AUTO_ZERO else (0.0, 0.0)
+        self._imu_cal.clear()
+        self._imu_cal_started = None
+
+    def _corrected_tilt(self, raw_roll: float, raw_pitch: float) -> tuple:
+        """(roll, pitch) relative to the learned upright; (0, 0) until calibrated."""
+        if self._imu_zero is None:
+            return (0.0, 0.0)
+        return (raw_roll - self._imu_zero[0], raw_pitch - self._imu_zero[1])
+
     def _init_walk_sensors(self) -> None:
         """Enable the gyro/accelerometer and any foot force sensors.
 
@@ -466,7 +782,7 @@ class PoseImitationController:
         the stepping gate falls back to the CoM model alone when they are absent.
         """
         self.gyro = None
-        self.fsr: Dict[str, List[object]] = {"L": [], "R": []}
+        self.fsr: dict[str, list[object]] = {"L": [], "R": []}
         for name in (GYRO_NAME, ACCELEROMETER_NAME):
             dev = self.robot.getDevice(name)
             if dev is None:
@@ -491,7 +807,7 @@ class PoseImitationController:
         logger.info("Sensors: gyro=%s, foot-force sensors=%d",
                     self.gyro is not None, n_fsr)
 
-    def _read_fsr(self) -> Optional[Dict[str, float]]:
+    def _read_fsr(self) -> dict[str, float] | None:
         """Per-foot load ``{"L": n, "R": n}`` from the FSRs, or None.
 
         NAO's foot sensors are 3-axis ("force-3d") TouchSensors, so the value
@@ -502,7 +818,7 @@ class PoseImitationController:
         """
         if not self.fsr["L"] and not self.fsr["R"]:
             return None
-        out: Dict[str, float] = {}
+        out: dict[str, float] = {}
         for side in ("L", "R"):
             total = 0.0
             for dev in self.fsr[side]:
@@ -552,14 +868,14 @@ class PoseImitationController:
         logger.info("UDP socket ready")
 
     # ------------------------------------------------------------------- comms
-    def _drain_latest_command(self) -> Optional[Dict]:
+    def _drain_latest_command(self) -> dict | None:
         """Return the most recent pose command, discarding any backlog.
 
         UDP can queue several frames between simulation steps. We only care
         about the freshest pose, so we drain the buffer and keep the last one
         (keeps end-to-end latency low -- PRD NFR-1).
         """
-        latest: Optional[Dict] = None
+        latest: dict | None = None
         while True:
             try:
                 data, _ = self.sock.recvfrom(SOCKET_RCVBUF)
@@ -626,10 +942,15 @@ class PoseImitationController:
         )
 
     def _drive_legs(self, now: float, roll: float, pitch: float,
-                    yaw: float) -> None:
-        """Pick and run exactly one leg commander for this simulation step."""
+                    yaw: float, fsr: dict[str, float] | None = None) -> None:
+        """Pick and run exactly one leg commander for this simulation step.
+
+        ``roll``/``pitch`` are relative to the LEARNED upright (see
+        :meth:`_corrected_tilt`), never the raw InertialUnit reading.
+        """
         torso_rp = (roll, pitch)
-        fsr = self._read_fsr()
+        if fsr is None:
+            fsr = self._read_fsr()
         falling = self._falling(roll, pitch)
 
         # (1) A clip is playing: it owns the whole body until it ends, unless the
@@ -666,6 +987,14 @@ class PoseImitationController:
             return
 
         # (2) Real locomotion: walk/turn with a pre-balanced clip.
+        #
+        #     ``clip_declined`` records that this layer WANTED to act and could
+        #     not. Branch 3 keys off it, which is the difference between "the
+        #     robot marches in place while it waits to be steady enough to walk"
+        #     and the old behaviour: it fell through to branch 4, which does
+        #     nothing with the legs, so the robot stood motionless while the human
+        #     marched at it and reported legs=pose with no error anywhere.
+        clip_declined = False
         if self.leg_control == "auto" and not falling:
             plan = plan_action(
                 yaw_error_rad=self.yaw_servo.error(yaw),
@@ -673,35 +1002,61 @@ class PoseImitationController:
                 available=self.motion.available,
                 params=LOCOMOTION,
                 turning=self._turning,
+                yaw_trustworthy=self.yaw_servo.stable(),
             )
+            self._clip_planned = plan.action or ""
             if plan.action is None:
                 # Nothing left to correct: the rotation (if any) has converged.
                 self._turning = False
+                self._clip_status = "nothing planned"
             elif not self._settled(roll, pitch):
-                # Starting a clip mid-wobble is how a walk becomes a fall; wait.
-                self.leg_mode = "pose"
+                # Starting a clip mid-wobble is how a walk becomes a fall; wait,
+                # but let branch 3 keep the legs moving while we wait.
+                clip_declined = True
+                self._clip_status = "declined: not settled"
             elif self.motion.start(plan.action):
                 logger.info("Locomotion: %s (%s)", plan.action, plan.reason)
                 self._turning = plan.is_turn
                 self._begin_motion(now)
-                self.driver.release_to_motion()
+                # Hand the clip only the joints it declares. Webots' walk clips
+                # drive the 12 leg joints and nothing else, so the arms and head
+                # keep following the human right through the step.
+                self.driver.release_to_motion(self.motion.joints(plan.action))
                 self.leg_mode = f"motion:{plan.action}"
+                self._clip_status = "started"
                 return
+            else:
+                # The clip was planned but Webots would not play it. Silence here
+                # made a rejected clip indistinguishable from a clip nobody asked
+                # for, which is a long debugging session for a one-line cause.
+                logger.warning(
+                    "Locomotion clip '%s' was planned (%s) but would not start; "
+                    "falling back to the march engine this step.",
+                    plan.action, plan.reason,
+                )
+                clip_declined = True
+                self._clip_status = "start REFUSED by Webots"
         else:
             self._turning = False
 
-        # (3) No clip available but the human is walking: march in place.
+        # (3) The clip layer is not walking us: march in place instead.
         #     Never while going over -- the pose layer below is the better
         #     recovery, because its tilt gate ramps the asymmetric part of the
         #     posture out and returns the legs to the balanced symmetric crouch,
         #     with the CoM correction folded back in as soon as both feet are
         #     evenly loaded again.
+        #
+        #     The gate is "did the clip layer decline?", NOT "is a forward clip
+        #     absent from disk?". The old disk test meant that installing Webots
+        #     -- which ships Forwards.motion -- permanently disabled the march
+        #     engine, so the fallback existed only on machines that could not run
+        #     the robot in the first place.
         if (
             self.leg_control in ("auto", "engine")
             and not falling
             and self.driver.enable_walk
             and self._marching()
-            and "forward" not in self.motion.available
+            and (clip_declined or "forward" not in self.motion.available)
         ):
             self.leg_mode = f"march:{WALK_TIER}"
             self.driver.gait_tick(now, torso_rp, fsr=fsr)
@@ -751,7 +1106,7 @@ class PoseImitationController:
     def _motion_overran(self, now: float) -> bool:
         return self._motion_deadline is not None and now > self._motion_deadline
 
-    def _end_motion(self, action: Optional[str], *, ok: bool, reason: str) -> None:
+    def _end_motion(self, action: str | None, *, ok: bool, reason: str) -> None:
         """Take the body back from a clip and update the locomotion health count."""
         self.motion.abort()
         self._motion_started_at = None
@@ -780,6 +1135,70 @@ class PoseImitationController:
             self.driver.lower_body.reset()
 
     # ---------------------------------------------------------------- logging
+    def _diagnostics(self, roll: float, pitch: float, yaw: float) -> dict[str, object]:
+        """One row of controller state for the trajectory log.
+
+        Cheap by design -- everything here is already computed for this step,
+        except the support margin, which is one forward-kinematics pass and is the
+        single most useful number for telling "the robot is standing badly" from
+        "the robot is standing fine and the pose is wrong".
+        """
+        d_roll, d_pitch = self._tilt_rate()
+        m = self.driver.lower_body_meta
+        gait = self.gait_cmd or {}
+        fsr = self._read_fsr() or {}
+        raw_roll, raw_pitch, _ = self._imu_rpy()
+        zero = self._imu_zero
+        out: dict[str, object] = {
+            "imu_roll": roll, "imu_pitch": pitch, "imu_yaw": yaw,
+            "imu_roll_raw": raw_roll, "imu_pitch_raw": raw_pitch,
+            "imu_zero_roll": None if zero is None else zero[0],
+            "imu_zero_pitch": None if zero is None else zero[1],
+            "gyro_roll_rate": d_roll, "gyro_pitch_rate": d_pitch,
+            "tilt_risk": self._tilt_risk,
+            "predicted_tilt": self._predicted_tilt_rad(roll, pitch),
+            "leg_mode": self.leg_mode,
+            "stale": int(bool(self.driver.stats.stale)),
+            "lb_mode": m.get("mode"),
+            "lb_shift": m.get("shift"),
+            "lb_lift": m.get("lift"),
+            "lb_gate": m.get("gate"),
+            "lb_stance_margin": m.get("stance_margin"),
+            "lb_lean_scale": m.get("lean_scale"),
+            "lb_crouch_u": m.get("crouch_u"),
+            "lb_crouch_cue": m.get("crouch_cue"),
+            "lb_conf": m.get("confidence"),
+            "lb_lift_source": m.get("lift_source"),
+            "lb_rejected": m.get("rejected"),
+            # Quoted-safe: the CSV writer escapes it, and it is the one field that
+            # names the limiting factor in words.
+            "lb_why": m.get("why"),
+            "head_height": self._head_height,
+            "reloads": self._reloads,
+            "clip_planned": self._clip_planned,
+            "clip_status": ("playing" if self.motion.active else self._clip_status),
+            "clips_available": len(self.motion.available),
+            "yaw_stable": int(bool(self.yaw_servo.stable())),
+            "yaw_error": self.yaw_servo.error(yaw),
+            "yaw_latched": int(bool(self.yaw_servo.latched)),
+            "fsr_l": fsr.get("L"), "fsr_r": fsr.get("R"),
+            "gait_state": gait.get("state"),
+            "gait_cadence": gait.get("cadence_hz"),
+            "gait_conf": gait.get("conf"),
+            "body_yaw": gait.get("body_yaw_rad"),
+        }
+        balance = self.driver.balance
+        if balance is not None:
+            try:
+                state = dict(self.driver.commanded)
+                state.update(self.driver.measured)
+                mx, my = balance.model.support_margins(state)
+                out["support_margin_x"] = mx
+                out["support_margin_y"] = my
+            except Exception:  # noqa: BLE001 - diagnostics must never break control
+                pass
+        return out
+
     def _log_status(self) -> None:
         if self.frame_count % STATUS_EVERY != 0:
             return
@@ -811,12 +1230,47 @@ class PoseImitationController:
                 float(m.get("phase", 0.0)), m.get("single_support", False),
             )
         if self.motion.available:
-            logger.info("  heading error %+.0f deg (servo %s)",
-                        math.degrees(self.yaw_servo.error(self._imu_rpy()[2])),
-                        "latched" if self.yaw_servo.latched else "waiting")
-        for name in self.driver.stuck_motors():
+            logger.info("  locomotion: %d clips | planned=%s | %s | yaw %s",
+                        len(self.motion.available), self._clip_planned or "-",
+                        self._clip_status,
+                        "steady" if self.yaw_servo.stable() else "TOO NOISY to turn on")
+            d = self.yaw_servo.diagnostics(self._imu_rpy()[2])
+            # The reference pair is logged alongside the error on purpose: an
+            # error alone cannot distinguish a loop that is converging from one
+            # stuck at a fixed offset, and a fixed offset is what a recorded
+            # session actually showed.
+            logger.info(
+                "  heading: error %+.0f deg | human %+.0f -> %+.0f | robot %+.0f "
+                "-> %+.0f | servo %s",
+                math.degrees(d["error"]),
+                math.degrees(d["human_ref"]), math.degrees(d["human_now"]),
+                math.degrees(d["robot_ref"]), math.degrees(d["robot_now"]),
+                "latched" if self.yaw_servo.latched else "waiting to latch",
+            )
+        # Repeated, not printed once at startup: a silently absent balance layer
+        # is the single most expensive failure mode this controller has.
+        if self._imu_zero is None:
             logger.warning(
-                "Motor '%s' may be stuck (avg err %.3f rad)",
+                "  IMU tilt zero not yet learned (%d standing samples, need %d): "
+                "tilt is reported as level, so the balance loop and every tilt "
+                "gate are idle. Is the robot standing with its feet loaded?",
+                len(self._imu_cal), IMU_CALIBRATION_MIN_SAMPLES,
+            )
+        if self.driver.balance is not None:
+            warning = self.driver.balance.diverging()
+            if warning:
+                logger.error("  %s", warning)
+        if self._head_height is not None:
+            logger.info("  head %.3f m above the soles (fall below %.2f); "
+                        "recoveries this session: %d",
+                        self._head_height, FALL_HEAD_HEIGHT_M, self._reloads)
+        for reason in self.driver.degraded:
+            logger.error("  DEGRADED: %s", reason)
+        for name in self.driver.stuck_motors():
+            logger.error(
+                "Motor '%s' is not tracking its command (avg err %.3f rad). If "
+                "this persists the joint is mechanically blocked -- most likely "
+                "against the torso or the opposite limb.",
                 name, self.driver.health.average_error(name),
             )
         self._last_log_time = time.time()
@@ -853,16 +1307,27 @@ class PoseImitationController:
             self.gait_cmd = None
             self.driver.set_gait_command(None)
             self.driver.lower_body_stand_down()
+            # The arms and head need telling too, or they hold the departed
+            # human's last pose indefinitely (see upper_body_stand_down).
+            self.driver.upper_body_stand_down()
 
         self.driver.read_feedback()
-        roll, pitch, yaw = self._imu_rpy()
+        raw_roll, raw_pitch, yaw = self._imu_rpy()
+        fsr = self._read_fsr()
+        self._calibrate_imu(now, raw_roll, raw_pitch, fsr)
+        roll, pitch = self._corrected_tilt(raw_roll, raw_pitch)
+        if self._fallen(now, roll, pitch) and self._recover_from_fall(now):
+            return
         self._update_tilt_risk(now, roll, pitch)
+        if self.driver.balance is not None:
+            self.driver.balance.note_tilt(now, roll, pitch)
         self._update_yaw_servo(now, yaw)
-        self._drive_legs(now, roll, pitch, yaw)
+        self._drive_legs(now, roll, pitch, yaw, fsr=fsr)
 
         if self.trajectory_log is not None:
             self.trajectory_log.record(
-                now, self.frame_count, self.driver.commanded, self.driver.measured
+                now, self.frame_count, self.driver.commanded, self.driver.measured,
+                self._diagnostics(roll, pitch, yaw),
             )
         self._log_status()
         self.frame_count += 1

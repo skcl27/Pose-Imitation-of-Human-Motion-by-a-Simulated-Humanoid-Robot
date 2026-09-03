@@ -25,7 +25,6 @@ import os
 import socket
 import sys
 import time
-from typing import Dict, Optional
 
 try:
     from controller import Robot  # type: ignore
@@ -128,8 +127,8 @@ class AdvancedPoseController:
         self.sock.setblocking(False)
         logger.info("UDP socket ready")
 
-    def _drain_latest_command(self) -> Optional[Dict]:
-        latest: Optional[Dict] = None
+    def _drain_latest_command(self) -> dict | None:
+        latest: dict | None = None
         while True:
             try:
                 data, _ = self.sock.recvfrom(SOCKET_RCVBUF)
@@ -169,6 +168,13 @@ class AdvancedPoseController:
         self._last_diag_time = time.time()
 
     def run(self) -> None:
+        for reason in self.driver.degraded:
+            logger.error("DEGRADED: %s", reason)
+        if self.driver.degraded:
+            logger.error(
+                "The layer(s) above are NOT running -- usually Webots' Python "
+                "command pointing at an interpreter without NumPy."
+            )
         logger.info("Starting advanced control loop...")
         try:
             while self.robot.step(self.timestep) != -1:
@@ -182,8 +188,13 @@ class AdvancedPoseController:
                         angles = command.get("joint_angles_rad", {})
                         if angles:
                             self.driver.update(angles, now_s=now)
-                else:
-                    self.driver.check_stale(now)
+                elif self.driver.check_stale(now):
+                    # Tracking lost: stand the whole robot down rather than
+                    # holding the departed human's last pose. The legs ramp to
+                    # the balanced crouch and the arms and head to neutral --
+                    # this controller was missing both.
+                    self.driver.lower_body_stand_down()
+                    self.driver.upper_body_stand_down()
 
                 self.driver.read_feedback()
                 # Continuous lower-body control at simulation rate (not per

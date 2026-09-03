@@ -64,7 +64,14 @@ pip install -r requirements.txt
 
 # 4. Camera-only demo (no Webots required) — shows live skeleton overlay:
 python run.py --no-webots
+
+# ...or the whole thing, Webots included:
+make run
 ```
+
+> **First run downloads the MeTRAbs model** (~320 MB) into `~/.cache/metrabs`
+> (override with `$METRABS_CACHE_DIR`). It is kept there, not in a temp
+> directory, so a reboot does not throw it away.
 
 Press **`q`** or **`ESC`** in the window to quit.
 
@@ -111,17 +118,24 @@ Press **`q`** or **`ESC`** in the window to quit.
 python run.py [--config configs/default.yaml]
               [--source 0|path/to/video.mp4]
               [--no-webots]            # skip UDP send (pure perception demo)
+              [--launch-webots]        # start Webots too (whole demo, one command)
+              [--no-launch-webots]     # never start it; Webots is already open
               [--no-display]           # headless, no OpenCV window
               [--max-frames N]
               [--log-level INFO|DEBUG|WARNING|ERROR]
 ```
+
+`--launch-webots` **attaches to an already-running Webots** rather than opening a
+second instance — two of them would each load the world and then fight over
+UDP 8765.
 
 ## Make Targets
 
 | Target | Description |
 |---|---|
 | `make setup`    | Provision venv + apt deps (Ubuntu). |
-| `make run`      | Full pipeline (camera + Webots bridge + window). |
+| `make run`      | The whole demo: launches Webots **and** the pipeline. |
+| `make pipeline` | Pipeline only, against a Webots you opened yourself. |
 | `make demo`     | Camera + window only (no Webots needed). |
 | `make headless` | 100 frames, no window — CI smoke test. |
 | `make test`     | Run pytest. |
@@ -139,8 +153,13 @@ module, so it is fully unit-tested on a machine without Webots installed.
 
 ## Webots setup in one line
 
-Open `main/worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt`,
-press ▶, then run `python run.py`.
+```bash
+make run          # or: python run.py --launch-webots
+```
+
+That opens `main/worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt`
+and starts the pipeline against it. Press ▶ in Webots if the simulation is
+paused. To drive a Webots you opened yourself, use `make pipeline` instead.
 
 Two world settings are **required**, and both are already in the committed world
 file — if you build your own world, copy them or the legs will not work:

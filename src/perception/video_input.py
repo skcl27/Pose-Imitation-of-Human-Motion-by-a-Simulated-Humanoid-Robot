@@ -8,15 +8,15 @@ from __future__ import annotations
 import logging
 import platform
 import time
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from typing import Generator, Union
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-SourceType = Union[int, str]
+SourceType = int | str
 
 
 @dataclass
@@ -87,8 +87,25 @@ class VideoSource:
     def height(self) -> int:
         return int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    def read_loop(self, target_period_s: float = 0.0) -> Generator[VideoFrame, None, None]:
-        """Yield frames until the source ends or too many failures occur."""
+    def read_loop(
+        self,
+        target_period_s: float | Callable[[], float] = 0.0,
+    ) -> Generator[VideoFrame, None, None]:
+        """Yield frames until the source ends or too many failures occur.
+
+        ``target_period_s`` may be a number or a **callable** returning the
+        current period. The callable form is what makes adaptive frame-rate
+        control work at all: the pipeline used to pass
+        ``fps_controller.target_period_s``, which is a property, so the period was
+        read once when this generator was constructed and never again. The
+        controller went on measuring latency and adjusting its target for the
+        whole run while the loop slept to a constant period -- four config keys
+        (min_fps, max_fps, fps_step, latency_budget_ms) had no effect on anything,
+        and the HUD reported a target FPS that was not being applied.
+        """
+        period_of = (
+            target_period_s if callable(target_period_s) else (lambda: target_period_s)
+        )
         frame_index = 0
         consecutive_failures = 0
         max_failures = 30
@@ -112,9 +129,10 @@ class VideoSource:
             )
             frame_index += 1
 
-            if target_period_s > 0:
+            period = period_of()
+            if period > 0:
                 elapsed = time.perf_counter() - start
-                sleep_s = target_period_s - elapsed
+                sleep_s = period - elapsed
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 

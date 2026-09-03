@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List
 
 from src.perception.landmarks import POSE_LANDMARKS
 from src.type_defs import JointCommand, PoseFrame
@@ -23,7 +23,7 @@ class CsvRunLogger:
     def _open_pose_writer(self) -> None:
         pose_path = self.run_dir / "pose_keypoints.csv"
         self._pose_fp = pose_path.open("w", newline="", encoding="utf-8")
-        fieldnames: List[str] = ["frame_index", "timestamp_s"]
+        fieldnames: list[str] = ["frame_index", "timestamp_s"]
         for name in POSE_LANDMARKS:
             fieldnames.extend([f"{name}_x", f"{name}_y", f"{name}_z", f"{name}_visibility"])
         self._pose_writer = csv.DictWriter(self._pose_fp, fieldnames=fieldnames)
@@ -39,7 +39,7 @@ class CsvRunLogger:
     def log_pose(self, pose: PoseFrame) -> None:
         if self._pose_writer is None:
             self._open_pose_writer()
-        row: Dict[str, float | int] = {
+        row: dict[str, float | int] = {
             "frame_index": pose.frame_index,
             "timestamp_s": pose.timestamp_s,
         }
@@ -61,7 +61,7 @@ class CsvRunLogger:
     def log_joint_command(self, command: JointCommand) -> None:
         if self._joint_writer is None:
             self._open_joint_writer(sorted(command.joint_angles_rad.keys()))
-        row: Dict[str, float | int] = {
+        row: dict[str, float | int] = {
             "frame_index": command.frame_index,
             "timestamp_s": command.timestamp_s,
         }

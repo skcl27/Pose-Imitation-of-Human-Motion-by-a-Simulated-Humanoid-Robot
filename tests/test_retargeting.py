@@ -63,6 +63,11 @@ def test_mapper_uses_depth_not_just_lateral_extent() -> None:
             **base,
             "left_shoulder": Keypoint(-100.0, -600.0, 0.0),
             "left_elbow": Keypoint(-250.0, -500.0, 0.0),   # dx=-150, dy=+100, dz=0
+            # The forearm continues in the same direction. Only the SHOULDER
+            # pitch is under test, but the mapper needs a complete arm (see
+            # RetargetingMapper.REQUIRED) or it returns no joints at all -- which
+            # is what this fixture used to trip on.
+            "left_wrist": Keypoint(-400.0, -400.0, 0.0),
         },
     )
     forward = PoseFrame(
@@ -71,6 +76,7 @@ def test_mapper_uses_depth_not_just_lateral_extent() -> None:
             **base,
             "left_shoulder": Keypoint(-100.0, -600.0, 0.0),
             "left_elbow": Keypoint(-100.0, -500.0, 150.0),  # dx=0, dy=+100, dz=150
+            "left_wrist": Keypoint(-100.0, -400.0, 300.0),
         },
     )
     mapper = RetargetingMapper(default_joint_limits())

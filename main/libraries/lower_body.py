@@ -85,7 +85,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
 
 from nao_retarget import LegTarget, LowerBodyObservation, crouch_posture
 from pose_control_utils import JointLimiter, get_default_motor_configs
@@ -135,6 +134,54 @@ class LowerBodyParams:
     # Mirror-symmetric poses (wider stance, deeper squat) are CoM-neutral and
     # widen the support polygon, so they pass at full authority.
     symmetric_gain: float = 1.0
+
+    # -- CoM compensation (feed-forward) -----------------------------------
+    # Balance is not allowed to gate the imitation. The human's leg pose is
+    # commanded at full authority and the robot then SHIFTS ITS CENTRE OF MASS to
+    # make that pose holdable -- which is what a person does when they lean: they
+    # move their hips, they do not refuse to lean.
+    #
+    # The shift is the sole-flat two-parameter family (hip +c / ankle -c on both
+    # legs, per axis), so it translates the pelvis without tilting either sole and
+    # without touching the joints that carry the imitation. Searched on a spiral
+    # warm-started from the previous solution, so each tick is cheap (8 forward
+    # kinematics passes, ~4.7 ms of a 20 ms step) and the answer converges over a
+    # few ticks at simulation rate.
+    com_shift_max_pitch: float = 0.30   # rad; fore/aft pelvis travel available
+    com_shift_max_roll: float = 0.30    # rad; lateral pelvis travel available
+    # Extra stance width the compensation may add. This is the best tool it has for
+    # a LEAN, and the reason is worth stating: a pelvis shift and a lean are the
+    # same degree of freedom, so shifting the pelvis to hold a lean directly
+    # subtracts from the lean being imitated. Widening the stance instead ENLARGES
+    # the support polygon and is mirror-symmetric, so it costs the imitation
+    # nothing at all. Measured, holding a 0.60 rad lean:
+    #
+    #     nothing              -0.004 m
+    #     pelvis shift -0.20   +0.025 m   but the lean delivered drops by 0.20
+    #     stance width +0.20   +0.031 m   and the lean is untouched
+    #
+    # It is searched rather than computed because past about 0.20 rad it stops
+    # helping: the ankle runs out of range to keep the widening sole flat.
+    com_shift_max_width: float = 0.35   # rad
+    # Step limits per tick, and the probe used to measure the gradient. The search
+    # is a measured-gradient step, not a sampling search: the support margin is a
+    # piecewise-linear function of the pelvis position, so three extra forward
+    # kinematics passes give the exact local sensitivity of the margin to each
+    # parameter, and one Newton-ish step closes most of the deficit.
+    #
+    # A golden-angle spiral was tried first and was the wrong tool: the objective
+    # is non-smooth (the contact filter switches which sole corners count), so a
+    # warm-started sampling search hill-climbed onto the wrong side of a kink and
+    # then drifted, ending with a WORSE margin than it started with.
+    com_shift_probe: float = 0.02       # rad; finite-difference step
+    com_shift_max_step: float = 0.06    # rad; largest change per tick, per axis
+    com_shift_slew: float = 0.5         # blend toward the computed step
+    com_margin_target: float = 0.020    # m
+    # How long the compensation is allowed to keep trying before the pose itself is
+    # scaled back. Without this the fallback fired on the very first tick -- the
+    # compensation needs a few ticks to travel -- so the motion was gated after all,
+    # which is the behaviour this whole design exists to remove.
+    com_grace_s: float = 0.5
     # How far out of flat each sole is allowed to end up. A sole is flat when
     # AnkleRoll == -HipRoll, and the ankle's range is smaller than the hip's, so a
     # wide stance necessarily tilts the soles a little. Spending a small, bounded
@@ -147,10 +194,15 @@ class LowerBodyParams:
     # and 34 deg (peak), so the ankle limit alone (22.8 deg) saturated just below
     # what people actually do -- which read as "it spreads, but not like me".
     max_abduction: float = ANKLE_ROLL_LIMIT + 0.15
-    # Antisymmetric poses (a lean, a split stance) do move the CoM, and in double
-    # support there is no single-foot polygon to verify them against, so they are
-    # deliberately limited.
-    asymmetric_gain: float = 0.35
+    # Antisymmetric poses -- a lean, a split stance -- move the centre of mass, and
+    # they used to be attenuated to 35% for exactly that reason. They are no longer:
+    # the CoM compensation above answers them by moving the pelvis instead, so the
+    # imitation runs at full authority and only gets scaled back as a LAST resort,
+    # when the compensation has run out of travel (_limit_asymmetry). Gating the
+    # motion was the wrong tool -- it made the robot follow a lean at a third of
+    # size while still being just as unbalanced, because a third of a lean still
+    # moves the CoM a third of the way out.
+    asymmetric_gain: float = 1.0
 
     # -- weight transfer ---------------------------------------------------
     shift_rad: float = 0.16         # lean amplitude that loads the stance foot
@@ -161,6 +213,13 @@ class LowerBodyParams:
     lift_stop: float = 0.07         # hysteresis: below this the foot comes down
 
     # -- safety gates ------------------------------------------------------
+    # Double-support margin the commanded LEAN must leave (see _limit_lean). The
+    # antisymmetric deviation was previously gated only by a fixed gain, so the
+    # layer could ask for up to 0.437 rad of lean while the support polygon runs
+    # out at about 0.58 -- a predicted margin of 3 mm, with nothing checking it
+    # against the robot's own model. That is precisely the decision this module's
+    # docstring says belongs here rather than in the retargeter.
+    lean_margin_min: float = 0.020  # m
     margin_min: float = 0.002       # m; stance margin needed to begin lifting
     # Margin at which the full requested lift is allowed. A completed weight
     # transfer yields ~0.015 m, so anything larger silently caps the lift below
@@ -176,7 +235,16 @@ class LowerBodyParams:
     fsr_min_gain: float = 0.40
     fsr_total_min: float = 1.0      # N; below this the FSR reading is ignored
     tilt_abort_rad: float = 0.28    # |IMU roll/pitch| beyond this -> stand down
-    conf_min: float = 0.50          # min lower-body landmark confidence
+    conf_min: float = 0.50          # min lower-body confidence to ENGAGE
+    # ...and the lower bar to STAY engaged. Hysteresis, for the same reason
+    # lift_start/lift_stop have it, and it is not optional here: the retargeter
+    # halves its confidence when only ONE leg is in view (a single-leg read cannot
+    # tell a lift from the other foot leaving the frame), which lands a clear
+    # single-leg detection at almost exactly 0.49 -- just under a 0.50 gate. A
+    # recorded run flapped double -> load -> double -> load -> single, aborting each
+    # weight transfer part-way through, because the gate opened and shut on that
+    # boundary. Starting a transfer needs two legs; finishing one does not.
+    conf_keep: float = 0.40
 
     # -- standing turn -----------------------------------------------------
     # Shared-hip-yaw bias used for immediate visual feedback while a stepping
@@ -200,7 +268,7 @@ class LowerBodyState:
     shift: float = 0.0        # [0, 1] weight-transfer blend
     lift: float = 0.0         # [0, 1] swing-leg authority
     stance: str = ""          # "L" / "R" / "" (double support)
-    last_now: Optional[float] = None
+    last_now: float | None = None
 
 
 class LowerBodyController:
@@ -220,22 +288,31 @@ class LowerBodyController:
 
     def __init__(
         self,
-        params: Optional[LowerBodyParams] = None,
+        params: LowerBodyParams | None = None,
         *,
-        com_model: Optional[object] = None,
-        limiter: Optional[JointLimiter] = None,
+        com_model: object | None = None,
+        limiter: JointLimiter | None = None,
     ) -> None:
         self.params = params or LowerBodyParams()
         self.limiter = limiter or JointLimiter(get_default_motor_configs())
         self.com_model = com_model
         self.state = LowerBodyState()
-        self._probe: Dict[str, Tuple[float, float]] = {}  # stance -> (dir, t)
+        self._probe: dict[str, tuple[float, float]] = {}  # stance -> (dir, t)
+        # Warm start for the feed-forward CoM shift (see com_shift_* params).
+        self._shift_ff: dict[str, float] = {"pitch": 0.0, "roll": 0.0, "width": 0.0}
+        self._shift_margin: float = 0.0
+        # When the compensation first started failing to reach its target. Reset
+        # every time it succeeds, so the grace period is about a SUSTAINED failure.
+        self._shift_short_since: float | None = None
         self._last_obs = LowerBodyObservation()
-        self._fsr_share: Optional[float] = None
+        self._fsr_share: float | None = None
 
     # ------------------------------------------------------------------ API
     def reset(self) -> None:
         """Drop all blend state (call after an external whole-body motion).
+
+        Includes the CoM shift: a clip leaves the robot somewhere else entirely, so
+        the pelvis offset that suited the old pose is meaningless against the new.
 
         A motion clip leaves the robot in a completely different configuration,
         so a half-finished weight transfer from before the clip must not be
@@ -243,8 +320,11 @@ class LowerBodyController:
         """
         self.state = LowerBodyState()
         self._probe.clear()
+        self._shift_ff = {"pitch": 0.0, "roll": 0.0, "width": 0.0}
+        self._shift_margin = 0.0
+        self._shift_short_since = None
 
-    def set_observation(self, obs: Optional[LowerBodyObservation]) -> None:
+    def set_observation(self, obs: LowerBodyObservation | None) -> None:
         """Latch the newest camera observation (control runs at sim rate)."""
         if obs is not None:
             self._last_obs = obs
@@ -263,13 +343,13 @@ class LowerBodyController:
     def step(
         self,
         now_s: float,
-        obs: Optional[LowerBodyObservation] = None,
+        obs: LowerBodyObservation | None = None,
         *,
-        torso_rp: Tuple[float, float] = (0.0, 0.0),
-        fsr: Optional[Dict[str, float]] = None,
-        measured: Optional[Dict[str, float]] = None,
+        torso_rp: tuple[float, float] = (0.0, 0.0),
+        fsr: dict[str, float] | None = None,
+        measured: dict[str, float] | None = None,
         yaw_bias: float = 0.0,
-    ) -> Tuple[Dict[str, float], Dict[str, object]]:
+    ) -> tuple[dict[str, float], dict[str, object]]:
         """Advance the sequencer one control step and emit leg targets."""
         p = self.params
         st = self.state
@@ -282,7 +362,12 @@ class LowerBodyController:
 
         roll, pitch = torso_rp
         tilt_ok = abs(roll) < p.tilt_abort_rad and abs(pitch) < p.tilt_abort_rad
-        usable = bool(obs.valid and obs.confidence >= p.conf_min and tilt_ok)
+        # Hysteresis on the confidence gate: a sequence already under way holds on
+        # at the lower bar, so a marginal frame cannot abort a weight transfer
+        # half-completed. Tilt has no such grace -- that gate is a safety abort.
+        engaged = st.lift > 1e-3 or st.shift > 1e-3
+        conf_bar = p.conf_keep if engaged else p.conf_min
+        usable = bool(obs.valid and obs.confidence >= conf_bar and tilt_ok)
 
         swing = self._requested_swing(obs) if usable else ""
         if swing:
@@ -318,8 +403,43 @@ class LowerBodyController:
             obs, swing, yaw_bias if mode == MODE_DOUBLE else 0.0, usable
         )
         clamped = {n: self.limiter.clamp_angle(n, v) for n, v in targets.items()}
+        # Verify the LEAN against the CoM model before it reaches a motor. Skipped
+        # while a weight transfer is in progress: there the lean is deliberate and
+        # its whole purpose is to move the CoM onto one foot, which the
+        # double-support margin is the wrong test for (_lift_gate's stance_margin
+        # is the right one, and it is already applied).
+        # Sole tilt first: NAO's roll limits are asymmetric (LHipRoll reaches
+        # +45.3 deg but RHipRoll only +21.7), so clamping a large symmetric request
+        # breaks the tilt-neutrality the composition had.
         self._limit_sole_tilt(clamped)
-        meta: Dict[str, object] = {
+
+        # Then SHIFT THE CENTRE OF MASS to make the commanded pose holdable. This
+        # is the step that replaces gating: the pose is already at full authority
+        # and stays that way while there is pelvis travel left to pay for it.
+        margin = self._shift_com(clamped, measured, torso_rp)
+        # Re-enforce sole contact after the shift. The shift itself is tilt-neutral
+        # by construction, but NAO's roll limits are asymmetric (RHipRoll reaches
+        # +21.7 deg where RAnkleRoll reaches -25.3), so CLAMPING it can break that
+        # neutrality and leave a sole off flat -- which collapses the very polygon
+        # the shift was computed to defend.
+        self._limit_sole_tilt(clamped)
+
+        # Only if the compensation has run out of travel is the pose itself scaled
+        # back -- and only after it has been short for com_grace_s, because the
+        # pelvis needs a few ticks to get there. Double support only: a deliberate
+        # weight transfer is judged by stance_margin in _lift_gate, not by the
+        # double-support polygon.
+        if margin >= p.lean_margin_min:
+            self._shift_short_since = None
+        elif self._shift_short_since is None:
+            self._shift_short_since = now_s
+        starved = (self._shift_short_since is not None
+                   and (now_s - self._shift_short_since) >= p.com_grace_s)
+        lean_scale = 1.0
+        if st.shift <= 1e-3 and starved:
+            lean_scale = self._limit_asymmetry(clamped, measured)
+            self._limit_sole_tilt(clamped)
+        meta: dict[str, object] = {
             "why": self._explain(obs, tilt_ok, swing, gate, human_lift),
             "lift_source": obs.lift_source,
             "mode": mode,
@@ -336,8 +456,19 @@ class LowerBodyController:
             "human_lift": round(human_lift, 4),
             "crouch_u": round(self._crouch_u(obs), 4),
             "crouch_cue": round(obs.crouch_u, 4),
+            "crouch_solved": round(
+                min(min(-lg.hip_pitch, 0.5 * lg.knee_pitch)
+                    for lg in (obs.left, obs.right) if lg is not None)
+                if (obs.valid and (obs.left is not None or obs.right is not None))
+                else 0.0, 4),
             "tilt_ok": tilt_ok,
             "tracking": usable,
+            "lean_scale": round(lean_scale, 3),
+            "com_shift_pitch": round(self._shift_ff["pitch"], 4),
+            "com_shift_roll": round(self._shift_ff["roll"], 4),
+            "com_shift_width": round(self._shift_ff["width"], 4),
+            "com_margin": round(self._shift_margin, 5),
+            "confidence": round(obs.confidence, 3),
         }
         return clamped, meta
 
@@ -355,8 +486,10 @@ class LowerBodyController:
         st = self.state
         if not obs.valid:
             return "no lower-body landmarks in frame"
-        if obs.confidence < p.conf_min:
-            return f"lower-body confidence {obs.confidence:.2f} < {p.conf_min:.2f}"
+        engaged = st.lift > 1e-3 or st.shift > 1e-3
+        bar = p.conf_keep if engaged else p.conf_min
+        if obs.confidence < bar:
+            return f"lower-body confidence {obs.confidence:.2f} < {bar:.2f}"
         if not tilt_ok:
             return "torso tilted past the safety limit; standing down"
         if obs.lift_source == "none":
@@ -401,9 +534,32 @@ class LowerBodyController:
         """
         p = self.params
         legs = [lg for lg in (obs.left, obs.right) if lg is not None] if obs.valid else []
-        depth = 0.0
+
+        # (a) The leg solve's own reading. Kept because it is the one that carries
+        # the two invariants below, and because when the ankle IS visible it is a
+        # direct geometric measurement rather than an inference.
+        solved = 0.0
         if legs:
-            depth = min(min(-lg.hip_pitch, 0.5 * lg.knee_pitch) for lg in legs)
+            solved = min(min(-lg.hip_pitch, 0.5 * lg.knee_pitch) for lg in legs)
+
+        # (b) The retargeter's dedicated two-cue squat estimate. This used to be
+        # thrown away, which made the squat impossible to see on the framing
+        # people actually use: with the ankle out of shot ``_leg`` cannot solve the
+        # shank, so it reports ``knee_pitch == 0``, and the ``0.5 * knee_pitch``
+        # term above then drags (a) to zero however deeply the human bends. The
+        # ankle is visible in under a fifth of recorded frames, and the commanded
+        # depth accordingly sat on its floor in 96% of them.
+        cue = obs.crouch_u if obs.valid else 0.0
+
+        # The LARGER of the two, not the smaller. Both invariants survive it
+        # because both sources independently report ~0 in those cases:
+        #   * a waist hinge -- (a) sees knee_pitch 0; (b) requires the knees to
+        #     agree via its own knee cue, which is also 0.
+        #   * one knee lifted -- (a) takes the min across legs; (b) reads the
+        #     STRAIGHTER knee, which is the weight-bearing one.
+        # So max() adds reach without weakening either guarantee.
+        depth = max(solved, cue)
+
         # base_crouch_u is a floor, not a target: fully locked knees leave the
         # balance loop nothing to work with (KneePitch bottoms out at -5.3 deg).
         return _clamp(max(depth, p.base_crouch_u), 0.0, p.max_crouch_u)
@@ -429,9 +585,9 @@ class LowerBodyController:
     def _lift_gate(
         self,
         stance: str,
-        measured: Optional[Dict[str, float]],
-        fsr: Optional[Dict[str, float]],
-    ) -> Tuple[float, float]:
+        measured: dict[str, float] | None,
+        fsr: dict[str, float] | None,
+    ) -> tuple[float, float]:
         """Return ``(gate, stance_margin_m)`` -- how much lift is safe right now.
 
         ``gate`` scales the swing leg's authority continuously from 0 (CoM not
@@ -467,7 +623,7 @@ class LowerBodyController:
                 gate *= p.fsr_min_gain + (1.0 - p.fsr_min_gain) * confirm
         return gate, margin
 
-    def _shift_direction(self, stance: str, measured: Optional[Dict[str, float]],
+    def _shift_direction(self, stance: str, measured: dict[str, float] | None,
                          now_s: float) -> float:
         """Sign of the same-sign roll lean that loads ``stance``.
 
@@ -503,7 +659,7 @@ class LowerBodyController:
 
     def _compose(
         self, obs: LowerBodyObservation, swing: str, yaw_bias: float, usable: bool
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         """Symmetric crouch + authority-weighted per-leg human deviation + lean.
 
         ``usable`` gates only the ANTIsymmetric part of the double-support
@@ -531,7 +687,9 @@ class LowerBodyController:
             # crouch -- sharing the swing leg's pose onto it would move the very
             # foot the CoM is standing on.
             stance = "R" if swing == "L" else "L"
-            for side, dev, weight in (
+            # ``_side`` is carried for readability only -- the deviation dict is
+            # already keyed by joint name, so the side is not needed again here.
+            for _side, dev, weight in (
                 (swing, dev_l if swing == "L" else dev_r, st.lift),
                 (stance, dev_l if stance == "L" else dev_r, p.asymmetric_gain),
             ):
@@ -564,9 +722,9 @@ class LowerBodyController:
 
     def _apply_symmetric(
         self,
-        targets: Dict[str, float],
-        dev_l: Optional[Dict[str, float]],
-        dev_r: Optional[Dict[str, float]],
+        targets: dict[str, float],
+        dev_l: dict[str, float] | None,
+        dev_r: dict[str, float] | None,
         usable: bool,
     ) -> None:
         """Add the human's double-support deviation, split by symmetry.
@@ -623,12 +781,231 @@ class LowerBodyController:
                 + asym_gain * (antisym if mirrored else -antisym)
             )
 
-    def apply_sole_tilt_limit(self, targets: Dict[str, float]) -> Dict[str, float]:
+    def _apply_shift(self, targets: dict[str, float], pitch: float, roll: float,
+                     width: float = 0.0) -> dict[str, float]:
+        """``targets`` with a sole-flat pelvis shift and stance widening added.
+
+        Hip and ankle move by equal and opposite amounts on both legs, so the sum
+        Hip+Knee+Ankle -- and therefore each sole's contact -- is untouched while
+        the body translates over the feet. The knees are not touched at all, so
+        nothing here competes with the joints carrying the squat.
+
+        ``pitch`` and ``roll`` are same-sign on both legs: they translate the
+        pelvis. ``width`` is mirror-symmetric: it moves the feet apart, enlarging
+        the polygon without moving the centre of mass.
+        """
+        out = dict(targets)
+        for side in ("L", "R"):
+            out_sign = 1.0 if side == "L" else -1.0
+            for joint, delta in (
+                (f"{side}HipPitch", pitch),
+                (f"{side}AnklePitch", -pitch),
+                (f"{side}HipRoll", roll + out_sign * width),
+                (f"{side}AnkleRoll", -roll - out_sign * width),
+            ):
+                out[joint] = targets.get(joint, 0.0) + delta
+        return out
+
+    def _shift_com(self, targets: dict[str, float],
+                   measured: dict[str, float] | None,
+                   torso_rp: tuple[float, float]) -> float:
+        """Move the pelvis so the commanded pose is holdable. Feed-forward.
+
+        This is the layer that replaces gating. The human's leg pose has already
+        been composed at full authority; this asks "where must the centre of mass
+        be for that pose to stand up?" and shifts the pelvis there, rather than
+        refusing to strike the pose. It is the same thing a person does when they
+        lean over: the hips go the other way.
+
+        Feed-forward, because it evaluates the pose being COMMANDED rather than the
+        one already measured -- so the compensation arrives with the motion instead
+        of chasing it. ``BalanceController`` still runs as the feedback half,
+        cleaning up what the model got wrong.
+
+        Returns the achieved support margin. Modifies ``targets`` in place.
+        """
+        p = self.params
+        if self.com_model is None:
+            return 0.0
+        state = dict(measured or {})
+
+        def margin(pitch: float, roll: float, width: float) -> float:
+            trial = dict(state)
+            trial.update(self._apply_shift(targets, pitch, roll, width))
+            try:
+                mx, my = self.com_model.support_margins_tilted(trial, torso_rp)
+            except AttributeError:
+                # An older CoM model without the tilt-aware helper.
+                mx, my = self.com_model.support_margins(trial)
+            except Exception:  # noqa: BLE001
+                return math.inf
+            return min(mx, my)
+
+        current = self._shift_ff
+        axes = (("pitch", p.com_shift_max_pitch), ("roll", p.com_shift_max_roll),
+                ("width", p.com_shift_max_width))
+
+        def evaluate(shift: dict[str, float]) -> float:
+            return margin(shift["pitch"], shift["roll"], shift["width"])
+
+        base = evaluate(current)
+        if base == math.inf:
+            return 0.0
+
+        # A pose that stands up on its own must cost nothing, or the compensation
+        # becomes a tax on every movement -- and this is what keeps the typical
+        # tick down to a single forward-kinematics pass.
+        if base < p.com_margin_target:
+            deficit = p.com_margin_target - base
+            # Local sensitivity of the margin to each parameter, measured rather
+            # than assumed: three probes, one per axis.
+            gradients = []
+            for name, _limit in axes:
+                probe = dict(current)
+                probe[name] += p.com_shift_probe
+                gradients.append((name, (evaluate(probe) - base) / p.com_shift_probe))
+            # Spend the step on the axis that buys the most margin per radian. One
+            # axis at a time keeps it monotone: the objective is non-smooth, and
+            # moving three parameters at once is how the earlier sampling search
+            # walked onto the wrong side of a kink.
+            name, gradient = max(gradients, key=lambda g: abs(g[1]))
+            committed = False
+            if abs(gradient) > 1e-6:
+                limit = dict(axes)[name]
+                step = _clamp(deficit / gradient,
+                              -p.com_shift_max_step, p.com_shift_max_step)
+                lo = 0.0 if name == "width" else -limit
+                # Evaluate the value actually about to be COMMITTED, not the full
+                # step: the objective is non-smooth, so a partial step can be worse
+                # than both its endpoints. Checking the endpoint and committing a
+                # fraction of it is how the previous version walked onto a kink and
+                # then sat there with a margin worse than doing nothing.
+                target_value = _clamp(current[name] + step, lo, limit)
+                slewed = current[name] + p.com_shift_slew * (target_value - current[name])
+                proposed = dict(current)
+                proposed[name] = slewed
+                if evaluate(proposed) > base:
+                    current[name] = slewed
+                    committed = True
+            if not committed:
+                # No parameter can improve matters from here. Give the offset back
+                # rather than holding one that is not earning anything -- a stale
+                # shift is a posture the imitation has to fight for nothing.
+                for key, _limit in axes:
+                    current[key] *= (1.0 - p.com_shift_slew)
+        else:
+            # Comfortable: let the compensation relax back toward neutral so it does
+            # not accumulate a permanent offset the imitation has to fight.
+            for name, _limit in axes:
+                current[name] *= (1.0 - p.com_shift_slew * 0.25)
+
+        shifted = self._apply_shift(targets, current["pitch"], current["roll"],
+                                    current["width"])
+        for name, value in shifted.items():
+            targets[name] = self.limiter.clamp_angle(name, value)
+        self._shift_margin = evaluate(current)
+        return self._shift_margin
+
+    # Scales tried when a commanded lean has to be reduced. Coarse on purpose: each
+    # step costs a full forward-kinematics pass, and the blends upstream are already
+    # rate-limited, so a fine search buys nothing but CPU.
+    _LEAN_SCALES = (1.0, 0.8, 0.6, 0.4, 0.2, 0.0)
+
+    # The two ways an antisymmetric leg pose moves the centre of mass, and how the
+    # left/right pair combines for each. NAO mirrors its ROLL channels (LHipRoll
+    # positive and RHipRoll negative both mean "outward") but not its pitch ones,
+    # so the same-sign roll sum is the lean while the pitch DIFFERENCE is the split
+    # stance. Both are scaled by one factor; their mirror-symmetric counterparts
+    # (stance width, squat depth) are CoM-neutral or actively helpful and are never
+    # touched -- a wider stance enlarges the polygon.
+    _ASYM_CHANNELS = (
+        ("HipRoll", True), ("AnkleRoll", True),
+        ("HipPitch", False), ("KneePitch", False), ("AnklePitch", False),
+    )
+
+    def _limit_asymmetry(self, targets: dict[str, float],
+                         measured: dict[str, float] | None) -> float:
+        """Scale the antisymmetric leg pose until the model says it is holdable.
+
+        Answers the question the module docstring reserves for this layer -- "how
+        much of that may the robot actually execute right now?" -- for the one part
+        of the pose that moves the centre of mass. Previously the antisymmetric
+        deviation was gated by a fixed ``asymmetric_gain`` alone, with nothing
+        consulting the robot's own model: the layer could ask for 0.437 rad of lean
+        where the support polygon runs out around 0.58, and a split stance was
+        unchecked entirely.
+
+        Returns the scale applied (1.0 = untouched), for telemetry. A no-op when
+        there is no CoM model to ask, in which case the fixed gain remains the only
+        limit, exactly as before.
+        """
+        if self.com_model is None:
+            return 1.0
+
+        # Decompose once: how much antisymmetry is in each channel.
+        anti: dict[str, float] = {}
+        for channel, mirrored in self._ASYM_CHANNELS:
+            left = targets.get("L" + channel, 0.0)
+            right = targets.get("R" + channel, 0.0)
+            anti[channel] = 0.5 * (left + right) if mirrored else 0.5 * (left - right)
+        if all(abs(v) < 1e-4 for v in anti.values()):
+            return 1.0
+
+        def with_scale(scale: float) -> dict[str, float]:
+            out = dict(targets)
+            for channel, mirrored in self._ASYM_CHANNELS:
+                drop = (1.0 - scale) * anti[channel]
+                out["L" + channel] = targets.get("L" + channel, 0.0) - drop
+                out["R" + channel] = targets.get("R" + channel, 0.0) - (
+                    drop if mirrored else -drop
+                )
+            return out
+
+        state = dict(measured or {})
+        best_scale, best_margin = None, -math.inf
+        for scale in self._LEAN_SCALES:
+            trial = dict(state)
+            trial.update(with_scale(scale))
+            try:
+                margin = float(self.com_model.support_margin(trial))
+            except Exception:  # noqa: BLE001 - no support_margin on this model
+                return 1.0
+            if margin >= self.params.lean_margin_min:
+                # The LARGEST scale that is holdable: keep as much of the human's
+                # pose as the robot can actually stand in.
+                if scale < 1.0:
+                    for name, value in with_scale(scale).items():
+                        targets[name] = self.limiter.clamp_angle(name, value)
+                return scale
+            if margin > best_margin:
+                best_scale, best_margin = scale, margin
+        # Nothing is holdable -- the pose is past what this robot can do standing
+        # still, whatever it does with its pelvis. Keep the BEST-supported scale
+        # rather than collapsing to zero: attenuating to nothing throws away the
+        # imitation and does not even buy the best balance.
+        if best_scale is not None and best_scale < 1.0:
+            for name, value in with_scale(best_scale).items():
+                targets[name] = self.limiter.clamp_angle(name, value)
+        return best_scale if best_scale is not None else 1.0
+
+    def apply_sole_tilt_limit(self, targets: dict[str, float]) -> dict[str, float]:
         """Keep each sole within ``sole_tilt_budget`` of flat, in place.
 
         A sole is flat when ``AnkleRoll == -HipRoll``. When the budget is exceeded
         the HIP gives way, not the ankle: standing on the edge of a foot is what
-        tips the robot, and losing a little stance width is cheap by comparison.
+        tips the robot.
+
+        What that costs is worth stating precisely, because it is not what it
+        looks like. Sole tilt is ``HipRoll + AnkleRoll``, and both of the roll
+        terms this layer generates cancel exactly in that sum -- symmetric stance
+        width contributes ``+s`` and ``-s``, the weight-shift lean ``+l`` and
+        ``-l``. So the tilt is produced *only* by the CoM balance correction,
+        which applies the same sign to both legs; giving way at the hip therefore
+        moves the LEAN, never the stance width. That is why balance.py bounds its
+        two roll clamps to sum below this budget: it keeps this method a no-op on
+        the balance path, rather than letting a saturated roll correction be
+        quietly converted into a permanent whole-body lean (measured: a fixed
+        0.300 rad lean in 98% of a recorded session).
 
         Call this **last**, immediately before commanding the motors. The layer
         applies it to its own output, but the caller then folds in the CoM balance
@@ -639,7 +1016,7 @@ class LowerBodyController:
         self._limit_sole_tilt(targets)
         return targets
 
-    def _limit_sole_tilt(self, targets: Dict[str, float]) -> None:
+    def _limit_sole_tilt(self, targets: dict[str, float]) -> None:
         """In-place implementation of :meth:`apply_sole_tilt_limit`."""
         budget = self.params.sole_tilt_budget
         for side in ("L", "R"):
@@ -659,7 +1036,7 @@ class LowerBodyController:
         cached = self._probe.get(stance)
         return cached[0] if cached is not None else (-1.0 if stance == "L" else 1.0)
 
-    def _deviation(self, leg: LegTarget, side: str, u: float) -> Dict[str, float]:
+    def _deviation(self, leg: LegTarget, side: str, u: float) -> dict[str, float]:
         """The human leg pose minus the symmetric crouch, per-channel capped."""
         p = self.params
         base_hip, base_knee, base_ankle = -u, 2.0 * u, -u

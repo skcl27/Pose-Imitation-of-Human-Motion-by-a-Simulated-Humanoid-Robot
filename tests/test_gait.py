@@ -196,3 +196,90 @@ def test_tier_b_gate_blocks_when_fsr_shows_weight_not_transferred() -> None:
 def test_all_leg_joints_are_known_nao_motors() -> None:
     for name in LEG_JOINTS:
         assert name in CONFIGS
+
+
+# ---------------------------------------------------------------------------
+# Tier A must actually be what it claims: a DOUBLE-support march
+# ---------------------------------------------------------------------------
+def _model():
+    from balance import NaoCoMModel
+    return NaoCoMModel()
+
+
+def _posture(targets):
+    from pose_control_utils import standing_posture
+    state = standing_posture()
+    state.update(targets)
+    return state
+
+
+def _cycle(engine, seconds=4.0, dt=0.02):
+    """Run the engine at full amplitude and yield every commanded posture."""
+    engine.set_command({"state": "march", "cadence_hz": 1.0, "conf": 1.0,
+                        "intensity": 1.0})
+    t = 0.0
+    while t < seconds:
+        t += dt
+        targets, meta = engine.step(t, tier="march", torso_rp=(0.0, 0.0))
+        yield targets, meta
+
+
+def test_the_march_keeps_both_soles_flat() -> None:
+    """The lateral sway shifts the pelvis by rolling the hips; the ankles must
+    counter-rotate so the soles stay flat while it does.
+
+    They did not, and it was the walking bug: hip and ankle roll were applied with
+    the SAME sign, tilting each sole by up to 0.12 rad. A tilted sole contacts along
+    one edge, so the support polygon collapses to that edge -- measured, the lateral
+    margin went from +0.088 m standing to -0.083 m, i.e. the centre of mass spent
+    most of every stride outside the polygon. The robot fell within seconds of the
+    march starting.
+    """
+    engine = GaitEngine()
+    for targets, _ in _cycle(engine):
+        for side in ("L", "R"):
+            tilt = targets[f"{side}HipRoll"] + targets[f"{side}AnkleRoll"]
+            assert abs(tilt) < 1e-9, (side, tilt)
+
+
+def test_the_march_never_lifts_a_foot_off_the_floor() -> None:
+    """Tier A's safety claim is that it never fully unloads a foot -- that is why
+    the symmetric balance loop stays valid underneath it. The knee bob has to be
+    small enough for that to be true, and at 0.18 rad it was not: it lifted the
+    bobbing foot 8.7 mm clear of the ground."""
+    from balance import FOOT_LIFT_TOL
+    model = _model()
+    engine = GaitEngine()
+    worst = 0.0
+    for targets, _ in _cycle(engine):
+        frames = model.frames(_posture(targets))
+        lows = [float(model.foot_corners(s, frames)[:, 2].min()) for s in ("L", "R")]
+        worst = max(worst, abs(lows[0] - lows[1]))
+    assert worst < FOOT_LIFT_TOL, (
+        f"the march lifts a foot {worst * 1000:.1f} mm, past the {FOOT_LIFT_TOL * 1000:.0f} mm "
+        f"contact tolerance -- it is no longer a double-support march"
+    )
+
+
+def test_the_march_stays_inside_the_support_polygon() -> None:
+    """The property that actually matters, checked end to end."""
+    model = _model()
+    engine = GaitEngine()
+    worst = (9.0, 9.0)
+    for targets, _ in _cycle(engine):
+        mx, my = model.support_margins(_posture(targets))
+        worst = (min(worst[0], mx), min(worst[1], my))
+    assert worst[0] > 0.0, f"fore/aft margin {worst[0]:+.4f}"
+    assert worst[1] > 0.0, f"lateral margin {worst[1]:+.4f}"
+
+
+def test_the_march_is_still_visibly_a_march() -> None:
+    """The fixes must not quietly reduce it to standing still."""
+    engine = GaitEngine()
+    knees = []
+    sway = []
+    for targets, _ in _cycle(engine):
+        knees.append(targets["LKneePitch"])
+        sway.append(targets["LHipRoll"])
+    assert max(knees) - min(knees) > 0.15, "the knee pump is not visible"
+    assert max(sway) - min(sway) > 0.05, "there is no lateral weight shift"

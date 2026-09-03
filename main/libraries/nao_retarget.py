@@ -100,8 +100,8 @@ and lives in ``lower_body.LowerBodyController``.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
 
 from pose_control_utils import JointLimiter, get_default_motor_configs
 
@@ -113,6 +113,12 @@ VIS_THRESHOLD = 0.5
 HEAD_YAW_GAIN = 1.0
 HEAD_PITCH_GAIN = 1.6
 HEAD_PITCH_BASELINE = 0.9  # nose sits ~0.9 shoulder-widths above shoulder line
+
+# Per-subject calibration of that baseline (see :class:`HeadGeometry`). A neck
+# longer or shorter than the population average shifts the neutral, and the
+# robot then holds a permanent nod while the human looks straight ahead.
+HEAD_BASELINE_WARMUP = 45    # frames (~1.5 s at 30 FPS) averaged as "neutral"
+HEAD_BASELINE_DECAY = 0.002  # afterwards: slow drift, so a NEW subject re-calibrates
 
 # ---------------------------------------------------------------------------
 # Lower-body tuning (unchanged from the MediaPipe-era version: these are all
@@ -132,6 +138,10 @@ KNEE_BEND_RANGE = 1.30         # rad of human knee bend mapped to full crouch
 # flat throughout. The real ceiling is the knee's own 121 deg range.
 MAX_CROUCH = 0.70
 
+# Below this the swing angle is undefined -- the bone lies along the second
+# joint's own axis -- and only the signed zeros of atan2 would decide it.
+SWING_DEGENERATE = 1e-9
+
 # Below this |cos(first_angle)| the second angle is geometrically unobservable
 # (the limb points nearly along the rotation axis of the first joint), so we
 # report it as 0 rather than a noise-amplified value.
@@ -140,8 +150,8 @@ MIN_COS_ROLL = 0.30
 # Per-frame EMA smoothing of the directly-measured segment lengths (mm).
 GEOMETRY_ALPHA = 0.25
 
-Vec = Tuple[float, float, float]
-Landmark = Tuple[float, float, float, float]  # x, y, z (mm, camera frame), visibility
+Vec = tuple[float, float, float]
+Landmark = tuple[float, float, float, float]  # x, y, z (mm, camera frame), visibility
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +189,7 @@ def _norm(v: Vec) -> float:
     return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2) + 1e-9
 
 
-def _normalize(v: Vec) -> Optional[Vec]:
+def _normalize(v: Vec) -> Vec | None:
     n = _norm(v) - 1e-9
     if n < 1e-6:
         return None
@@ -200,13 +210,22 @@ def _lift_fraction(rise: float, leg_length: float, full: float) -> float:
     return _clamp((rise / leg_length - LIFT_DEADBAND) / full, 0.0, 1.0)
 
 
-def _swing_twist(a_signed: float, b_ref: float, c_signed: float) -> Tuple[float, float]:
+def _swing_twist(a_signed: float, b_ref: float, c_signed: float) -> tuple[float, float]:
     """Closed-form inverse of a 2-DOF "first rotate about a fixed axis, then
     rotate about the resulting axis" joint -- see the module docstring's
     "Swing-twist decomposition" section for the derivation and how legs/arms
     each map their axes onto ``(a_signed, b_ref, c_signed)``.
     """
     d = _clamp(b_ref, -1.0, 1.0)
+    # The bone lying exactly along the SECOND joint's axis makes the first
+    # (swing) angle geometrically undefined: both arguments of the atan2 are
+    # zero. That is not a corner case -- it is an arm raised straight out to the
+    # side, and atan2's signed zeros decide the answer there, so `atan2(-0.0,
+    # -0.0)` returns pi and the joint slams to its limit while `atan2(-0.0,
+    # +0.0)` returns 0. Pin it to 0 (the identity) and let the second angle carry
+    # the whole rotation, which is both stable and the reachable choice.
+    if math.hypot(a_signed, d) < SWING_DEGENERATE:
+        return 0.0, (math.pi / 2.0 if c_signed > 0.0 else -math.pi / 2.0)
     first = math.atan2(a_signed, d)
     cos_first = math.cos(first)
     if abs(cos_first) < MIN_COS_ROLL:
@@ -219,9 +238,9 @@ def _swing_twist(a_signed: float, b_ref: float, c_signed: float) -> Tuple[float,
 # ---------------------------------------------------------------------------
 # Landmark access
 # ---------------------------------------------------------------------------
-def _parse(keypoints: Dict[str, Sequence[float]]) -> Dict[str, Landmark]:
+def _parse(keypoints: dict[str, Sequence[float]]) -> dict[str, Landmark]:
     """Normalize incoming landmark values to (x, y, z, visibility) tuples."""
-    out: Dict[str, Landmark] = {}
+    out: dict[str, Landmark] = {}
     for name, v in keypoints.items():
         try:
             x = float(v[0])
@@ -236,11 +255,11 @@ def _parse(keypoints: Dict[str, Sequence[float]]) -> Dict[str, Landmark]:
     return out
 
 
-def _visible(kps: Dict[str, Landmark], *names: str, thr: float = VIS_THRESHOLD) -> bool:
+def _visible(kps: dict[str, Landmark], *names: str, thr: float = VIS_THRESHOLD) -> bool:
     return all(n in kps and kps[n][3] >= thr for n in names)
 
 
-def _mid_point(kps: Dict[str, Landmark], *names: str) -> Optional[Landmark]:
+def _mid_point(kps: dict[str, Landmark], *names: str) -> Landmark | None:
     """Midpoint of whichever of ``names`` are visible, or None if none are.
 
     Degrading to a single landmark (rather than requiring the pair) is what
@@ -279,7 +298,7 @@ class TorsoFrame:
     origin: Vec    # mid-hip position (mm, camera frame) -- for height measurements
 
 
-def _torso_frame(kps: Dict[str, Landmark]) -> Optional[TorsoFrame]:
+def _torso_frame(kps: dict[str, Landmark]) -> TorsoFrame | None:
     if not _visible(kps, "left_shoulder", "right_shoulder"):
         return None
     ls, rs = kps["left_shoulder"], kps["right_shoulder"]
@@ -324,7 +343,7 @@ def _to_local(frame: TorsoFrame, v: Vec) -> Vec:
 # ---------------------------------------------------------------------------
 # Per-segment retargeting (upper body)
 # ---------------------------------------------------------------------------
-def _arm(kps: Dict[str, Landmark], side: str, frame: TorsoFrame) -> Dict[str, float]:
+def _arm(kps: dict[str, Landmark], side: str, frame: TorsoFrame) -> dict[str, float]:
     pre = "left_" if side == "L" else "right_"
     if not _visible(kps, pre + "shoulder", pre + "elbow"):
         return {}
@@ -337,9 +356,28 @@ def _arm(kps: Dict[str, Landmark], side: str, frame: TorsoFrame) -> Dict[str, fl
     lat, up, fwd = _to_local(frame, unit)
     lat_outward = _side_sign(side) * lat
 
-    pitch, roll_outward = _swing_twist(-up, fwd, lat_outward)
+    # NOTE the negated `fwd`. TorsoFrame.forward is right x up, which for any
+    # real body in a right-handed frame points out of the subject's BACK, not
+    # their chest (see the TorsoFrame docstring). The LEG solve wants exactly
+    # that -- NAO's HipPitch is negative for a thigh swung forward -- but NAO's
+    # ShoulderPitch is ZERO for an arm held forward, so the arm needs the
+    # chest-facing axis, which is -forward.
+    #
+    # Without the negation an arm reaching straight at the camera solved to
+    # atan2(0, -1) = 180 deg, which the +/-119.5 deg joint limit then clamped:
+    # the arm slammed to its mechanical stop instead of pointing forward, and
+    # every forward reach in between came out moving the wrong way. It was
+    # invisible to the tests because figure() in tests/test_nao_retarget.py hangs
+    # the arms straight down at z = 0, where the fore/aft term is 0 and its sign
+    # therefore cannot matter.
+    #
+    # Only the pitch changes: _swing_twist's second (roll) output is invariant
+    # under b_ref -> -b_ref, because `first` becomes pi - first, so cos_first and
+    # d negate together and their ratio -- the only thing the roll uses -- is
+    # unchanged. So is |cos_first|, so the MIN_COS_ROLL gate is untouched too.
+    pitch, roll_outward = _swing_twist(-up, -fwd, lat_outward)
 
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     if side == "L":
         out["LShoulderPitch"] = pitch
         out["LShoulderRoll"] = +roll_outward   # NAO L: positive = outward
@@ -359,7 +397,59 @@ def _arm(kps: Dict[str, Landmark], side: str, frame: TorsoFrame) -> Dict[str, fl
     return out
 
 
-def _head(kps: Dict[str, Landmark], frame: TorsoFrame) -> Dict[str, float]:
+@dataclass
+class HeadGeometry:
+    """Per-subject neutral for the head-pitch solve.
+
+    :func:`_head` measures how far the nose sits above the shoulder line, in
+    shoulder-width units, and reads the difference from a neutral as "how far
+    from looking straight ahead". :data:`HEAD_PITCH_BASELINE` is a population
+    average, so a subject whose neck is longer or shorter than average carries a
+    constant offset: the robot holds a permanent nod while the human looks
+    straight at the camera, and that offset eats the head's usable range at one
+    end.
+
+    Unlike the segment lengths in :class:`BodyGeometry` this cannot simply be
+    measured -- a low nose is EITHER a short neck OR a subject looking down, and
+    no single frame separates the two. Nor is it an extremum, so
+    :class:`PeakHold` does not apply either: looking up and looking down move it
+    in OPPOSITE directions, and a running maximum would latch onto the
+    subject's most upward glance. It is therefore averaged over the opening
+    frames -- someone who has just stepped in front of a camera is looking at it
+    -- and afterwards held with a slow drift, so a different subject eventually
+    re-calibrates instead of inheriting the first one's neck.
+    """
+
+    warmup: int = HEAD_BASELINE_WARMUP
+    decay: float = HEAD_BASELINE_DECAY
+    baseline: float = HEAD_PITCH_BASELINE
+    _samples: int = field(default=0, init=False, repr=False)
+
+    def update(self, nose_height: float) -> float:
+        """Fold in one frame's nose height (shoulder-widths); return the neutral.
+
+        Non-finite samples are ignored rather than allowed to poison the mean.
+        """
+        if not math.isfinite(nose_height):
+            return self.baseline
+        self._samples += 1
+        if self._samples == 1:
+            # Replace the population default outright: one real measurement of
+            # THIS subject beats an average of everyone.
+            self.baseline = nose_height
+        elif self._samples <= self.warmup:
+            self.baseline += (nose_height - self.baseline) / self._samples
+        else:
+            self.baseline += self.decay * (nose_height - self.baseline)
+        return self.baseline
+
+    @property
+    def calibrated(self) -> bool:
+        return self._samples >= self.warmup
+
+
+def _head(kps: dict[str, Landmark], frame: TorsoFrame,
+          geom: HeadGeometry | None = None) -> dict[str, float]:
     if not _visible(kps, "nose", "left_shoulder", "right_shoulder"):
         return {}
     nose = kps["nose"]
@@ -386,13 +476,16 @@ def _head(kps: Dict[str, Landmark], frame: TorsoFrame) -> Dict[str, float]:
 
     # Pitch: nose vertical (torso-local "up") offset relative to its typical
     # above-shoulder-line height. Looking down brings the nose toward the
-    # shoulders (up component grows less negative) -> positive pitch.
-    pitch_raw = -(up / shoulder_w)
-    pitch = (pitch_raw + HEAD_PITCH_BASELINE) * HEAD_PITCH_GAIN
+    # shoulders (nose_height shrinks) -> positive pitch. The neutral it is read
+    # against is this subject's own once ``geom`` has seen enough frames,
+    # falling back to the population average when no calibrator is supplied.
+    nose_height = up / shoulder_w
+    baseline = geom.update(nose_height) if geom is not None else HEAD_PITCH_BASELINE
+    pitch = (baseline - nose_height) * HEAD_PITCH_GAIN
     return {"HeadYaw": yaw, "HeadPitch": pitch}
 
 
-def _knee_bend(kps: Dict[str, Landmark], side: str) -> Optional[float]:
+def _knee_bend(kps: dict[str, Landmark], side: str) -> float | None:
     """Human knee flexion (rad, 0 = straight) from hip-knee-ankle, or None."""
     pre = "left_" if side == "L" else "right_"
     if not _visible(kps, pre + "hip", pre + "knee", pre + "ankle"):
@@ -416,7 +509,7 @@ class LegTarget:
     lift: float = 0.0          # 0 = planted, 1 = knee-high lift
     confidence: float = 0.0    # 0..1 from landmark visibility
 
-    def as_targets(self, side: str) -> Dict[str, float]:
+    def as_targets(self, side: str) -> dict[str, float]:
         """Expand to NAO joint names for ``side`` in ("L", "R")."""
         return {
             f"{side}HipPitch": self.hip_pitch,
@@ -430,8 +523,8 @@ class LegTarget:
 @dataclass
 class LowerBodyObservation:
     """Everything the lower-body controller needs from one camera frame."""
-    left: Optional[LegTarget] = None
-    right: Optional[LegTarget] = None
+    left: LegTarget | None = None
+    right: LegTarget | None = None
     crouch_u: float = 0.0        # rad; symmetric squat amplitude (0 = upright)
     stance_side: str = ""        # "L" / "R" / "" (both feet down)
     confidence: float = 0.0      # 0..1 overall lower-body confidence
@@ -439,7 +532,7 @@ class LowerBodyObservation:
     # Which landmarks produced the lift signal: "feet", "knees" or "none".
     lift_source: str = "none"
 
-    def leg(self, side: str) -> Optional[LegTarget]:
+    def leg(self, side: str) -> LegTarget | None:
         return self.left if side == "L" else self.right
 
 
@@ -494,7 +587,7 @@ class BodyGeometry:
     def _ema(self, prev: float, sample: float, has_prev: bool) -> float:
         return sample if not has_prev else prev + self.alpha * (sample - prev)
 
-    def update_torso(self, kps: Dict[str, Landmark]) -> float:
+    def update_torso(self, kps: dict[str, Landmark]) -> float:
         ls, rs = kps["left_shoulder"], kps["right_shoulder"]
         mid_sh = ((ls[0] + rs[0]) * 0.5, (ls[1] + rs[1]) * 0.5, (ls[2] + rs[2]) * 0.5, 1.0)
         mid_hip = _mid_point(kps, "left_hip", "right_hip")
@@ -548,11 +641,11 @@ class LowerBodyRetargeter:
         self.geom = BodyGeometry()
 
     # -- public ------------------------------------------------------------
-    def observe(self, keypoints: Dict[str, Sequence[float]]) -> LowerBodyObservation:
+    def observe(self, keypoints: dict[str, Sequence[float]]) -> LowerBodyObservation:
         """Retarget one frame of landmarks into a :class:`LowerBodyObservation`."""
         return self.observe_parsed(_parse(keypoints))
 
-    def observe_parsed(self, kps: Dict[str, Landmark]) -> LowerBodyObservation:
+    def observe_parsed(self, kps: dict[str, Landmark]) -> LowerBodyObservation:
         frame = _torso_frame(kps)
         if frame is None:
             return LowerBodyObservation()
@@ -594,7 +687,7 @@ class LowerBodyRetargeter:
         )
 
     # -- internals ---------------------------------------------------------
-    def _calibrate_segments(self, kps: Dict[str, Landmark]) -> None:
+    def _calibrate_segments(self, kps: dict[str, Landmark]) -> None:
         """Directly measure this frame's thigh/shank lengths (mm), EMA-smoothed."""
         for side in ("L", "R"):
             pre = "left_" if side == "L" else "right_"
@@ -603,7 +696,7 @@ class LowerBodyRetargeter:
             if _visible(kps, pre + "knee", pre + "ankle"):
                 self.geom.update_shank(_dist3(kps[pre + "ankle"], kps[pre + "knee"]))
 
-    def _foot_height(self, kps: Dict[str, Landmark], side: str) -> Optional[float]:
+    def _foot_height(self, kps: dict[str, Landmark], side: str) -> float | None:
         """Camera-frame vertical (mm) of a foot. MeTRAbs' coco_19 skeleton has
         no separate heel landmark (unlike MediaPipe's 33-point set), so this
         is the ankle alone."""
@@ -612,17 +705,18 @@ class LowerBodyRetargeter:
             return None
         return kps[pre + "ankle"][1]
 
-    def _ground_line(self, kps: Dict[str, Landmark]) -> Optional[float]:
+    def _ground_line(self, kps: dict[str, Landmark]) -> float | None:
         """Camera-frame vertical (mm) of the ground: the LOWER of the two feet.
 
         This is the trick that makes lift detection calibration-free -- whichever
         foot is planted defines the floor, so the other foot's rise above it is
         the lift, with no need to know where the real floor is in the image.
         """
-        ys = [y for y in (self._foot_height(kps, "L"), self._foot_height(kps, "R")) if y is not None]
+        feet = (self._foot_height(kps, "L"), self._foot_height(kps, "R"))
+        ys = [y for y in feet if y is not None]
         return max(ys) if ys else None
 
-    def _lifts(self, kps: Dict[str, Landmark]) -> Tuple[Dict[str, float], str]:
+    def _lifts(self, kps: dict[str, Landmark]) -> tuple[dict[str, float], str]:
         """Per-side foot-lift fraction in [0, 1], and which landmarks gave it.
 
         Falls back to the KNEES (visible whenever the hips are) when the feet
@@ -638,7 +732,7 @@ class LowerBodyRetargeter:
             return ({s: _lift_fraction(ground - feet[s], leg_len, LIFT_FULL)
                      for s in ("L", "R")}, "feet")
 
-        knees: Dict[str, Optional[float]] = {}
+        knees: dict[str, float | None] = {}
         for side in ("L", "R"):
             pre = "left_" if side == "L" else "right_"
             knees[side] = kps[pre + "knee"][1] if _visible(kps, pre + "knee") else None
@@ -650,8 +744,8 @@ class LowerBodyRetargeter:
         return ({"L": 0.0, "R": 0.0}, "none")
 
     def _leg(
-        self, kps: Dict[str, Landmark], side: str, frame: TorsoFrame, lift: float
-    ) -> Optional[LegTarget]:
+        self, kps: dict[str, Landmark], side: str, frame: TorsoFrame, lift: float
+    ) -> LegTarget | None:
         pre = "left_" if side == "L" else "right_"
         if not _visible(kps, pre + "hip", pre + "knee"):
             return None
@@ -703,7 +797,7 @@ class LowerBodyRetargeter:
             confidence=_clamp(conf, 0.0, 1.0),
         )
 
-    def _crouch(self, kps: Dict[str, Landmark], ground_y: Optional[float]) -> float:
+    def _crouch(self, kps: dict[str, Landmark], ground_y: float | None) -> float:
         """Symmetric squat amplitude u (rad) for the balanced crouch posture.
 
         Two independent cues must agree before the robot squats: the hips
@@ -732,7 +826,7 @@ class LowerBodyRetargeter:
 # ---------------------------------------------------------------------------
 # Legacy symmetric crouch (kept for the walk engine's idle posture)
 # ---------------------------------------------------------------------------
-def crouch_posture(u: float) -> Dict[str, float]:
+def crouch_posture(u: float) -> dict[str, float]:
     """Symmetric, statically-balanced crouch: hip -u, knee +2u, ankle -u.
 
     ``HipPitch + KneePitch + AnklePitch == 0`` keeps the torso vertical and the
@@ -750,9 +844,9 @@ def crouch_posture(u: float) -> Dict[str, float]:
     }
 
 
-def _swap_sides(targets: Dict[str, float]) -> Dict[str, float]:
+def _swap_sides(targets: dict[str, float]) -> dict[str, float]:
     """Swap L<->R joints for a mirror-image mapping."""
-    swapped: Dict[str, float] = {}
+    swapped: dict[str, float] = {}
     for name, value in targets.items():
         if name.startswith("L"):
             swapped["R" + name[1:]] = value
@@ -767,27 +861,32 @@ def _swap_sides(targets: Dict[str, float]) -> Dict[str, float]:
 # Public entry point (upper body + head; legs go through LowerBodyRetargeter)
 # ---------------------------------------------------------------------------
 def retarget_upper_body(
-    keypoints: Dict[str, Sequence[float]],
+    keypoints: dict[str, Sequence[float]],
     *,
     drive_head: bool = True,
     swap_sides: bool = False,
-    limiter: Optional[JointLimiter] = None,
-) -> Dict[str, float]:
+    limiter: JointLimiter | None = None,
+    head_geom: HeadGeometry | None = None,
+) -> dict[str, float]:
     """Map MeTRAbs landmarks to clamped NAO arm/head targets (radians).
 
     Only joints whose source landmarks are visible are returned; everything
     else is omitted so the caller can hold the previous pose.
+
+    ``head_geom`` is the caller's :class:`HeadGeometry`, held across frames so
+    the head-pitch neutral calibrates to the subject; omit it for a one-shot
+    solve against the population default.
     """
     limiter = limiter or JointLimiter(get_default_motor_configs())
     kps = _parse(keypoints)
 
-    targets: Dict[str, float] = {}
+    targets: dict[str, float] = {}
     frame = _torso_frame(kps)
     if frame is not None:
         targets.update(_arm(kps, "L", frame))
         targets.update(_arm(kps, "R", frame))
         if drive_head:
-            targets.update(_head(kps, frame))
+            targets.update(_head(kps, frame, head_geom))
 
     if swap_sides:
         targets = _swap_sides(targets)
@@ -795,14 +894,15 @@ def retarget_upper_body(
 
 
 def retarget_full_body(
-    keypoints: Dict[str, Sequence[float]],
+    keypoints: dict[str, Sequence[float]],
     *,
     drive_legs: bool = False,
     drive_head: bool = True,
     swap_sides: bool = False,
-    limiter: Optional[JointLimiter] = None,
-    retargeter: Optional[LowerBodyRetargeter] = None,
-) -> Dict[str, float]:
+    limiter: JointLimiter | None = None,
+    retargeter: LowerBodyRetargeter | None = None,
+    head_geom: HeadGeometry | None = None,
+) -> dict[str, float]:
     """Arms + head, plus (when ``drive_legs``) the raw per-leg leg solve.
 
     NOTE: the leg angles returned here are the *human's* pose, with no balance
@@ -813,7 +913,8 @@ def retarget_full_body(
     """
     limiter = limiter or JointLimiter(get_default_motor_configs())
     targets = retarget_upper_body(
-        keypoints, drive_head=drive_head, swap_sides=False, limiter=limiter
+        keypoints, drive_head=drive_head, swap_sides=False, limiter=limiter,
+        head_geom=head_geom,
     )
 
     if drive_legs:
@@ -829,7 +930,7 @@ def retarget_full_body(
     return {name: limiter.clamp_angle(name, value) for name, value in targets.items()}
 
 
-def retargetable_joints(drive_legs: bool = False, drive_head: bool = True) -> List[str]:
+def retargetable_joints(drive_legs: bool = False, drive_head: bool = True) -> list[str]:
     """The set of NAO joints this module can drive (for logging headers)."""
     joints = [
         "LShoulderPitch", "RShoulderPitch",

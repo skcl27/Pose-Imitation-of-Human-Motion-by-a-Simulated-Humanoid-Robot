@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import socket
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 from src.type_defs import JointCommand, Keypoint
 
@@ -42,10 +41,10 @@ class WebotsBridge:
     def _encode(
         self,
         command: JointCommand,
-        keypoints: Optional[Dict[str, Keypoint]] = None,
-        gait: Optional[Dict[str, object]] = None,
+        keypoints: dict[str, Keypoint] | None = None,
+        gait: dict[str, object] | None = None,
     ) -> bytes:
-        payload: Dict[str, object] = {
+        payload: dict[str, object] = {
             "timestamp_s": command.timestamp_s,
             "frame_index": command.frame_index,
             "joint_angles_rad": command.joint_angles_rad,
@@ -69,8 +68,8 @@ class WebotsBridge:
     def send_pose_frame(
         self,
         command: JointCommand,
-        keypoints: Optional[Dict[str, Keypoint]] = None,
-        gait: Optional[Dict[str, object]] = None,
+        keypoints: dict[str, Keypoint] | None = None,
+        gait: dict[str, object] | None = None,
     ) -> None:
         """Send joint angles plus raw landmarks (full-body retargeting) and an
         optional gait command (real-time walking).

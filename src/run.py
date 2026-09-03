@@ -13,6 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src import webots_launcher  # noqa: E402
 from src.pipeline import PipelineOptions, PoseImitationPipeline  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
 
@@ -34,7 +35,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-webots", action="store_true",
-        help="Disable Webots UDP bridge (pure perception demo).",
+        help="Disable Webots UDP bridge (pure perception demo). Implies "
+             "--no-launch-webots.",
+    )
+    parser.add_argument(
+        "--launch-webots", dest="launch_webots", action="store_true", default=None,
+        help="Start Webots on the project world before the pipeline, so one "
+             "command brings up the whole demo (PRD FR-9). Attaches to an "
+             "already-running Webots instead of opening a second one.",
+    )
+    parser.add_argument(
+        "--no-launch-webots", dest="launch_webots", action="store_false",
+        help="Never start Webots; assume it is already open (overrides the "
+             "webots.launch config key).",
     )
     parser.add_argument(
         "--no-display", action="store_true",
@@ -92,10 +105,33 @@ def main(argv: list[str] | None = None) -> int:
         source_override=args.source,
     )
 
+    # CLI beats config; --no-webots (no bridge at all) beats both, since there
+    # would be nothing for the simulator to receive.
+    should_launch = (
+        bool(config.get("webots.launch", False))
+        if args.launch_webots is None
+        else args.launch_webots
+    )
+    webots: webots_launcher.WebotsProcess | None = None
+    if should_launch and options.enable_webots:
+        try:
+            webots = webots_launcher.launch(
+                world=config.get("webots.world", None),
+                startup_delay_s=float(config.get("webots.startup_delay_s", 4.0)),
+                mode=str(config.get("webots.mode", "realtime")),
+            )
+        except webots_launcher.WebotsLaunchError as exc:
+            log.error("%s", exc)
+            return 4
+
     log.info("Starting pipeline (display=%s, webots=%s)",
              options.show_window, options.enable_webots)
     pipeline = PoseImitationPipeline(options=options)
-    return pipeline.run()
+    try:
+        return pipeline.run()
+    finally:
+        if webots is not None and webots.owned:
+            webots.stop()
 
 
 if __name__ == "__main__":

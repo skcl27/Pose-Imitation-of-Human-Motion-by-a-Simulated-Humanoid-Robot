@@ -445,15 +445,52 @@ def test_stance_width_gives_way_before_sole_contact() -> None:
         CONFIGS["LAnkleRoll"].min_angle, abs=1e-6)
 
 
-def test_a_lean_is_still_gated() -> None:
-    """Same-sign roll moves the CoM, so it must NOT get the symmetric pass."""
-    p = LowerBodyParams()
+def test_a_holdable_lean_is_imitated_ONE_TO_ONE() -> None:
+    """Balance compensates; it does not attenuate.
+
+    This replaces a test that asserted the opposite -- that a lean was scaled to
+    35% because same-sign roll moves the centre of mass. Attenuating was the wrong
+    tool: a third of a lean still moves the CoM a third of the way out, so it
+    bought fidelity loss without buying balance. The robot now strikes the pose and
+    shifts its pelvis (and widens its stance) to make it holdable, which is what a
+    person does when they lean.
+
+    0.35 rad is inside what NAO can hold: a lean moves the CoM by
+    leg_length * sin(theta), and at 0.35 rad that is 96 mm against an 88 mm
+    polygon half-width plus the compensation's travel.
+    """
+    model = NaoCoMModel()
+    ctl = LowerBodyController(com_model=model)
+    targets, meta, _, _ = run(ctl, leaning(0.35), 5.0)
+    lean = 0.5 * (targets["LHipRoll"] + targets["RHipRoll"])
+    assert lean == pytest.approx(0.35, abs=0.03), lean      # 1:1, not 35%
+    assert meta["lean_scale"] == 1.0                         # nothing was gated
+    assert meta["com_margin"] > 0.0                          # and it is holdable
+
+
+def test_a_lean_past_the_hardware_limit_is_attenuated_as_a_LAST_resort() -> None:
+    """Past what the robot can physically hold, the pose has to give.
+
+    A lean moves the CoM by leg_length * sin(theta) -- 158 mm at 0.6 rad, against
+    an 88 mm polygon half-width. No compensation can hold that; the robot would
+    have to step. So the pose is scaled back, but only after the compensation has
+    been given com_grace_s to try.
+    """
     ctl = LowerBodyController(com_model=NaoCoMModel())
-    targets, _, _, _ = run(ctl, leaning(0.35), 2.0)
-    expected = p.asymmetric_gain * 0.35
-    assert targets["LHipRoll"] == pytest.approx(expected, abs=0.02)
-    assert targets["RHipRoll"] == pytest.approx(expected, abs=0.02)
-    assert abs(targets["LHipRoll"]) < 0.35 * 0.6            # clearly limited
+    _, meta, _, _ = run(ctl, leaning(0.9), 5.0)
+    assert meta["lean_scale"] < 1.0
+
+
+def test_the_compensation_gets_a_grace_period_before_anything_is_scaled() -> None:
+    """The fallback must not fire on the first tick -- the pelvis needs a few ticks
+    to travel, and firing early is gating by another name."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    t = 0.0
+    obs = leaning(0.9)
+    for _ in range(5):                       # 0.1s, well inside com_grace_s
+        t += 0.02
+        _, meta = ctl.step(t, obs, measured={})
+    assert meta["lean_scale"] == 1.0, "scaled back before the compensation could try"
 
 
 def test_a_split_stance_is_still_gated() -> None:
@@ -489,9 +526,19 @@ def test_only_one_visible_leg_is_read_conservatively() -> None:
         right=None, crouch_u=0.0, confidence=0.6, valid=True, lift_source="feet",
     )
     ctl = LowerBodyController(com_model=NaoCoMModel())
-    targets, _, _, _ = run(ctl, obs, 2.0)
-    assert targets["LHipRoll"] == pytest.approx(p.asymmetric_gain * 0.35, abs=0.02)
-    assert targets["RHipRoll"] == pytest.approx(0.0, abs=0.02)
+    targets, meta, _, _ = run(ctl, obs, 2.0)
+    # The DEVIATION is what this test is about: read as antisymmetric (the
+    # conservative reading) and applied to the visible leg only. Both hips also
+    # carry the CoM compensation's same-sign roll on top, so the two are separated
+    # by looking at the difference rather than at the absolute values.
+    # (Whether it is then attenuated is a separate question, covered by the
+    # compensation tests: a one-sided roll is half lean and half stance width, so
+    # how holdable it is depends on the geometry, not on this decomposition.)
+    # The L-R DIFFERENCE isolates the deviation from everything added same-sign on
+    # top (the CoM compensation, and the lean scaling if it fired -- neither of
+    # which changes a difference).
+    deviation = targets["LHipRoll"] - targets["RHipRoll"]
+    assert deviation == pytest.approx(p.asymmetric_gain * 0.35, abs=0.06), deviation
 
 
 def test_a_lifted_leg_does_not_drag_the_stance_leg_with_it() -> None:
@@ -511,3 +558,226 @@ def test_a_full_weight_transfer_allows_the_full_requested_lift() -> None:
     _, meta, _, _ = run(ctl, lifting("L", lift=1.0), 4.0)
     assert meta["gate"] == pytest.approx(1.0, abs=1e-6)
     assert meta["lift"] > 0.95
+
+
+# ---------------------------------------------------------------------------
+# The lean is verified against the model, not just gain-limited
+# ---------------------------------------------------------------------------
+def _leaning(roll, conf=1.0):
+    """Both legs rolled the SAME way: an antisymmetric pose, i.e. a lean."""
+    left = LegTarget(0.0, roll, 0.0, 0.0, -roll, lift=0.0, confidence=conf)
+    right = LegTarget(0.0, roll, 0.0, 0.0, -roll, lift=0.0, confidence=conf)
+    return LowerBodyObservation(
+        left=left, right=right, crouch_u=0.0, stance_side="",
+        confidence=conf, valid=True, lift_source="feet",
+    )
+
+
+def test_a_lean_the_robot_cannot_hold_is_scaled_back() -> None:
+    """The gap this closes: the antisymmetric deviation was gated only by a fixed
+    GAIN, with nothing consulting the robot's own model -- and this module's whole
+    premise is that stability decisions are made from the robot's own state.
+
+    At the shipped ``asymmetric_gain`` of 0.35 the gain alone happens to keep the
+    lean inside the polygon (0.277 rad, ~39 mm of margin), so the guard is a safety
+    net rather than an attenuator -- see the companion test below. It is exercised
+    here by raising the gain, which is a supported configuration and exactly the
+    change that would silently reintroduce a fall.
+    """
+    model = NaoCoMModel()
+    loose = LowerBodyParams(asymmetric_gain=1.0)
+    ctl = LowerBodyController(params=loose, com_model=model)
+    targets, meta, _, _ = run(ctl, _leaning(2.0), 3.0)      # an extreme lean request
+    assert meta["lean_scale"] < 1.0                          # it really was reduced
+
+    # The contract: the lean is scaled back until the model is satisfied, or right
+    # down to nothing. It cannot promise the margin outright, because NAO's roll
+    # limits are asymmetric (LHipRoll reaches +45.3 deg, RHipRoll only +21.7), so
+    # clamping an extreme request leaves a residual sole tilt that costs margin on
+    # its own and is not a lean for this method to remove.
+    # The contract is about the POSTURE being holdable, not about the lean reaching
+    # any particular number: the guard stops scaling as soon as the model is
+    # satisfied, so a more accurate support polygon simply means less scaling is
+    # needed. What must hold is that the guard leaves the robot better supported
+    # than the same request would unguarded.
+    ungated = LowerBodyController(params=loose, com_model=None)
+    bad, bad_meta, _, _ = run(ungated, _leaning(2.0), 3.0)
+    assert bad_meta["lean_scale"] == 1.0                     # nothing checked it
+    bad_lean = 0.5 * (bad["LHipRoll"] + bad["RHipRoll"])
+    lean = 0.5 * (targets["LHipRoll"] + targets["RHipRoll"])
+    assert bad_lean > 0.4                                    # a big unchecked lean
+    assert abs(lean) < bad_lean                              # the guard reduced it
+    assert model.support_margin(dict(targets)) > model.support_margin(dict(bad))
+
+
+def test_a_lean_the_robot_CAN_hold_passes_through_untouched() -> None:
+    """Inside the hardware limit, nothing is scaled and the pose arrives whole."""
+    model = NaoCoMModel()
+    for request in (0.10, 0.20, 0.30):
+        ctl = LowerBodyController(com_model=model)
+        targets, meta, _, _ = run(ctl, _leaning(request), 5.0)
+        assert meta["lean_scale"] == 1.0, request
+        lean = 0.5 * (targets["LHipRoll"] + targets["RHipRoll"])
+        assert lean == pytest.approx(request, abs=0.03), (request, lean)
+
+
+def test_stance_widening_is_preferred_over_fighting_the_lean() -> None:
+    """Why width is one of the compensation's parameters.
+
+    A pelvis shift and a lean are the same degree of freedom, so shifting the
+    pelvis to hold a lean subtracts directly from the lean being imitated.
+    Widening the stance enlarges the support polygon instead and is
+    mirror-symmetric, so it costs the imitation nothing. Measured holding a 0.60
+    rad lean: shift -0.20 buys +0.025 m of margin but loses 0.20 of lean, while
+    width +0.20 buys +0.031 m and loses none.
+    """
+    model = NaoCoMModel()
+    ctl = LowerBodyController(com_model=model)
+    _, meta, _, _ = run(ctl, _leaning(0.55), 5.0)
+    # It reached for width, not only for a pelvis shift.
+    assert meta["com_shift_width"] > 0.0, meta
+
+
+def test_the_compensation_costs_nothing_on_a_comfortable_pose() -> None:
+    """A pose that stands up on its own must not be taxed -- otherwise every
+    movement pays for balance it does not need, and the tick cost goes up too."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    _, meta, _, _ = run(ctl, standing(), 3.0)
+    assert abs(meta["com_shift_pitch"]) < 1e-3
+    assert abs(meta["com_shift_roll"]) < 1e-3
+    assert abs(meta["com_shift_width"]) < 1e-3
+
+
+def test_the_compensation_keeps_both_soles_flat() -> None:
+    """It translates the pelvis; it must never tilt a sole to do it. A tilted sole
+    contacts along one edge and collapses the very polygon being defended."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    t = 0.0
+    for _ in range(250):
+        t += 0.02
+        targets, _ = ctl.step(t, _leaning(0.5), measured={})
+        for side in ("L", "R"):
+            tilt = targets[f"{side}HipRoll"] + targets[f"{side}AnkleRoll"]
+            assert abs(tilt) <= LowerBodyParams().sole_tilt_budget + 1e-6, (side, tilt)
+
+
+def test_stance_width_is_never_scaled_by_the_lean_limit() -> None:
+    """A wider stance is mirror-symmetric: CoM-neutral, and it ENLARGES the
+    polygon. It must not be caught by a limit aimed at leaning."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    wide = LegTarget(0.0, +0.60, 0.0, 0.0, -0.60, lift=0.0, confidence=1.0)
+    narrow = LegTarget(0.0, -0.60, 0.0, 0.0, +0.60, lift=0.0, confidence=1.0)
+    obs = LowerBodyObservation(
+        left=wide, right=narrow, crouch_u=0.0, stance_side="",
+        confidence=1.0, valid=True, lift_source="feet",
+    )
+    targets, meta, _, _ = run(ctl, obs, 3.0)
+    assert meta["lean_scale"] == 1.0
+    # And the stance really is wide: the rolls are opposite-signed and large.
+    assert targets["LHipRoll"] > 0.2
+    assert targets["RHipRoll"] < -0.2
+
+
+def test_the_lean_limit_does_not_fight_the_weight_transfer() -> None:
+    """During a shift the lean is deliberate -- its purpose IS to move the CoM
+    onto one foot, so the double-support margin is the wrong test. stance_margin
+    in _lift_gate is the right one and is already applied."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    _, meta, _, _ = run(ctl, lifting("L"), 3.0)
+    assert meta["shift"] > 0.5                    # a transfer is under way
+    assert meta["lean_scale"] == 1.0              # and it was left alone
+
+
+def test_the_lean_limit_degrades_to_the_old_behaviour_without_a_model() -> None:
+    """No NumPy, no model, no check -- but it must not crash or freeze the legs."""
+    ctl = LowerBodyController(com_model=None)
+    targets, meta, _, _ = run(ctl, _leaning(2.0), 3.0)
+    assert meta["lean_scale"] == 1.0
+    assert set(LEG_JOINTS) <= set(targets)
+
+
+def test_a_marginal_frame_does_not_abort_a_weight_transfer() -> None:
+    """The retargeter halves its confidence when only one leg is in view, which
+    puts a clear single-leg detection at ~0.49 against a 0.50 gate. Without
+    hysteresis the layer flapped double -> load -> double, restarting the transfer
+    every time -- visible as legs that twitch instead of stepping."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    p = ctl.params
+    # Establish a transfer with two legs clearly visible.
+    good = lifting("L", conf=1.0)
+    t = 0.0
+    for _ in range(60):
+        t += 0.02
+        _, meta = ctl.step(t, good)
+    assert meta["shift"] > 0.5, meta
+
+    # Now confidence dips to just under the ENGAGE bar but above the KEEP bar.
+    marginal = lifting("L", conf=0.49)
+    assert p.conf_keep <= 0.49 < p.conf_min
+    for _ in range(30):
+        t += 0.02
+        _, meta = ctl.step(t, marginal)
+    assert meta["tracking"] is True                # still engaged
+    assert meta["shift"] > 0.5, meta               # the transfer survived
+
+    # A genuine collapse in confidence still stands the robot down.
+    bad = lifting("L", conf=0.20)
+    for _ in range(200):
+        t += 0.02
+        _, meta = ctl.step(t, bad)
+    assert meta["tracking"] is False
+    assert meta["shift"] < 0.05
+
+
+def test_engaging_still_needs_the_full_confidence_bar() -> None:
+    """Hysteresis must lower the bar to CONTINUE, never to start."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    marginal = lifting("L", conf=0.45)
+    t = 0.0
+    for _ in range(80):
+        t += 0.02
+        _, meta = ctl.step(t, marginal)
+    assert meta["tracking"] is False
+    assert meta["shift"] < 1e-3
+
+
+def test_a_split_stance_is_checked_too_not_just_a_lean() -> None:
+    """The guard covers every antisymmetric channel, not only roll.
+
+    A split stance -- one leg forward, one back -- moves the CoM fore/aft and
+    rotates the feet, shrinking the polygon on the axis where NAO has least to
+    give (30 mm behind the ankle against 100 mm in front). Checking only the roll
+    lean left 15 of 204 double-support frames outside the support polygon on
+    recorded data, every one of them with the roll guard already fully applied.
+    """
+    model = NaoCoMModel()
+    loose = LowerBodyParams(asymmetric_gain=1.0)
+    # Antisymmetric PITCH: left leg flexed forward, right extended back.
+    fwd = LegTarget(-1.2, 0.0, 0.0, 0.0, 0.0, lift=0.0, confidence=1.0)
+    back = LegTarget(+0.4, 0.0, 0.0, 0.0, 0.0, lift=0.0, confidence=1.0)
+    obs = LowerBodyObservation(
+        left=fwd, right=back, crouch_u=0.0, stance_side="",
+        confidence=1.0, valid=True, lift_source="feet",
+    )
+    guarded = LowerBodyController(params=loose, com_model=model)
+    targets, meta, _, _ = run(guarded, obs, 3.0)
+
+    ungated = LowerBodyController(params=loose, com_model=None)
+    bad, bad_meta, _, _ = run(ungated, obs, 3.0)
+    assert bad_meta["lean_scale"] == 1.0
+
+    # The guarded posture must be at least as well supported as the unguarded one,
+    # and if the guard acted at all it must have improved matters.
+    assert model.support_margin(dict(targets)) >= model.support_margin(dict(bad)) - 1e-9
+    if meta["lean_scale"] < 1.0:
+        assert model.support_margin(dict(targets)) > model.support_margin(dict(bad))
+
+
+def test_the_symmetric_squat_is_never_scaled_by_the_asymmetry_guard() -> None:
+    """A deep squat is mirror-symmetric: CoM-neutral, and the crouch posture keeps
+    the ankle under the hip at any depth. It must reach the robot untouched."""
+    ctl = LowerBodyController(com_model=NaoCoMModel())
+    targets, meta, _, _ = run(ctl, squatting(0.60), 3.0)
+    assert meta["lean_scale"] == 1.0
+    assert meta["crouch_u"] == pytest.approx(0.60, abs=1e-6)
+    assert targets["LHipPitch"] == pytest.approx(targets["RHipPitch"], abs=1e-9)

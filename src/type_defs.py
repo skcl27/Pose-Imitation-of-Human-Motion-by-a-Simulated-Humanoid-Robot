@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 
 @dataclass(frozen=True)
@@ -29,12 +28,12 @@ class Keypoint:
 @dataclass(frozen=True)
 class PoseFrame:
     timestamp_s: float
-    keypoints: Dict[str, Keypoint]
+    keypoints: dict[str, Keypoint]
     frame_index: int
 
 
 @dataclass(frozen=True)
 class JointCommand:
     timestamp_s: float
-    joint_angles_rad: Dict[str, float]
+    joint_angles_rad: dict[str, float]
     frame_index: int

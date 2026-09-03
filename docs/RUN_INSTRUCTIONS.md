@@ -5,6 +5,10 @@ This guide shows how to run the project from both sides: the Python pipeline in 
 
 > **Environment**: Ubuntu 22.04 / 24.04, Python 3.12 in Conda env `py312`, TensorFlow + TensorFlow-Hub running [MeTRAbs](https://github.com/isarandi/metrabs) (installed via pip within conda), Webots R2024a
 >
+> **First run downloads the MeTRAbs model** (~320 MB) into `~/.cache/metrabs`;
+> set `$METRABS_CACHE_DIR` to put it elsewhere. It is deliberately *not* kept in
+> a temp directory, so a reboot does not throw it away.
+>
 > **GPU required.** MeTRAbs needs a CUDA-enabled TensorFlow build for real-time
 > inference -- see step 2.4. Without a GPU, either run on a different machine or
 > set `pose.allow_synthetic_fallback: true` in `configs/default.yaml` (the robot
@@ -24,7 +28,16 @@ cd /home/<user>/CS_Group_C_2026/Pose-Imitation-of-Human-Motion-by-a-Simulated-Hu
 python run.py --no-webots
 ```
 
-### Option B: Full Webots live imitation
+### Option B: Full Webots live imitation — one command
+```bash
+conda activate py312
+cd /home/<user>/CS_Group_C_2026/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot
+make run                       # == python run.py --launch-webots
+```
+This opens the project world in Webots and starts the pipeline against it. Press
+▶ in Webots if the simulation does not start playing on its own.
+
+### Option C: drive a Webots you opened yourself
 1. Launch Webots and open `main/worlds/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.wbt`
 2. Set the robot controller to `pose_imitation_controller`
 3. Start the simulation in Webots
@@ -32,8 +45,10 @@ python run.py --no-webots
 ```bash
 conda activate py312
 cd /home/<user>/CS_Group_C_2026/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot
-python run.py
+make pipeline                  # == python run.py --no-launch-webots
 ```
+(Plain `python run.py --launch-webots` is also safe here: it detects the running
+Webots and attaches to it rather than opening a second one.)
 
 ---
 

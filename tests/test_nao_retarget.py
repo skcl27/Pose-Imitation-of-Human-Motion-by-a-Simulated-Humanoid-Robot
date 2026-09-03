@@ -20,9 +20,13 @@ import math
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
 from nao_retarget import (  # noqa: E402
+    HEAD_PITCH_BASELINE,
+    HeadGeometry,
     LowerBodyRetargeter,
     PeakHold,
     _side_sign,
@@ -313,3 +317,170 @@ def test_crouch_posture_is_statically_balanced() -> None:
             total = p[f"{side}HipPitch"] + p[f"{side}KneePitch"] + p[f"{side}AnklePitch"]
             assert abs(total) < 1e-12   # torso vertical, sole flat
         assert p["LHipRoll"] == p["RHipRoll"] == 0.0
+
+
+# ------------------------------------------------- head-pitch self-calibration
+# ``figure()``'s nose sits 120 mm above a 120 mm shoulder span, i.e. exactly
+# 1.0 shoulder-widths -- a subject whose neck is longer than the population
+# average encoded in HEAD_PITCH_BASELINE.
+def _with_neck(nose_height: float):
+    """``figure()`` with the nose at ``nose_height`` shoulder-widths up."""
+    kps = figure()
+    shoulder_w = 2.0 * HALF_SHOULDER
+    kps["nose"] = [CENTER_X, (HIP_Y - TORSO) - nose_height * shoulder_w, 0.0, 1.0]
+    return kps
+
+
+def test_an_off_average_neck_biases_the_head_without_calibration() -> None:
+    """The regression this class exists for: a subject looking straight ahead
+    gets a standing head tilt purely because their neck is not average."""
+    pitch = retarget_upper_body(_with_neck(1.30))["HeadPitch"]
+    assert abs(pitch) > 0.5   # ~ -37 deg of permanent nod
+
+
+def test_calibration_removes_the_bias_for_a_neutral_head() -> None:
+    geom = HeadGeometry()
+    for _ in range(geom.warmup):
+        targets = retarget_upper_body(_with_neck(1.30), head_geom=geom)
+    assert geom.calibrated
+    assert abs(targets["HeadPitch"]) < 1e-6
+    assert abs(geom.baseline - 1.30) < 1e-6
+
+
+def test_calibration_does_not_flatten_real_head_motion() -> None:
+    """Calibrating away the OFFSET must not calibrate away the SIGNAL."""
+    geom = HeadGeometry()
+    for _ in range(geom.warmup):
+        retarget_upper_body(_with_neck(1.30), head_geom=geom)
+    # Nose drops toward the shoulders -> looking down -> positive pitch.
+    assert retarget_upper_body(_with_neck(1.10), head_geom=geom)["HeadPitch"] > 0.2
+    # ... and the opposite way for looking up.
+    geom_up = HeadGeometry()
+    for _ in range(geom_up.warmup):
+        retarget_upper_body(_with_neck(1.30), head_geom=geom_up)
+    assert retarget_upper_body(_with_neck(1.50), head_geom=geom_up)["HeadPitch"] < -0.2
+
+
+def test_the_first_frame_replaces_the_population_default() -> None:
+    geom = HeadGeometry()
+    assert geom.baseline == HEAD_PITCH_BASELINE
+    assert geom.update(1.40) == 1.40      # not averaged with the default
+
+
+def test_non_finite_samples_cannot_poison_the_neutral() -> None:
+    geom = HeadGeometry()
+    geom.update(1.20)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert geom.update(bad) == 1.20
+
+
+def test_a_brief_glance_does_not_move_a_settled_neutral() -> None:
+    """After warm-up the neutral drifts slowly, so looking away for a second
+    must not drag the robot's idea of 'straight ahead' with it."""
+    geom = HeadGeometry()
+    for _ in range(geom.warmup):
+        geom.update(1.00)
+    for _ in range(50):                    # ~1.7 s of looking down
+        geom.update(0.60)
+    assert abs(geom.baseline - 1.00) < 0.05
+
+
+def test_a_new_subject_eventually_recalibrates() -> None:
+    """The slow decay is what stops the second person in front of the camera
+    from inheriting the first one's neck."""
+    geom = HeadGeometry()
+    for _ in range(geom.warmup):
+        geom.update(1.00)
+    for _ in range(2000):
+        geom.update(1.40)
+    assert abs(geom.baseline - 1.40) < 0.05
+
+
+# ------------------------------------------------- arm fore/aft axis (chirality)
+# These use a subject built to face the camera (left shoulder at POSITIVE x --
+# your left is on my right), because that is what a real estimator reports and
+# it is the orientation under which the fore/aft sign actually matters.
+#
+# The suite could not catch a front-to-back inversion before: figure() hangs the
+# arms straight down with z = 0, where the fore/aft component of the arm bone is
+# zero and its sign therefore cannot change the answer.
+def _facing_subject(left_arm_forward_rad: float = 0.0):
+    """A camera-facing figure whose LEFT arm is swung forward by the given angle.
+
+    Camera frame: x right, y DOWN, z away from the camera -- so "forward" for the
+    subject (toward the camera) is NEGATIVE z.
+    """
+    sh_y, half_sh, upper, fore = -500.0, 190.0, 300.0, 260.0
+    dy, dz = math.cos(left_arm_forward_rad), -math.sin(left_arm_forward_rad)
+    ls = (half_sh, sh_y, 0.0)          # left on POSITIVE x: subject faces us
+    rs = (-half_sh, sh_y, 0.0)
+    return {
+        "left_shoulder": [ls[0], ls[1], ls[2], 1.0],
+        "right_shoulder": [rs[0], rs[1], rs[2], 1.0],
+        "left_hip": [100.0, 0.0, 0.0, 1.0],
+        "right_hip": [-100.0, 0.0, 0.0, 1.0],
+        "left_elbow": [ls[0], ls[1] + upper * dy, ls[2] + upper * dz, 1.0],
+        "left_wrist": [ls[0], ls[1] + (upper + fore) * dy, ls[2] + (upper + fore) * dz, 1.0],
+        "right_elbow": [rs[0], rs[1] + upper, rs[2], 1.0],
+        "right_wrist": [rs[0], rs[1] + upper + fore, rs[2], 1.0],
+        "nose": [0.0, sh_y - 240.0, 0.0, 1.0],
+    }
+
+
+def test_a_hanging_arm_is_shoulder_pitch_ninety() -> None:
+    """NAO's ShoulderPitch is +90 deg for an arm at the side."""
+    t = retarget_upper_body(_facing_subject(0.0))
+    assert math.degrees(t["LShoulderPitch"]) == pytest.approx(90.0, abs=1.0)
+
+
+def test_an_arm_reaching_at_the_camera_is_shoulder_pitch_zero() -> None:
+    """The regression this pair exists for. TorsoFrame.forward is right x up,
+    which points out of the subject's BACK; NAO's ShoulderPitch is 0 for an arm
+    held FORWARD, so the arm solve must read the negated axis. Without that, an
+    arm pointing at the camera solved to atan2(0, -1) = 180 deg and the joint
+    limit clamped it to 119.5 -- the arm hit its mechanical stop instead of
+    reaching forward, on every frame of every forward reach."""
+    t = retarget_upper_body(_facing_subject(math.radians(90.0)))
+    assert math.degrees(t["LShoulderPitch"]) == pytest.approx(0.0, abs=1.0)
+
+
+def test_the_forward_reach_is_monotonic_and_never_saturates() -> None:
+    """A smooth human motion must produce a smooth robot one. The broken version
+    was not merely offset: it saturated at +119.5 for most of the range and then
+    flipped sign to -119.5 at the end."""
+    limit = math.radians(119.5)
+    pitches = [
+        retarget_upper_body(_facing_subject(math.radians(d)))["LShoulderPitch"]
+        for d in range(0, 91, 10)
+    ]
+    assert all(abs(p) < limit - 1e-3 for p in pitches), "a joint hit its limit"
+    for earlier, later in zip(pitches, pitches[1:], strict=False):
+        assert later < earlier + 1e-9, "shoulder pitch must fall as the arm rises"
+    assert math.degrees(pitches[0] - pitches[-1]) == pytest.approx(90.0, abs=2.0)
+
+
+def test_the_swing_is_defined_when_the_bone_lies_on_the_second_axis() -> None:
+    """An arm straight out to the side puts the bone along the roll axis, so the
+    swing angle is undefined and only atan2's SIGNED ZEROS would decide it --
+    which is a coin flip between 0 and 180 deg, and 180 saturates the joint."""
+    from nao_retarget import _swing_twist
+
+    first, second = _swing_twist(0.0, 0.0, 1.0)
+    assert first == 0.0
+    assert second == pytest.approx(math.pi / 2.0)
+    first_neg, second_neg = _swing_twist(-0.0, -0.0, -1.0)
+    assert first_neg == 0.0
+    assert second_neg == pytest.approx(-math.pi / 2.0)
+
+
+def test_the_leg_solve_still_reads_the_unnegated_axis() -> None:
+    """The arm fix must NOT be applied to the legs: NAO's HipPitch is NEGATIVE
+    for a thigh swung forward, so the leg solve wants the back-pointing axis that
+    TorsoFrame.forward already provides."""
+    r = LowerBodyRetargeter()
+    for _ in range(90):
+        r.observe(figure())
+    obs = r.observe(figure(left=(0.0, -0.6, 1.0)))
+    leg = obs.leg("L")
+    assert leg is not None
+    assert leg.as_targets("L")["LHipPitch"] < 0.0

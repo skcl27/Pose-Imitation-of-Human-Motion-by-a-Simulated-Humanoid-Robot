@@ -4,8 +4,11 @@
 input:
   # 0 = first webcam on Linux/macOS. Use a file path like "data/sample.mp4" to replay.
   source: 0
-  width: 1280
-  height: 720
+  # PRD FR-1a: capture at Full HD. MeTRAbs rescales internally, so this costs
+  # capture/copy bandwidth rather than inference time -- drop to 1280x720 if the
+  # capture chain becomes the bottleneck.
+  width: 1920
+  height: 1080
   # Mirror the camera horizontally so the skeleton tracks selfie-style.
   flip_horizontal: true
 
@@ -33,9 +36,45 @@ pose:
   # This pipeline drives a single robot from a single human -- cap detections
   # to 1 to skip inference work on any other people in frame.
   max_detections: 1
-  # Light EMA smoothing applied to raw 3D keypoints (MeTRAbs, unlike MediaPipe,
-  # does not smooth across frames itself). 1.0 = no smoothing.
-  smoothing_alpha: 0.5
+  # Frames between full person-detections. MeTRAbs' detect_poses runs YOLOv4 AND
+  # the pose network; measured here that is 75.9 ms/frame, of which the detector
+  # alone is 39.7 ms -- 52% of the budget, spent re-finding a person who moved a
+  # few pixels. Reusing the previous frame's joints as the box costs 36.2 ms for
+  # bit-identical output (max difference 0.00 mm), which is the difference
+  # the difference between 12.1 and 16.0 FPS end-to-end on a live subject, for a
+  # median joint error of 6.8 mm (p95 120 mm). Measured: interval 3 gives 17.7
+  # FPS but a p95 of 330 mm, and interval 5 gives NO extra speed with a 232 mm
+  # median -- so 2 is the sweet spot, not something larger. 1 = detect always.
+  detect_interval: 2
+  # Largest median per-joint jump (mm) between consecutive frames before a pose
+  # from the tracked box is disbelieved and a full re-detection is run instead.
+  # estimate_poses has no detector, so given a stale box it will happily return a
+  # confident skeleton of an empty room; this is what stops the robot chasing a
+  # phantom after you walk away. Measured: 0 phantom poses at every interval.
+  max_joint_jump_mm: 300.0
+  # Smoothing of raw 3D keypoints (MeTRAbs, unlike MediaPipe, does not smooth
+  # across frames itself). This used to be a fixed-alpha EMA, whose group delay
+  # is (1-alpha)/alpha samples NO MATTER what the subject is doing: measured at
+  # this pipeline's real rate of 14.3 FPS (70.1 ms/frame), alpha 0.5 cost 70 ms
+  # -- 47% of runtime.latency_budget_ms below, spent before inference is even
+  # counted, and visible as the robot lagging the human.
+  #
+  # The 1e ("One Euro") filter makes the cutoff track speed instead, so the
+  # delay is spent only while the subject is still. See src/utils/filtering.py.
+  smoothing:
+    # Cutoff (Hz) approached when the subject is motionless. Raise it if a HELD
+    # pose still jitters; lowering it buys smoothness at rest for free, because
+    # a still subject has no motion to delay.
+    min_cutoff: 1.0
+    # How hard speed opens the cutoff, in Hz per (mm/s) -- keypoints are in
+    # MILLIMETRES, so a brisk limb runs 1000-2000 mm/s and 0.005 turns that into
+    # +5 to +10 Hz. Sampling at 14.3 FPS puts Nyquist at 7.2 Hz, so that range
+    # is the difference between "smoothed" and "pass-through". RAISE THIS FIRST
+    # if the robot still feels late.
+    beta: 0.005
+    # Cutoff (Hz) for the velocity estimate itself, so one noisy frame cannot
+    # punch the filter wide open. Rarely needs changing.
+    d_cutoff: 1.0
   # Refuse to start on a machine with no GPU visible to TensorFlow rather than
   # silently falling back to a much-too-slow CPU run. Only relevant when
   # use_metrabs is true.
@@ -59,6 +98,24 @@ webots_bridge:
   enabled: true
   host: 127.0.0.1
   port: 8765
+
+webots:
+  # Start Webots on the project world as part of `python run.py`, so one command
+  # brings up the whole demo (PRD FR-9 / acceptance criterion 1). An already-open
+  # Webots is attached to rather than duplicated, so leaving this on is safe even
+  # when following the "open Webots first" flow in docs/RUN_INSTRUCTIONS.md.
+  # Override per-run with --launch-webots / --no-launch-webots.
+  launch: true
+  # Path to the world file; empty = main/worlds/<project>.wbt.
+  world: null
+  # Seconds to let the world load before the pipeline starts streaming. UDP is
+  # connectionless, so frames sent before the controller binds its socket are
+  # dropped on the floor rather than queued.
+  startup_delay_s: 4.0
+  # Passed to Webots as --mode. "realtime" so the simulation actually plays:
+  # Webots reopens a world in whatever run state it was saved in, and a world
+  # saved while paused never steps, so the controller never binds its socket.
+  mode: realtime
 
 # Real-time walking / turning (Python side: cue extraction + streaming).
 #

@@ -594,8 +594,26 @@ class BalanceController:
     # leans further and further over. That is exactly what happened here -- 70
     # seconds of monotonically growing forward tilt with the correction saturated
     # the whole time -- and nothing in the logs said so. Now it does.
-    DIVERGENCE_S = 3.0          # how long tilt must keep growing to count
-    DIVERGENCE_GROWTH = 0.10    # rad it must grow by over that window
+    # How long tilt must keep growing to count as divergence, PER AXIS.
+    #
+    # These are not the same number because the two axes fail on completely
+    # different timescales, and using the pitch figure for roll made the detector
+    # structurally incapable of catching a lateral fall.
+    #
+    # The evidence: the fore/aft divergence that set PITCH_SIGN took 70 s to put
+    # the robot down -- the sole is long in x, so the CoM has a long way to travel
+    # and the loop has to push it the whole way. A lateral divergence observed on
+    # 2026-09-03 (logs/webots_joint_trajectory_1788431474.csv, rows 2865-2925) went
+    # from the first non-zero roll correction to both feet off the ground in 1.2 s,
+    # because the foot is narrow in y and the CoM only has to cross ~30 mm. With a
+    # 3.0 s window the detector needs the robot to keep diverging for more than
+    # twice as long as the fall actually lasts, so it never fires and the one
+    # instrument that exists for confirming ROLL_SIGN is silent exactly when it
+    # matters.
+    DIVERGENCE_S = {"pitch": 3.0, "roll": 0.6}
+    # Rad the tilt must grow by over that window. Scaled with the window so both
+    # axes describe a comparable rate rather than a comparable displacement.
+    DIVERGENCE_GROWTH = {"pitch": 0.10, "roll": 0.05}
     _SATURATION_FRAC = 0.9      # "at the clamp" means this fraction of it
 
     def diverging(self) -> str:
@@ -613,20 +631,21 @@ class BalanceController:
         this class deliberately does not keep a clock.
         """
         for axis, value, key in (("pitch", pitch, "pitch"), ("roll", roll, "roll")):
+            window = self.DIVERGENCE_S[axis]
             history = self._tilt_history.setdefault(axis, [])
             history.append((now_s, abs(value)))
-            while history and (now_s - history[0][0]) > self.DIVERGENCE_S:
+            while history and (now_s - history[0][0]) > window:
                 history.pop(0)
-            if len(history) < 3 or (history[-1][0] - history[0][0]) < self.DIVERGENCE_S * 0.8:
+            if len(history) < 3 or (history[-1][0] - history[0][0]) < window * 0.8:
                 continue
             growth = history[-1][1] - history[0][1]
             clamp = (self.params.max_pitch_corr if axis == "pitch"
                      else self.params.max_roll_corr)
             saturated = abs(self._state[key]) >= self._SATURATION_FRAC * clamp
-            if growth > self.DIVERGENCE_GROWTH and saturated:
+            if growth > self.DIVERGENCE_GROWTH[axis] and saturated:
                 self._divergence = (
                     f"balance is DIVERGING on {axis}: |{axis}| grew "
-                    f"{growth:+.3f} rad over {self.DIVERGENCE_S:.0f}s while the "
+                    f"{growth:+.3f} rad over {window:.1f}s while the "
                     f"correction sat at its clamp ({self._state[key]:+.3f}). That is "
                     f"the signature of an inverted sign -- check "
                     f"BalanceController.{axis.upper()}_SIGN against which way the "

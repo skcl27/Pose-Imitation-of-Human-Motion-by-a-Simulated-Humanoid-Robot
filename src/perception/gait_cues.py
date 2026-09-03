@@ -86,7 +86,6 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
 
 from src.type_defs import Keypoint, PoseFrame
 
@@ -132,7 +131,7 @@ class GaitCommand:
     body_yaw_rad: float = 0.0
     yaw_conf: float = 0.0
 
-    def as_dict(self) -> Dict[str, object]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "state": self.state,
             "cadence_hz": round(self.cadence_hz, 4),
@@ -250,10 +249,10 @@ class GaitCueExtractor:
         self.start_cycles = int(start_cycles)
 
         # (timestamp_s, normalized knee-differential signal s)
-        self._hist: Deque[Tuple[float, float]] = deque()
-        self._cross_times: Deque[float] = deque(maxlen=6)
+        self._hist: deque[tuple[float, float]] = deque()
+        self._cross_times: deque[float] = deque(maxlen=6)
         self._last_sign: int = 0
-        self._scale_ema: Optional[float] = None  # smoothed body width
+        self._scale_ema: float | None = None  # smoothed body width
         self._yaw_ema: float = 0.0                # smoothed torso yaw (rad)
         self._yaw_seen: bool = False
         # Self-calibrated reference length of each yaw segment (shoulders, hips).
@@ -317,13 +316,13 @@ class GaitCueExtractor:
         self._state = "idle"
 
     # -- internals ----------------------------------------------------------
-    def _confidence(self, kps: Dict[str, Keypoint]) -> float:
+    def _confidence(self, kps: dict[str, Keypoint]) -> float:
         vis = [kps[n].visibility for n in _REQUIRED if n in kps]
         if len(vis) < len(_REQUIRED):
             return 0.0
         return sum(1.0 for v in vis if v >= 0.5) / len(_REQUIRED)
 
-    def _body_scale(self, kps: Dict[str, Keypoint]) -> float:
+    def _body_scale(self, kps: dict[str, Keypoint]) -> float:
         """Smoothed body width (shoulder span, hip span fallback) for normalization."""
         width = 0.0
         if "left_shoulder" in kps and "right_shoulder" in kps:
@@ -337,7 +336,7 @@ class GaitCueExtractor:
         )
         return max(self._scale_ema, 1e-3)
 
-    def _knee_diff_signal(self, kps: Dict[str, Keypoint], scale: float) -> float:
+    def _knee_diff_signal(self, kps: dict[str, Keypoint], scale: float) -> float:
         """(left-knee height − right-knee height) / scale. Image y is DOWN, so a
         *raised* knee has a smaller y; height = hip_y − knee_y is larger when the
         knee is up. The differential is anti-phase between legs -> immune to arm
@@ -347,7 +346,7 @@ class GaitCueExtractor:
         right_h = hip_y - kps["right_knee"].y
         return (left_h - right_h) / scale
 
-    def _update_yaw(self, kps: Dict[str, Keypoint]) -> Tuple[float, float]:
+    def _update_yaw(self, kps: dict[str, Keypoint]) -> tuple[float, float]:
         """Smoothed torso yaw in radians (full circle) and its confidence.
 
         The shoulder (and hip) line is a body-fixed horizontal segment, so its

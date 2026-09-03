@@ -8,7 +8,6 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Optional
 
 import cv2
 
@@ -21,7 +20,7 @@ from src.perception.visualizer import SkeletonOverlay
 from src.retargeting.mapper import RetargetingMapper, default_joint_limits
 from src.type_defs import JointCommand, Keypoint, PoseFrame
 from src.utils.config import Config
-from src.utils.filtering import ExponentialSmoother
+from src.utils.filtering import ExponentialSmoother, OneEuroFilter
 from src.utils.fps import AdaptiveFPSController
 from src.utils.logger import CsvRunLogger
 from src.webots_bridge import WebotsBridge
@@ -30,26 +29,42 @@ logger = logging.getLogger(__name__)
 
 
 class _KeypointSmoother:
-    """Light per-joint EMA smoothing of raw 3D keypoints.
+    """Speed-adaptive smoothing of raw 3D keypoints.
 
     MeTRAbs, unlike MediaPipe (``smooth_landmarks=True``), does not smooth
-    across frames itself -- each frame's pose is estimated independently. This
-    reuses ``ExponentialSmoother`` (one instance per x/y/z channel) to damp
-    frame-to-frame jitter. ``visibility`` passes through unsmoothed since it
-    reflects the current frame's detection quality, not a lagging quantity.
+    across frames itself -- each frame's pose is estimated independently, so
+    something has to damp the jitter. A fixed-alpha EMA charged a flat
+    ``(1 - alpha) / alpha`` samples of delay for that whether the subject was
+    moving or not: at this pipeline's measured 14.3 FPS, ``alpha = 0.5`` cost
+    70 ms, nearly half of ``runtime.latency_budget_ms``, and the robot visibly
+    lagged the human. ``OneEuroFilter`` spends that delay only while the
+    subject is still, and gets out of the way when they move -- see
+    ``src/utils/filtering.py``.
+
+    ``visibility`` passes through unsmoothed: it reflects the current frame's
+    detection quality, not a lagging physical quantity.
     """
 
-    def __init__(self, alpha: float) -> None:
-        self._x = ExponentialSmoother(alpha=alpha)
-        self._y = ExponentialSmoother(alpha=alpha)
-        self._z = ExponentialSmoother(alpha=alpha)
+    def __init__(
+        self,
+        min_cutoff: float = 1.0,
+        beta: float = 0.005,
+        d_cutoff: float = 1.0,
+    ) -> None:
+        def _f() -> OneEuroFilter:
+            return OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
 
-    def update(self, keypoints: dict) -> dict:
+        self._x, self._y, self._z = _f(), _f(), _f()
+        self._prev_t: float | None = None
+
+    def update(self, keypoints: dict, timestamp_s: float) -> dict:
         if not keypoints:
             return keypoints
-        xs = self._x.update({n: kp.x for n, kp in keypoints.items()})
-        ys = self._y.update({n: kp.y for n, kp in keypoints.items()})
-        zs = self._z.update({n: kp.z for n, kp in keypoints.items()})
+        dt = 0.0 if self._prev_t is None else timestamp_s - self._prev_t
+        self._prev_t = timestamp_s
+        xs = self._x.update({n: kp.x for n, kp in keypoints.items()}, dt)
+        ys = self._y.update({n: kp.y for n, kp in keypoints.items()}, dt)
+        zs = self._z.update({n: kp.z for n, kp in keypoints.items()}, dt)
         return {
             n: Keypoint(x=xs[n], y=ys[n], z=zs[n], visibility=kp.visibility)
             for n, kp in keypoints.items()
@@ -62,7 +77,7 @@ class PipelineOptions:
     show_window: bool = True
     enable_webots: bool = True
     max_frames: int = 0  # 0 = unlimited
-    source_override: Optional[str] = None
+    source_override: str | None = None
 
 
 @dataclass
@@ -108,10 +123,17 @@ class PoseImitationPipeline:
             detector_threshold=float(cfg.get("pose.detector_threshold", 0.3)),
             num_aug=int(cfg.get("pose.num_aug", 1)),
             max_detections=int(cfg.get("pose.max_detections", 1)),
+            detect_interval=int(cfg.get("pose.detect_interval", 5)),
+            box_padding=float(cfg.get("pose.box_padding", 0.18)),
+            max_joint_jump_mm=float(cfg.get("pose.max_joint_jump_mm", 300.0)),
             require_gpu=bool(cfg.get("pose.require_gpu", True)),
             allow_synthetic_fallback=bool(cfg.get("pose.allow_synthetic_fallback", False)),
         )
-        keypoint_smoother = _KeypointSmoother(alpha=float(cfg.get("pose.smoothing_alpha", 0.5)))
+        keypoint_smoother = _KeypointSmoother(
+            min_cutoff=float(cfg.get("pose.smoothing.min_cutoff", 1.0)),
+            beta=float(cfg.get("pose.smoothing.beta", 0.005)),
+            d_cutoff=float(cfg.get("pose.smoothing.d_cutoff", 1.0)),
+        )
         if estimator.is_real:
             logger.info(
                 "Pose estimator: MeTRAbs (real human tracking active). "
@@ -146,7 +168,7 @@ class PoseImitationPipeline:
         run_logger = CsvRunLogger(log_dir)
         logger.info("Logging run to %s", log_dir)
 
-        bridge: Optional[WebotsBridge] = None
+        bridge: WebotsBridge | None = None
         if self.options.enable_webots and bool(cfg.get("webots_bridge.enabled", True)):
             bridge = WebotsBridge(
                 host=str(cfg.get("webots_bridge.host", "127.0.0.1")),
@@ -160,12 +182,19 @@ class PoseImitationPipeline:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
-        latency_window: Deque[float] = deque(maxlen=30)
+        latency_window: deque[float] = deque(maxlen=30)
         max_frames = self.options.max_frames or int(cfg.get("runtime.max_frames", 0))
         exit_code = 0
 
         try:
-            for frame in capture.read_loop(target_period_s=fps_controller.target_period_s):
+            # Pass the CALLABLE, not the value: ``target_period_s`` is a
+            # property, so handing it over directly freezes the period at
+            # whatever it was when the generator was built and the adaptive
+            # controller below can never actually change the capture rate
+            # (FR-1b). See VideoSource.read_loop.
+            for frame in capture.read_loop(
+                target_period_s=lambda: fps_controller.target_period_s
+            ):
                 if self._stop_requested:
                     break
 
@@ -175,7 +204,9 @@ class PoseImitationPipeline:
                 if pose.keypoints:
                     pose = PoseFrame(
                         timestamp_s=pose.timestamp_s,
-                        keypoints=keypoint_smoother.update(pose.keypoints),
+                        keypoints=keypoint_smoother.update(
+                            pose.keypoints, pose.timestamp_s
+                        ),
                         frame_index=pose.frame_index,
                     )
                 run_logger.log_pose(pose)

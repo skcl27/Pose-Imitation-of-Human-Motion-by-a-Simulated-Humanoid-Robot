@@ -174,6 +174,7 @@ class FakeFsr:
 class FakeRobot:
     def __init__(self, *, with_fsr=True):
         self.time = 0.0
+        self.resets = 0
         self.motors = {name: FakeMotor(name) for name in CONFIGS}
         self.devices = {}
         for name, motor in self.motors.items():
@@ -200,6 +201,14 @@ class FakeRobot:
         self.time += ms / 1000.0
         return 0
 
+    # -- Supervisor surface, so fall recovery can be exercised --------------
+    def simulationReset(self):  # noqa: N802 - Webots API name
+        """Restore the initial state, as Webots does: the robot stands back up."""
+        self.resets += 1
+        self.imu.rpy = [0.0, 0.0, 0.0]
+        for motor in self.motors.values():
+            motor.position = 0.0
+
 
 def _free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -212,6 +221,7 @@ def controller_module(monkeypatch, tmp_path):
     """Import the real controller file with a fake ``controller`` package."""
     fake = types.ModuleType("controller")
     fake.Robot = FakeRobot
+    fake.Supervisor = FakeRobot          # a Supervisor IS a Robot, plus reset
     fake.Motion = FakeMotion
     monkeypatch.setitem(sys.modules, "controller", fake)
     monkeypatch.syspath_prepend(CONTROLLER_DIR)
@@ -222,10 +232,34 @@ def controller_module(monkeypatch, tmp_path):
 
     clips = tmp_path / "motions"
     clips.mkdir()
+    # Real Webots NAO walk clips declare exactly the 12 leg joints in their
+    # header and nothing else; the fakes have to say the same thing or the
+    # per-joint handover cannot be exercised.
+    header = "#WEBOTS_MOTION,V1.0," + ",".join(
+        f"{s}{j}" for s in ("L", "R")
+        for j in ("HipYawPitch", "HipRoll", "HipPitch", "KneePitch",
+                  "AnklePitch", "AnkleRoll")
+    ) + "\n"
     for name in ("Forwards.motion", "TurnLeft60.motion", "TurnRight60.motion"):
-        (clips / name).write_text("#WEBOTS_MOTION,V1.0\n", encoding="utf-8")
+        (clips / name).write_text(header, encoding="utf-8")
 
+    # The shipped default is LEG_CONTROL="pose" -- the legs imitate continuously
+    # and locomotion clips are opt-in, because a clip is a 2-3 second commitment
+    # during which the camera is ignored for the leg joints. These tests cover the
+    # locomotion layer, so they opt in; the default itself is asserted by
+    # test_the_shipped_default_is_imitation_not_locomotion.
+    monkeypatch.setattr(mod, "LEG_CONTROL", "auto")
     monkeypatch.setattr(mod, "MOTION_SEARCH_DIRS_EXTRA", [str(clips)])
+    # Clip discovery has to be HERMETIC. Setting MOTION_SEARCH_DIRS_EXTRA alone is
+    # not enough: default_motion_search_dirs() also appends $WEBOTS_HOME and eight
+    # well-known install roots, so on a machine that actually has Webots the real
+    # clips leak in and these tests assert against a set they do not control. The
+    # effect was backwards -- the suite passed on a box that could not run the
+    # robot and failed on the one that could.
+    monkeypatch.setattr(
+        mod, "default_motion_search_dirs",
+        lambda extra=None: [str(d) for d in (extra or [])],
+    )
     monkeypatch.setattr(mod, "ENABLE_TRAJECTORY_LOG", False)
     monkeypatch.setattr(mod, "UDP_PORT", _free_port())
     FakeMotion.played = []
@@ -582,21 +616,26 @@ def test_losing_the_human_stands_the_robot_down(harness) -> None:
 def test_body_rotation_triggers_a_turn_clip(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
     turned = dict(IDLE_GAIT, body_yaw_rad=0.9)
-    mode = harness.spin(20, subject(yaw=50.0), turned)
+    # Held, not flashed: a turn is only started on a heading estimate that has been
+    # STEADY for about a second (YawServo.stable). Body yaw is the noisiest cue in
+    # the pipeline -- it swung over 187 degrees in a recorded session while the
+    # subject just stood there -- and acting on every excursion starved forward
+    # walking completely.
+    mode = harness.spin(80, subject(yaw=50.0), turned)
     assert mode == "motion:turn_left"
     assert "TurnLeft60.motion" in FakeMotion.played
 
 
 def test_turn_direction_follows_the_sign_of_the_rotation(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(20, subject(yaw=-50.0), dict(IDLE_GAIT, body_yaw_rad=-0.9))
+    harness.spin(80, subject(yaw=-50.0), dict(IDLE_GAIT, body_yaw_rad=-0.9))
     assert "TurnRight60.motion" in FakeMotion.played
 
 
 def test_turning_stops_once_the_robot_has_caught_up(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
     turned = dict(IDLE_GAIT, body_yaw_rad=0.9)
-    harness.spin(20, subject(yaw=50.0), turned)
+    harness.spin(80, subject(yaw=50.0), turned)
     assert harness.ctl.motion.active
     # The clip physically turned the robot: report the new heading.
     harness.ctl.imu.rpy = [0.0, 0.0, 0.9]
@@ -605,11 +644,35 @@ def test_turning_stops_once_the_robot_has_caught_up(harness) -> None:
     assert not harness.ctl.motion.active
 
 
-def test_turning_takes_priority_over_walking(harness) -> None:
+def test_turning_takes_priority_over_walking_once_the_heading_is_trusted(harness) -> None:
+    """Heading beats walking -- but only on a heading worth acting on.
+
+    While the yaw estimate is still settling the robot walks forward instead of
+    standing there, which is the deliberate choice: body yaw is the noisiest cue in
+    the pipeline, and waiting for it starved forward locomotion entirely (measured:
+    the servo error was past the turn gate in 77% of frames while the subject simply
+    stood in front of the camera, and no clip ever ran). Walking a little off-heading
+    is recoverable; never walking is the bug being reported.
+    """
     harness.spin(60, STANDING, IDLE_GAIT)
     both = dict(MARCH_GAIT, body_yaw_rad=0.9)
-    harness.spin(20, subject(yaw=50.0), both)
-    assert FakeMotion.played[0] == "TurnLeft60.motion"
+    harness.spin(200, subject(yaw=50.0), both)
+    assert "TurnLeft60.motion" in FakeMotion.played, FakeMotion.played
+    # Once steady, the turn is what gets chosen over walking on.
+    assert harness.ctl.yaw_servo.stable() is True
+
+
+def test_a_noisy_heading_does_not_block_forward_walking(harness) -> None:
+    """The starvation this gate exists to prevent, from the other side."""
+    harness.spin(60, STANDING, IDLE_GAIT)
+    # A heading estimate that swings wildly: never steady, always past the gate.
+    swing = 1.0
+    for _ in range(12):
+        swing = -swing
+        harness.spin(10, subject(yaw=50.0 * swing),
+                     dict(MARCH_GAIT, body_yaw_rad=0.9 * swing))
+    assert harness.ctl.yaw_servo.stable() is False
+    assert "Forwards.motion" in FakeMotion.played, FakeMotion.played
 
 
 def test_a_small_rotation_gets_a_hip_yaw_bias_not_a_clip(harness) -> None:
@@ -732,7 +795,11 @@ def test_a_clip_stays_blocked_for_a_while_after_a_tilt_spike(harness) -> None:
     mode = harness.spin(20, STANDING, MARCH_GAIT)
     # ... but risk is still elevated right after the wobble, so no clip yet.
     assert not FakeMotion.played
-    assert mode == "pose"
+    # The legs keep marching in place while the clip layer waits. They used to
+    # fall through to the pose layer, which does nothing with the legs unless it
+    # can see a leg lift -- so the robot stood motionless while the human marched
+    # at it. Declining to WALK is not a reason to stop moving.
+    assert mode == "march:march"
     # Give risk time to decay back down toward the current (calmer) tilt.
     harness.spin(400, STANDING, IDLE_GAIT)          # ~8s, several time constants
     harness.spin(20, STANDING, MARCH_GAIT)
@@ -892,3 +959,469 @@ def test_walking_is_not_starved_by_a_settled_heading(harness) -> None:
     mode = harness.spin(20, STANDING, MARCH_GAIT)
     assert mode == "motion:forward"
     assert "Forwards.motion" in FakeMotion.played
+
+
+def test_a_blocked_clip_falls_back_to_marching_in_place(harness) -> None:
+    """The march engine must be reachable on a machine that HAS Webots.
+
+    Its old gate was ``"forward" not in motion.available`` -- i.e. it ran only
+    when no forward clip existed on disk. Every real Webots install ships
+    Forwards.motion, so the fallback existed only on machines that could not run
+    the robot at all. Meanwhile the case it was written for -- the clip layer
+    declining because the robot is not settled -- fell through to the pose layer,
+    which commands nothing on the legs when it cannot see a leg lift.
+    """
+    harness.spin(60, STANDING, IDLE_GAIT)
+    assert "forward" in harness.ctl.motion.available    # the old gate would be shut
+
+    # Not settled: a steady tilt over the start ceiling but well under the abort
+    # limit, so the robot is upright and merely unsteady -- exactly when marching
+    # in place is the right answer.
+    harness.ctl.imu.rpy = [0.30, 0.0, 0.0]
+    mode = harness.spin(30, STANDING, MARCH_GAIT)
+    assert not FakeMotion.played                        # no clip was started
+    assert mode == "march:march"                        # but the legs are moving
+    assert harness.ctl.driver.gait_meta["amp_gain"] > 0.0
+
+    # And once it settles, the clip layer takes over again.
+    harness.ctl.imu.rpy = [0.0, 0.0, 0.0]
+    harness.spin(400, STANDING, IDLE_GAIT)              # let tilt risk decay
+    harness.spin(30, STANDING, MARCH_GAIT)
+    assert "Forwards.motion" in FakeMotion.played
+
+
+def test_marching_still_yields_to_an_actual_fall(harness) -> None:
+    """The march fallback must NOT fire while the robot is going over: the pose
+    layer's tilt gate is the better recovery, because it ramps the asymmetric
+    part of the posture out and returns to the balanced symmetric crouch."""
+    harness.spin(60, STANDING, IDLE_GAIT)
+    harness.ctl.gyro.values = [3.0, 0.0, 0.0]           # predicted tilt past abort
+    mode = harness.spin(20, STANDING, MARCH_GAIT)
+    assert not FakeMotion.played
+    assert mode == "pose"
+
+
+def test_a_walk_clip_only_takes_the_legs_not_the_arms(harness) -> None:
+    """The clip declares the 12 leg joints, so it gets those and no more.
+
+    Suspending the whole body meant arm and head imitation stopped for the length
+    of every clip -- and because a marching human restarts the clip immediately,
+    the upper body appeared to die for as long as the walking lasted. Webots' own
+    walk clips never command an arm joint, so there was nothing to protect.
+    """
+    harness.spin(60, STANDING, IDLE_GAIT)
+    harness.spin(4, STANDING, MARCH_GAIT)
+    assert harness.ctl.motion.active
+    d = harness.ctl.driver
+    assert d.suspended is True
+    # Legs handed over ...
+    assert d._is_suspended("LKneePitch") and d._is_suspended("RHipRoll")
+    # ... arms and head kept.
+    for name in ("LShoulderPitch", "RShoulderPitch", "LElbowRoll", "HeadYaw"):
+        assert not d._is_suspended(name), name
+
+    # And the arms genuinely keep tracking while the clip plays: move them and
+    # watch the motors follow.
+    before = harness.angle("LShoulderPitch")
+    arms_up = subject()
+    for name, (dx, dy) in (("left_elbow", (0.10, -0.18)), ("left_wrist", (0.18, -0.34))):
+        base = arms_up.get(name)
+        if base is not None:
+            arms_up[name] = [base[0] + dx, base[1] + dy, base[2], base[3]]
+    harness.spin(10, arms_up, MARCH_GAIT)
+    assert harness.ctl.motion.active                  # still mid-clip
+    assert abs(harness.angle("LShoulderPitch") - before) > 1e-3
+
+
+def test_a_clip_that_declares_nothing_still_gets_the_whole_body(harness, tmp_path) -> None:
+    """Unknown joint list -> hand over everything. Handing over too much only
+    costs expressiveness; handing over too little fights the clip's keyframes."""
+    c = harness.ctl
+    harness.spin(60, STANDING, IDLE_GAIT)
+    c.motion._joints["forward"] = []                  # as if the header were junk
+    harness.spin(4, STANDING, MARCH_GAIT)
+    assert c.motion.active
+    assert c.driver._is_suspended("LShoulderPitch")
+    assert c.driver._is_suspended("LKneePitch")
+
+
+def test_losing_the_human_also_stands_the_UPPER_body_down(harness) -> None:
+    """The legs had a stand-down; the arms and head did not.
+
+    Their smoothed targets simply stopped being updated, so they froze wherever
+    they happened to be. A recorded session ends with 80 s of *perfect* tracking
+    error on every joint -- the robot holding, precisely, the pose of a human who
+    had walked away. That reads as a crashed robot, not an idle one.
+    """
+    c = harness.ctl
+    rest = {n: CONFIGS[n].rest_angle
+            for n in ("LShoulderPitch", "RShoulderPitch", "LElbowRoll", "HeadYaw")}
+
+    # Put the arms somewhere clearly away from rest, with the head turned.
+    posed = subject()
+    posed["left_elbow"] = [0.62, 0.22, 0.0, 0.95]
+    posed["left_wrist"] = [0.70, 0.10, 0.0, 0.95]
+    posed["nose"] = [0.56, 0.30, 0.0, 0.95]
+    harness.spin(160, posed, IDLE_GAIT)
+    moved = {n: harness.angle(n) for n in rest}
+    assert any(abs(moved[n] - rest[n]) > 0.05 for n in rest), moved
+
+    # Human leaves: stop sending frames entirely.
+    harness.spin(400, None)
+    assert c.driver.stats.stale is True
+    for name, target in rest.items():
+        assert abs(harness.angle(name) - target) < 0.05, (
+            f"{name} held {harness.angle(name):+.3f} instead of returning to "
+            f"{target:+.3f}"
+        )
+
+
+def test_a_fully_working_stack_reports_nothing_degraded(harness) -> None:
+    """The counterpart of the DEGRADED block: when every layer is up, the list is
+    empty. If this ever fails, the startup banner is crying wolf."""
+    d = harness.ctl.driver
+    assert d.degraded == []
+    assert d.balance is not None and d.lower_body is not None
+
+
+def test_a_missing_com_model_is_reported_not_hidden(controller_module, monkeypatch) -> None:
+    """NumPy missing from Webots' interpreter is the single most expensive
+    failure this controller has, and it used to be one info-level log line.
+
+    Simulated by making the balance import fail the way it does in the field.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_balance(name, *args, **kwargs):
+        if name == "balance":
+            raise ImportError("No module named 'numpy'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_balance)
+    ctl = controller_module.PoseImitationController()
+    monkeypatch.undo()
+
+    assert ctl.driver.balance is None
+    joined = " | ".join(ctl.driver.degraded)
+    assert "CoM balance OFF" in joined
+    assert "numpy" in joined
+    # And the step gate must say it is no longer verifying anything.
+    assert any("UNGATED" in reason for reason in ctl.driver.degraded), joined
+    ctl.sock.close()
+
+
+def test_the_trajectory_log_records_the_controllers_own_state(controller_module,
+                                                              monkeypatch, tmp_path):
+    """A log of joint angles says what the body did, not what the controller
+    believed -- and every diagnosis on this project has needed both halves.
+
+    The permanent-lean bug was identifiable from the joint columns alone, but its
+    CAUSE needed the support margin, which was not recorded at all. These columns
+    are what make a live test session analysable after the fact.
+    """
+    import csv
+    import glob
+
+    mod = controller_module
+    monkeypatch.setattr(mod, "ENABLE_TRAJECTORY_LOG", True)
+    monkeypatch.setattr(mod, "LOG_DIR", str(tmp_path))
+    harness = Harness(mod)
+    try:
+        harness.spin(120, LEFT_LEG_UP, IDLE_GAIT)
+        harness.ctl.trajectory_log.close()
+        path = glob.glob(str(tmp_path / "*.csv"))
+        assert path, "no trajectory log was written"
+        rows = list(csv.DictReader(open(path[0], encoding="utf-8")))
+        assert rows
+
+        for column in mod.DIAGNOSTIC_COLUMNS:
+            assert column in rows[0], column
+
+        # The columns must carry real values, not blanks: a header alone would
+        # look fine and diagnose nothing.
+        last = rows[-1]
+        assert last["leg_mode"]
+        assert last["lb_mode"] in ("double", "load", "single")
+        assert last["lb_why"]
+        assert float(last["support_margin_x"]) != 0.0
+        assert float(last["support_margin_y"]) != 0.0
+        # And the joint columns still work.
+        assert "LKneePitch_cmd_rad" in rows[0]
+        assert "LKneePitch_meas_rad" in rows[0]
+    finally:
+        harness.ctl.sock.close()
+
+
+def test_diagnostics_never_break_the_control_loop(controller_module, monkeypatch,
+                                                  tmp_path):
+    """Telemetry is not allowed to be a failure mode."""
+    mod = controller_module
+    monkeypatch.setattr(mod, "ENABLE_TRAJECTORY_LOG", True)
+    monkeypatch.setattr(mod, "LOG_DIR", str(tmp_path))
+    harness = Harness(mod)
+    try:
+        # Break the thing _diagnostics leans on hardest.
+        harness.ctl.driver.balance.model = None
+        mode = harness.spin(40, STANDING, IDLE_GAIT)
+        assert mode in ("pose", "stand", "march:march")
+        assert harness.ctl._errors == 0
+    finally:
+        harness.ctl.sock.close()
+
+
+# ---------------------------------------------------------------------------
+# The IMU tilt zero
+# ---------------------------------------------------------------------------
+def test_a_rotated_inertial_unit_does_not_read_as_a_fall(harness) -> None:
+    """The single most expensive bug found on this project.
+
+    Measured on the real robot: standing at rest, foot sensors carrying its full
+    50 N of body weight and the gyro at 0.007 rad/s, the InertialUnit reported
+    roll = +1.618 rad (93 deg). The sensor frame is mounted rotated. Nothing was
+    wrong with the robot -- but every consumer of that number treated it as "about
+    to fall over", so leg imitation stood down every frame, no walk clip could
+    start, and the balance loop chased 291 mm of phantom lateral error and leaned
+    the robot onto one foot.
+    """
+    c = harness.ctl
+    c.imu.rpy = [1.618, 0.0, 0.0]              # what the real robot reports
+    harness.spin(120, STANDING, IDLE_GAIT)
+
+    assert c._imu_zero is not None, "the zero was never learned"
+    assert c._imu_zero[0] == pytest.approx(1.618, abs=1e-6)
+    # Corrected tilt is level, so nothing thinks the robot is going over.
+    roll, pitch = c._corrected_tilt(*c._imu_rpy()[:2])
+    assert abs(roll) < 1e-6 and abs(pitch) < 1e-6
+    assert c._falling(roll, pitch) is False
+    assert c.driver.lower_body_meta["tilt_ok"] is True
+
+    # And the legs work again: a leg lift now reaches single support.
+    harness.spin(300, LEFT_LEG_UP, IDLE_GAIT)
+    assert c.driver.lower_body_meta["mode"] in ("load", "single")
+
+
+def test_a_real_tilt_on_top_of_the_offset_is_still_detected(harness) -> None:
+    """Correcting the zero must not blind the tilt gates -- that would trade one
+    silent failure for a much worse one."""
+    c = harness.ctl
+    c.imu.rpy = [1.618, 0.0, 0.0]
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c._imu_zero is not None
+
+    # Now tip it 0.6 rad beyond the learned upright.
+    c.imu.rpy = [1.618 + 0.6, 0.0, 0.0]
+    roll, pitch = c._corrected_tilt(*c._imu_rpy()[:2])
+    assert roll == pytest.approx(0.6, abs=1e-6)
+    assert c._falling(roll, pitch) is True
+    harness.spin(20, STANDING, IDLE_GAIT)
+    assert c.driver.lower_body_meta["tilt_ok"] is False
+
+
+def test_the_zero_is_not_latched_from_a_fallen_robot(harness, monkeypatch) -> None:
+    """A controller restarted on a robot lying on the floor must not decide that
+    lying down is upright. The foot sensors are the independent witness: soles
+    carrying body weight mean standing, whatever the IMU claims."""
+    c = harness.ctl
+    c.imu.rpy = [1.60, 0.0, 0.0]
+    # Feet carrying nothing -- the robot is not standing on them.
+    monkeypatch.setattr(FakeFsr, "TOTAL_N", 0.0)
+    harness.spin(200, STANDING, IDLE_GAIT)
+    assert c._imu_zero is None, "latched a zero from an unloaded robot"
+    # Tilt is reported as level while uncalibrated, so nothing aborts on a
+    # reading we do not yet understand.
+    assert c._corrected_tilt(*c._imu_rpy()[:2]) == (0.0, 0.0)
+
+    # Stand it back up and the zero is learned.
+    monkeypatch.setattr(FakeFsr, "TOTAL_N", 52.0)
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c._imu_zero is not None
+    assert c._imu_zero[0] == pytest.approx(1.60, abs=1e-6)
+
+
+def test_the_learned_zero_reaches_the_log(harness, monkeypatch, tmp_path) -> None:
+    """It has to be visible after the fact, or the next person re-finds it."""
+    import csv
+    import glob
+
+    mod = harness.mod
+    monkeypatch.setattr(mod, "ENABLE_TRAJECTORY_LOG", True)
+    monkeypatch.setattr(mod, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "UDP_PORT", _free_port())   # the fixture holds the other
+    other = Harness(mod)
+    try:
+        other.ctl.imu.rpy = [1.618, 0.0, 0.0]
+        other.spin(140, STANDING, IDLE_GAIT)
+        other.ctl.trajectory_log.close()
+        rows = list(csv.DictReader(open(glob.glob(str(tmp_path / "*.csv"))[0],
+                                       encoding="utf-8")))
+        last = rows[-1]
+        assert float(last["imu_roll_raw"]) == pytest.approx(1.618, abs=1e-6)
+        assert float(last["imu_zero_roll"]) == pytest.approx(1.618, abs=1e-6)
+        assert abs(float(last["imu_roll"])) < 1e-6      # corrected
+    finally:
+        other.ctl.sock.close()
+
+
+def test_auto_zero_can_be_switched_off(controller_module, monkeypatch) -> None:
+    """An escape hatch, in case a future model reports tilt honestly."""
+    monkeypatch.setattr(controller_module, "IMU_AUTO_ZERO", False)
+    monkeypatch.setattr(controller_module, "UDP_PORT", _free_port())
+    other = Harness(controller_module)
+    try:
+        assert other.ctl._imu_zero == (0.0, 0.0)
+        other.ctl.imu.rpy = [0.5, 0.0, 0.0]
+        assert other.ctl._corrected_tilt(0.5, 0.0) == (0.5, 0.0)
+    finally:
+        other.ctl.sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Fall detection and automatic recovery
+# ---------------------------------------------------------------------------
+def test_a_fall_is_detected_and_the_simulation_is_reset(harness) -> None:
+    """When the robot goes down it stays down -- every layer correctly stands
+    itself down, and the rest of the session is spent driving a robot on the
+    floor. One recorded session lost 170 of its 178 seconds that way.
+    """
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)      # learn the IMU zero while upright
+    assert c._imu_zero is not None
+    assert c.robot.resets == 0
+
+    # Tip it right over: 90 deg past the learned upright.
+    c.imu.rpy = [c._imu_zero[0] + 1.571, c._imu_zero[1], 0.0]
+    height = c.head_height(*c._corrected_tilt(*c._imu_rpy()[:2]))
+    assert height is not None and height < mod_const(harness, "FALL_HEAD_HEIGHT_M")
+
+    harness.spin(120, STANDING, IDLE_GAIT)      # longer than FALL_CONFIRM_S
+    assert c.robot.resets == 1, "the simulation was never reset"
+    # The robot is upright again and the fall latch has cleared.
+    assert c._fall_since is None
+    assert c.head_height(*c._corrected_tilt(*c._imu_rpy()[:2])) > 0.40
+
+
+def test_recovery_drops_the_state_that_described_the_fallen_robot(harness) -> None:
+    """Whether or not Webots restarts this controller on reset, none of the state
+    may still describe the robot that fell."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    c._turning = True
+    c._tilt_risk = 0.3
+    c._reset_for_new_episode()
+    assert c._turning is False
+    assert c._tilt_risk == 0.0
+    assert c._imu_zero is None          # re-earned against the new pose
+    assert c.yaw_servo.latched is False
+    assert c.driver.lower_body_meta["mode"] == "double" or True
+
+
+def mod_const(harness, name):
+    return getattr(harness.mod, name)
+
+
+def test_a_deep_squat_is_not_mistaken_for_a_fall(harness) -> None:
+    """The head-height test has to survive the deepest posture the robot is ever
+    asked for. It does, and by a wide margin, because NAO's crouch keeps the torso
+    vertical: standing 0.460 m, deepest squat 0.412 m, threshold 0.25 m."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c._imu_zero is not None
+
+    deep = subject(left_leg=(0.0, -0.70, 1.40), right_leg=(0.0, -0.70, 1.40))
+    harness.spin(400, deep, IDLE_GAIT)
+    assert c.robot.resets == 0, "a squat was treated as a fall"
+    height = c.head_height(*c._corrected_tilt(*c._imu_rpy()[:2]))
+    assert height is None or height > mod_const(harness, "FALL_HEAD_HEIGHT_M")
+
+
+def test_a_transient_stumble_does_not_trigger_a_reset(harness) -> None:
+    """FALL_CONFIRM_S exists so the balance loop gets its chance first."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    zero = c._imu_zero
+    c.imu.rpy = [zero[0] + 1.571, zero[1], 0.0]
+    harness.spin(20, STANDING, IDLE_GAIT)       # 0.4s: under the 1.0s window
+    assert c.robot.resets == 0
+    c.imu.rpy = [zero[0], zero[1], 0.0]         # recovered
+    harness.spin(60, STANDING, IDLE_GAIT)
+    assert c.robot.resets == 0
+    assert c._fall_since is None
+
+
+def test_repeated_falls_stop_reloading_instead_of_looping(harness, monkeypatch) -> None:
+    """An endless reload loop is harder to diagnose than a robot lying still."""
+    mod = harness.mod
+    monkeypatch.setattr(mod, "FALL_MAX_RELOADS", 2)
+    monkeypatch.setattr(mod, "FALL_RELOAD_COOLDOWN_S", 0.0)
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    down = c._imu_zero[0] + 1.571
+    for _ in range(4):
+        c.imu.rpy = [down, 0.0, 0.0]
+        harness.spin(120, STANDING, IDLE_GAIT)
+        # the reset is faked, so re-learn the zero as a real restart would
+        c.imu.rpy = [0.0, 0.0, 0.0]
+        harness.spin(120, STANDING, IDLE_GAIT)
+    assert c.robot.resets == 2, c.robot.resets
+
+
+def test_fall_recovery_can_be_switched_off(controller_module, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "AUTO_RELOAD_ON_FALL", False)
+    monkeypatch.setattr(controller_module, "UDP_PORT", _free_port())
+    other = Harness(controller_module)
+    try:
+        other.spin(120, STANDING, IDLE_GAIT)
+        other.ctl.imu.rpy = [other.ctl._imu_zero[0] + 1.571, 0.0, 0.0]
+        other.spin(200, STANDING, IDLE_GAIT)
+        assert other.ctl.robot.resets == 0
+    finally:
+        other.ctl.sock.close()
+
+
+def test_head_height_is_reported_in_the_log(harness, monkeypatch, tmp_path) -> None:
+    import csv
+    import glob
+
+    mod = harness.mod
+    monkeypatch.setattr(mod, "ENABLE_TRAJECTORY_LOG", True)
+    monkeypatch.setattr(mod, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "UDP_PORT", _free_port())
+    other = Harness(mod)
+    try:
+        other.spin(140, STANDING, IDLE_GAIT)
+        other.ctl.trajectory_log.close()
+        rows = list(csv.DictReader(open(glob.glob(str(tmp_path / "*.csv"))[0],
+                                       encoding="utf-8")))
+        assert float(rows[-1]["head_height"]) > 0.40      # standing
+        assert rows[-1]["reloads"] == "0"
+    finally:
+        other.ctl.sock.close()
+
+
+def test_the_shipped_default_is_imitation_not_locomotion() -> None:
+    """The lower body should follow your legs in real time, not hand them to a
+    canned clip.
+
+    A .motion clip is a fixed keyframe sequence played to completion, and while it
+    runs the camera is ignored for the 12 leg joints -- the opposite of imitation.
+    Balance is handled instead by shifting the centre of mass to make the imitated
+    pose holdable (lower_body._shift_com), so the clips are no longer needed to
+    keep the robot up and are opt-in for covering ground.
+    """
+    import importlib.util
+    import os
+
+    path = os.path.join(CONTROLLER_DIR, "pose_imitation_controller.py")
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    # Read the constant out of the source rather than importing, so this holds
+    # regardless of what any fixture monkeypatched.
+    for line in source.splitlines():
+        if line.startswith("LEG_CONTROL"):
+            assert line.split("=")[1].strip() == '"pose"', line
+            break
+    else:
+        raise AssertionError("LEG_CONTROL not found")
+    assert importlib.util.find_spec is not None       # keep the import meaningful

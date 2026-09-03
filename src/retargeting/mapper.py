@@ -20,20 +20,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
 
 from src.type_defs import JointCommand, Keypoint, PoseFrame
 
 
-def _vector(a: Keypoint, b: Keypoint) -> Tuple[float, float, float]:
+def _vector(a: Keypoint, b: Keypoint) -> tuple[float, float, float]:
     return (b.x - a.x, b.y - a.y, b.z - a.z)
 
 
-def _norm(v: Tuple[float, float, float]) -> float:
+def _norm(v: tuple[float, float, float]) -> float:
     return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2) + 1e-8
 
 
-def _horizontal_extent(v: Tuple[float, float, float]) -> float:
+def _horizontal_extent(v: tuple[float, float, float]) -> float:
     """Lateral-or-forward magnitude of a vector, ignoring its vertical (y)
     component. Using both x and z (rather than just x, as the old
     MediaPipe-era code did) correctly measures a limb's swing even when it
@@ -41,7 +40,13 @@ def _horizontal_extent(v: Tuple[float, float, float]) -> float:
     return math.hypot(v[0], v[2])
 
 
-def _angle_between(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+def _elevation(v: tuple[float, float, float]) -> float:
+    """Angle of a vector above the horizontal plane (y is DOWN in camera coords,
+    so a vector pointing up has a negative y and a positive elevation)."""
+    return math.atan2(-v[1], _horizontal_extent(v) + 1e-6)
+
+
+def _angle_between(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
     dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     cosine = max(-1.0, min(1.0, dot / (_norm(a) * _norm(b))))
     return math.acos(cosine)
@@ -55,7 +60,7 @@ class JointLimit:
 
 @dataclass
 class RetargetingMapper:
-    joint_limits: Dict[str, JointLimit]
+    joint_limits: dict[str, JointLimit]
 
     def _clip(self, joint: str, angle: float) -> float:
         lim = self.joint_limits.get(joint)
@@ -93,15 +98,14 @@ class RetargetingMapper:
         right_knee_vec = _vector(kp["right_hip"], kp["right_knee"])
 
         raw = {
-            "LShoulderPitch": math.atan2(-left_upper[1], _horizontal_extent(left_upper) + 1e-6),
-            "RShoulderPitch": math.atan2(-right_upper[1], _horizontal_extent(right_upper) + 1e-6),
+            "LShoulderPitch": _elevation(left_upper),
+            "RShoulderPitch": _elevation(right_upper),
             "LElbowRoll": math.pi - _angle_between(left_upper, left_lower),
             "RElbowRoll": -(math.pi - _angle_between(right_upper, right_lower)),
             "LHipPitch": math.atan2(left_knee_vec[1], _horizontal_extent(left_knee_vec) + 1e-6),
             "RHipPitch": math.atan2(right_knee_vec[1], _horizontal_extent(right_knee_vec) + 1e-6),
             "TorsoPitch": 0.5 * (
-                math.atan2(-left_hip_to_shoulder[1], _horizontal_extent(left_hip_to_shoulder) + 1e-6)
-                + math.atan2(-right_hip_to_shoulder[1], _horizontal_extent(right_hip_to_shoulder) + 1e-6)
+                _elevation(left_hip_to_shoulder) + _elevation(right_hip_to_shoulder)
             ),
         }
 
@@ -113,7 +117,7 @@ class RetargetingMapper:
         )
 
 
-def default_joint_limits() -> Dict[str, JointLimit]:
+def default_joint_limits() -> dict[str, JointLimit]:
     deg = math.radians
     return {
         "LShoulderPitch": JointLimit(deg(-119), deg(119)),

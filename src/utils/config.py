@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import yaml
 
 
 @dataclass(frozen=True)
 class Config:
-    raw: Dict[str, Any]
+    raw: dict[str, Any]
 
     def get(self, key: str, default: Any = None) -> Any:
         node: Any = self.raw
@@ -23,5 +23,5 @@ class Config:
 def load_config(config_path: str | Path) -> Config:
     path = Path(config_path)
     with path.open("r", encoding="utf-8") as f:
-        data: Optional[Dict[str, Any]] = yaml.safe_load(f)
+        data: dict[str, Any] | None = yaml.safe_load(f)
     return Config(raw=data or {})

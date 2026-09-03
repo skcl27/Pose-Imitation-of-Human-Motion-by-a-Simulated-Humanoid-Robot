@@ -6,6 +6,7 @@ action. The actual Webots Motion playback is exercised on the test machine.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -14,10 +15,22 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
 from walk_motion import (  # noqa: E402
+    STAND,
+    LocomotionParams,
+    YawServo,
     default_motion_search_dirs,
     find_motion_files,
-    select_action,
+    motion_joints,
+    motion_nominal_yaw,
+    plan_action,
+    wrap_pi,
 )
+
+CLIPS = {
+    "forward": "/w/Forwards.motion",
+    "turn_left": "/w/TurnLeft60.motion",
+    "turn_right": "/w/TurnRight60.motion",
+}
 
 
 def _touch(path: str) -> None:
@@ -72,45 +85,6 @@ def test_default_search_dirs_dedup() -> None:
 
 def _gait(state="march", cadence=1.0, conf=0.9, turn=0.0):
     return {"state": state, "cadence_hz": cadence, "conf": conf, "turn": turn}
-
-
-def test_select_action_forward_when_marching() -> None:
-    assert select_action(_gait()) == "forward"
-
-
-def test_select_action_none_when_idle_or_unconfident_or_stopped() -> None:
-    assert select_action(None) is None
-    assert select_action(_gait(state="idle")) is None
-    assert select_action(_gait(cadence=0.0)) is None
-    assert select_action(_gait(conf=0.2)) is None
-
-
-def test_select_action_turns_on_strong_turn_cue() -> None:
-    assert select_action(_gait(turn=0.6)) == "turn_left"
-    assert select_action(_gait(turn=-0.6)) == "turn_right"
-    # weak turn cue stays forward
-    assert select_action(_gait(turn=0.1)) == "forward"
-
-
-# ---------------------------------------------------------------------------
-# Yaw servo / locomotion planning
-# ---------------------------------------------------------------------------
-import math  # noqa: E402
-
-from walk_motion import (  # noqa: E402
-    STAND,
-    LocomotionParams,
-    YawServo,
-    motion_nominal_yaw,
-    plan_action,
-    wrap_pi,
-)
-
-CLIPS = {
-    "forward": "/w/Forwards.motion",
-    "turn_left": "/w/TurnLeft60.motion",
-    "turn_right": "/w/TurnRight60.motion",
-}
 
 
 def test_motion_nominal_yaw_reads_the_angle_off_the_filename() -> None:
@@ -193,15 +167,33 @@ def test_plan_requires_confident_marching_to_walk() -> None:
     assert plan_action(yaw_error_rad=0.0, gait=slow, available=CLIPS).action is None
 
 
+def _latch(servo, human, robot, *, t0=0.0, n=8, dt=0.15):
+    """Feed the burst of frames YawServo needs before it latches a reference.
+
+    The servo deliberately no longer latches on a single frame: body yaw is the
+    noisiest cue in the pipeline, and taking one arbitrary frame as the origin is
+    how the whole heading loop ends up with a fixed offset (measured: the hip-yaw
+    bias pinned to one side in 81% of a recorded session). It latches the median
+    of a short burst instead, so tests have to supply one.
+
+    Returns the timestamp just after the latch, so callers can carry on.
+    """
+    t = t0
+    for _ in range(n):
+        servo.update(human_yaw=human, conf=1.0, robot_yaw=robot, now_s=t)
+        t += dt
+    assert servo.latched, "burst should have latched the reference"
+    return t
+
+
 def test_yaw_servo_tracks_a_relative_rotation() -> None:
     servo = YawServo()
     # Latching zeroes the error: the subject's and the robot's initial headings
     # are both arbitrary, so only the change matters.
-    servo.update(human_yaw=0.3, conf=1.0, robot_yaw=-2.0, now_s=0.0)
-    assert servo.latched
+    t = _latch(servo, 0.3, -2.0)
     assert abs(servo.error(-2.0)) < 1e-9
     # Human turns 0.5 rad -> the robot is asked to turn the same way.
-    servo.update(human_yaw=0.8, conf=1.0, robot_yaw=-2.0, now_s=0.1)
+    servo.update(human_yaw=0.8, conf=1.0, robot_yaw=-2.0, now_s=t)
     assert abs(servo.error(-2.0) - 0.5) < 1e-9
     # ... and the error closes as the robot actually gets there.
     assert abs(servo.error(-1.5)) < 1e-9
@@ -218,26 +210,30 @@ def test_yaw_servo_ignores_unusable_measurements() -> None:
 
 def test_yaw_servo_relatches_after_losing_the_subject() -> None:
     servo = YawServo(relatch_after_s=2.0)
-    servo.update(human_yaw=0.0, conf=1.0, robot_yaw=0.0, now_s=0.0)
-    servo.update(human_yaw=1.0, conf=1.0, robot_yaw=0.0, now_s=0.1)
+    t = _latch(servo, 0.0, 0.0)
+    servo.update(human_yaw=1.0, conf=1.0, robot_yaw=0.0, now_s=t)
     assert abs(servo.error(0.0) - 1.0) < 1e-9
     # Subject walks off and comes back facing somewhere else entirely: chasing
-    # the stale error would spin the robot for no reason.
-    servo.update(human_yaw=-1.0, conf=1.0, robot_yaw=0.0, now_s=10.0)
+    # the stale error would spin the robot for no reason. The gap drops the old
+    # reference immediately; the new one comes from a fresh burst.
+    servo.update(human_yaw=-1.0, conf=1.0, robot_yaw=0.0, now_s=t + 10.0)
+    assert not servo.latched
+    assert servo.error(0.0) == 0.0
+    _latch(servo, -1.0, 0.0, t0=t + 10.0)
     assert abs(servo.error(0.0)) < 1e-9
 
 
 def test_yaw_servo_sign_flips_the_mapping() -> None:
     servo = YawServo(sign=-1.0)
-    servo.update(human_yaw=0.0, conf=1.0, robot_yaw=0.0, now_s=0.0)
-    servo.update(human_yaw=0.4, conf=1.0, robot_yaw=0.0, now_s=0.1)
+    t = _latch(servo, 0.0, 0.0)
+    servo.update(human_yaw=0.4, conf=1.0, robot_yaw=0.0, now_s=t)
     assert abs(servo.error(0.0) + 0.4) < 1e-9
 
 
 def test_yaw_servo_wraps_across_the_discontinuity() -> None:
     servo = YawServo()
-    servo.update(human_yaw=0.0, conf=1.0, robot_yaw=3.0, now_s=0.0)
-    servo.update(human_yaw=0.4, conf=1.0, robot_yaw=3.0, now_s=0.1)
+    t = _latch(servo, 0.0, 3.0)
+    servo.update(human_yaw=0.4, conf=1.0, robot_yaw=3.0, now_s=t)
     # desired = 3.4 rad, which wraps past pi; the error must stay small and
     # correctly signed instead of demanding a near-full turn the other way.
     assert abs(servo.error(3.0) - 0.4) < 1e-9
@@ -254,7 +250,7 @@ def test_wrap_pi() -> None:
 
 def test_reset_unlatches() -> None:
     servo = YawServo()
-    servo.update(human_yaw=0.2, conf=1.0, robot_yaw=0.0, now_s=0.0)
+    _latch(servo, 0.2, 0.0)
     servo.reset()
     assert not servo.latched and servo.error(1.0) == 0.0
 
@@ -351,3 +347,72 @@ def test_a_constant_offset_is_absorbed_by_the_latch() -> None:
     assert servo.error(0.0) == pytest.approx(0.0, abs=1e-9)
     assert plan_action(yaw_error_rad=servo.error(0.0),
                        available={"turn_left": "/w/TurnLeft60.motion"}).action is None
+
+
+def test_yaw_servo_latch_ignores_a_spiking_frame() -> None:
+    """The reason the latch is a median of a burst rather than one frame.
+
+    The body-yaw cue is documented to spike to its +/-90 deg bound on a minority
+    of frames while the subject stands square to the camera. If such a frame is
+    the one that sets the origin, every subsequent error inherits the offset --
+    which is exactly the fixed one-sided bias measured in a recorded session.
+    """
+    servo = YawServo()
+    t = 0.0
+    for i in range(9):
+        # One frame in three is a bogus +90 deg spike; the truth is 0.0.
+        human = math.pi / 2 if i % 3 == 0 else 0.0
+        servo.update(human_yaw=human, conf=1.0, robot_yaw=0.0, now_s=t)
+        t += 0.15
+    assert servo.latched
+    # The median rejected the spikes, so standing still is not a heading error.
+    servo.update(human_yaw=0.0, conf=1.0, robot_yaw=0.0, now_s=t)
+    assert abs(servo.error(0.0)) < 1e-9
+
+
+def test_yaw_servo_diagnostics_separate_offset_from_tracking() -> None:
+    servo = YawServo()
+    t = _latch(servo, 0.2, 1.0)
+    servo.update(human_yaw=0.9, conf=1.0, robot_yaw=1.0, now_s=t)
+    d = servo.diagnostics(1.0)
+    assert d["latched"] == 1.0
+    assert d["human_ref"] == pytest.approx(0.2)
+    assert d["robot_ref"] == pytest.approx(1.0)
+    assert d["human_now"] == pytest.approx(0.9)
+    assert d["error"] == pytest.approx(0.7, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Which joints a clip actually drives
+# ---------------------------------------------------------------------------
+def test_motion_joints_reads_the_clip_header(tmp_path) -> None:
+    """Webots' NAO walk clips drive only the legs. Knowing that is what lets the
+    controller keep the arms and head imitating while the robot walks, instead of
+    suspending the whole body for the length of every step."""
+    path = tmp_path / "Forwards.motion"
+    path.write_text(
+        "#WEBOTS_MOTION,V1.0,LHipYawPitch,LHipRoll,LHipPitch,LKneePitch,"
+        "LAnklePitch,LAnkleRoll,RHipYawPitch,RHipRoll,RHipPitch,RKneePitch,"
+        "RAnklePitch,RAnkleRoll\n"
+        "00:00:000,Pose1,0,0.027,-0.505,1.042,-0.537,-0.027,0,0.027,-0.505,"
+        "1.042,-0.537,-0.027\n",
+        encoding="utf-8",
+    )
+    joints = motion_joints(str(path))
+    assert len(joints) == 12
+    assert "LHipPitch" in joints and "RAnkleRoll" in joints
+    # Crucially, no arm or head joint is in there.
+    assert not [j for j in joints if "Shoulder" in j or "Elbow" in j or "Head" in j]
+
+
+def test_motion_joints_returns_empty_for_anything_it_cannot_read(tmp_path) -> None:
+    """An empty list means "unknown", and the caller must then hand over the
+    whole body -- handing over too little would fight the clip's keyframes."""
+    assert motion_joints(None) == []
+    assert motion_joints(str(tmp_path / "missing.motion")) == []
+    junk = tmp_path / "junk.motion"
+    junk.write_text("not a motion file\n", encoding="utf-8")
+    assert motion_joints(str(junk)) == []
+    bare = tmp_path / "bare.motion"
+    bare.write_text("#WEBOTS_MOTION,V1.0\n", encoding="utf-8")
+    assert motion_joints(str(bare)) == []

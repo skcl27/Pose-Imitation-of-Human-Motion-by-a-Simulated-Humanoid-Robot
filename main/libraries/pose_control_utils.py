@@ -49,8 +49,8 @@ Motor/sensor objects are passed in from the controller process.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional
 
 # ---------------------------------------------------------------------------
 # NAO H25 joint limits (radians)
@@ -60,7 +60,7 @@ from typing import Callable, Dict, Iterable, List, Optional
 # ranges; Webots clamps setPosition() to them, so commanding outside the range
 # silently saturates the joint.
 # ---------------------------------------------------------------------------
-NAO_JOINT_LIMITS: Dict[str, MotorConfig] = {}
+NAO_JOINT_LIMITS: dict[str, MotorConfig] = {}
 
 
 @dataclass
@@ -77,7 +77,7 @@ def _deg(d: float) -> float:
     return math.radians(d)
 
 
-def get_default_motor_configs() -> Dict[str, MotorConfig]:
+def get_default_motor_configs() -> dict[str, MotorConfig]:
     """Return mechanical configs for every NAO joint we care about.
 
     ``rest_angle`` encodes a stable standing posture: legs straight (0 rad),
@@ -153,7 +153,7 @@ class JointMap:
 #     opposite sign for each side                                     -> scale -1
 #   * Hips: same axis sense, gated behind drive_legs                  -> scale +1
 #   * TorsoPitch: no NAO motor                                        -> omitted
-PIPELINE_TO_NAO: Dict[str, JointMap] = {
+PIPELINE_TO_NAO: dict[str, JointMap] = {
     "LShoulderPitch": JointMap("LShoulderPitch", scale=-1.0),
     "RShoulderPitch": JointMap("RShoulderPitch", scale=-1.0),
     "LElbowRoll":     JointMap("LElbowRoll",     scale=-1.0),
@@ -169,7 +169,7 @@ PIPELINE_TO_NAO: Dict[str, JointMap] = {
 class JointLimiter:
     """Enforces joint angle limits."""
 
-    def __init__(self, configs: Dict[str, MotorConfig]) -> None:
+    def __init__(self, configs: dict[str, MotorConfig]) -> None:
         self.configs = configs
 
     def clamp_angle(self, joint_name: str, angle: float) -> float:
@@ -188,19 +188,28 @@ class JointLimiter:
 class ExponentialSmoother:
     """Per-joint exponential moving average to damp jitter (FR-6).
 
-    ``alpha`` in (0, 1]; higher = more responsive, lower = smoother.
+    ``alpha`` in (0, 1]; higher = more responsive, lower = smoother. A per-call
+    ``alpha`` override lets ONE smoother serve channels that want different
+    responsiveness, which matters more than it sounds: the driver used to keep two
+    smoothers holding independent state for the SAME twelve leg joints -- the
+    balance path smoothed them at 0.4 and the gait/pose paths at 0.7 -- so every
+    time the arbiter switched layer the leg targets jumped to whatever the other
+    smoother happened to remember. On weight-bearing joints that is exactly the
+    jolt ``leg_velocity_factor`` exists to prevent.
     """
 
     def __init__(self, alpha: float = 0.4) -> None:
         self.alpha = max(0.0, min(1.0, alpha))
-        self._state: Dict[str, float] = {}
+        self._state: dict[str, float] = {}
 
     def reset(self, joint_name: str, value: float) -> None:
         self._state[joint_name] = value
 
-    def smooth(self, joint_name: str, target: float) -> float:
+    def smooth(self, joint_name: str, target: float,
+               alpha: float | None = None) -> float:
+        a = self.alpha if alpha is None else max(0.0, min(1.0, alpha))
         prev = self._state.get(joint_name)
-        value = target if prev is None else prev + (target - prev) * self.alpha
+        value = target if prev is None else prev + (target - prev) * a
         self._state[joint_name] = value
         return value
 
@@ -211,7 +220,7 @@ class MotorHealthMonitor:
     def __init__(self, max_position_error: float = 0.1, window: int = 100) -> None:
         self.max_position_error = max_position_error
         self.window = window
-        self.position_errors: Dict[str, List[float]] = {}
+        self.position_errors: dict[str, list[float]] = {}
 
     def record(self, joint_name: str, target: float, current: float) -> float:
         error = abs(target - current)
@@ -233,18 +242,18 @@ class MotorHealthMonitor:
 
 
 def map_pipeline_angles(
-    incoming: Dict[str, float],
+    incoming: dict[str, float],
     *,
     drive_legs: bool = False,
-    limiter: Optional[JointLimiter] = None,
-) -> Dict[str, float]:
+    limiter: JointLimiter | None = None,
+) -> dict[str, float]:
     """Convert pipeline joint angles to clamped NAO motor targets.
 
     Pure function (no Webots dependency) so the mapping is unit-testable.
     Unknown joints and (when ``drive_legs`` is False) leg joints are dropped.
     """
     limiter = limiter or JointLimiter(get_default_motor_configs())
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for src, value in incoming.items():
         spec = PIPELINE_TO_NAO.get(src)
         if spec is None:
@@ -279,7 +288,7 @@ ALL_LEG_JOINTS = DRIVEN_LEG_JOINTS + (
 )
 
 
-def standing_posture() -> Dict[str, float]:
+def standing_posture() -> dict[str, float]:
     """Return the neutral standing target for every NAO joint (radians).
 
     Legs are kept straight (0 rad) and stiff so the robot stays balanced
@@ -350,9 +359,9 @@ class NaoPoseDriver:
         walk_tier: str = "march",
         gait_smoothing_alpha: float = 0.7,
         gait_leg_velocity_factor: float = 0.85,
-        gait_params: Optional[object] = None,
-        lower_body_params: Optional[object] = None,
-        logger: Optional[Callable[[str], None]] = None,
+        gait_params: object | None = None,
+        lower_body_params: object | None = None,
+        logger: Callable[[str], None] | None = None,
     ) -> None:
         self.robot = robot
         self.timestep = int(robot.getBasicTimeStep())
@@ -369,28 +378,44 @@ class NaoPoseDriver:
 
         self.configs = get_default_motor_configs()
         self.limiter = JointLimiter(self.configs)
+        # ONE smoother for the whole robot, with a per-joint alpha. The legs still
+        # get the snappier factor -- a walking waveform double-attenuated by the
+        # arm/head EMA collapses into a shuffle (FR-6) -- but they now get it from
+        # a single piece of state, so switching leg-control layer no longer jumps
+        # the targets. See ExponentialSmoother.
         self.smoother = ExponentialSmoother(smoothing_alpha)
-        # Legs under the gait engine need their own, snappier smoother so the
-        # walking waveform is not double-attenuated by the arm/head EMA (FR-6).
-        self.gait_smoother = ExponentialSmoother(gait_smoothing_alpha)
+        self.leg_alpha = max(0.0, min(1.0, gait_smoothing_alpha))
         self.health = MotorHealthMonitor()
 
-        self.motors: Dict[str, object] = {}
-        self.sensors: Dict[str, object] = {}
-        self.commanded: Dict[str, float] = {}
-        self.measured: Dict[str, float] = {}
+        self.motors: dict[str, object] = {}
+        self.sensors: dict[str, object] = {}
+        self.commanded: dict[str, float] = {}
+        self.measured: dict[str, float] = {}
         # True while a Webots Motion clip owns the whole body (see
         # release_to_motion / reclaim_from_motion).
-        self.suspended = False
+        # Joints a Webots Motion clip currently owns. A SET rather than a bool:
+        # Webots' NAO walk clips drive only the 12 leg joints (checked against the
+        # header of Forwards.motion, which lists exactly those), so suspending the
+        # whole body handed the clip joints it never commands and froze arm and
+        # head imitation for the clip's whole duration -- and since a marching
+        # human restarts the clip immediately, that read as the upper body dying.
+        self._suspended: set = set()
         # The pose imitation wants this leg posture; the balance loop adds small
         # corrections on top of it each control step.
-        self.base_targets: Dict[str, float] = {}
+        self.base_targets: dict[str, float] = {}
         self.stats = DriverStats()
-        self._last_command_time: Optional[float] = None
+        self._last_command_time: float | None = None
 
         # Model-based CoM balance feedback (Option 2: FK + known link masses).
         # Imported lazily and guarded so the driver still runs if numpy/balance
         # is unavailable.
+        # Layers that asked to be built and could not be. Kept as data rather than
+        # only logged once at startup: a missing NumPy in Webots' interpreter
+        # silently removes the entire model-based balance layer AND the CoM step
+        # gate, and the only symptom is a robot that never leans. The controller
+        # repeats this on the status line so it cannot scroll away unnoticed.
+        self.degraded: list[str] = []
+
         self.balance = None
         if enable_balance:
             try:
@@ -398,6 +423,7 @@ class NaoPoseDriver:
                 self.balance = BalanceController(NaoCoMModel())
                 self.log("Balance feedback ON (model-based CoM, Fibonacci search)")
             except Exception as exc:  # noqa: BLE001
+                self.degraded.append(f"CoM balance OFF ({exc})")
                 self.log(f"Balance feedback OFF ({exc})")
 
         # Walk engine (gait command -> balance-stable leg motion). When enabled,
@@ -405,7 +431,7 @@ class NaoPoseDriver:
         # crouch is skipped (gait owns the lower body). Imported lazily because
         # ``gait`` imports this module.
         self.gait_engine = None
-        self._gait_meta: Dict[str, object] = {"single_support": False, "amp_gain": 0.0}
+        self._gait_meta: dict[str, object] = {"single_support": False, "amp_gain": 0.0}
         if enable_walk:
             try:
                 from gait import GaitEngine
@@ -416,6 +442,7 @@ class NaoPoseDriver:
                 self.log(f"Walk engine ON (tier={walk_tier})")
             except Exception as exc:  # noqa: BLE001
                 self.enable_walk = False
+                self.degraded.append(f"march engine OFF ({exc})")
                 self.log(f"Walk engine OFF ({exc})")
 
         # Per-leg pose imitation + weight-shift/lift sequencer. This is the layer
@@ -423,6 +450,12 @@ class NaoPoseDriver:
         # needs the CoM model to decide when unloading a foot is safe, and
         # degrades to a hard-capped lift without it (never to "no motion at all",
         # which is what made the legs look dead before).
+        # Self-calibrating neutral for the head-pitch solve (nao_retarget's
+        # HeadGeometry). Held here so it persists across frames -- the whole
+        # point is that it converges on THIS subject's neck over a run; built
+        # lazily because ``nao_retarget`` imports this module.
+        self.head_geom = None
+
         self.leg_retargeter = None
         self.lower_body = None
         if drive_legs:
@@ -439,11 +472,25 @@ class NaoPoseDriver:
                     f" (CoM-gated stepping: {com_model is not None})"
                 )
             except Exception as exc:  # noqa: BLE001
+                self.degraded.append(f"leg pose imitation OFF ({exc})")
                 self.log(f"Lower-body pose imitation OFF ({exc})")
-        self._lb_meta: Dict[str, object] = {"mode": "off", "balance_ok": True}
+            else:
+                if com_model is None:
+                    self.degraded.append(
+                        "leg step gate UNGATED (no CoM model: lift capped, not verified)"
+                    )
+        self._lb_meta: dict[str, object] = {"mode": "off", "balance_ok": True}
 
         self._setup_devices()
         self.apply_standing_posture()
+
+    @property
+    def suspended(self) -> bool:
+        """True while a motion clip owns ANY joint (the leg layers key off this)."""
+        return bool(self._suspended)
+
+    def _is_suspended(self, name: str) -> bool:
+        return name in self._suspended
 
     # -- device setup -------------------------------------------------------
     def _setup_devices(self) -> None:
@@ -469,9 +516,10 @@ class NaoPoseDriver:
 
     def _set_motor(self, name: str, angle: float, velocity: float) -> None:
         motor = self.motors.get(name)
-        if motor is None or self.suspended:
-            # Suspended = a Webots Motion clip owns the body; commanding motors
-            # now would fight the clip's keyframes and break its balance.
+        if motor is None or self._is_suspended(name):
+            # This joint belongs to a running Motion clip; commanding it now would
+            # fight the clip's keyframes and break its balance. Joints the clip
+            # does NOT drive stay ours, so the arms and head keep imitating.
             return
         angle = self.limiter.clamp_angle(name, angle)
         try:
@@ -481,6 +529,13 @@ class NaoPoseDriver:
             self.log(f"Failed to command {name}: {exc}")
             return
         self.commanded[name] = angle
+
+    def _alpha_for(self, name: str) -> float:
+        """Smoothing factor for one joint: snappier on the legs than the arms."""
+        return self.leg_alpha if name in ALL_LEG_JOINTS else self.smoother.alpha
+
+    def _smooth(self, name: str, target: float) -> float:
+        return self.smoother.smooth(name, target, self._alpha_for(name))
 
     def _velocity_for(self, name: str) -> float:
         cfg = self.configs.get(name)
@@ -502,20 +557,17 @@ class NaoPoseDriver:
         self.log("Applied standing posture")
 
     # -- per-frame update ---------------------------------------------------
-    def _apply_targets(self, targets: Dict[str, float], now_s: Optional[float]) -> int:
+    def _apply_targets(self, targets: dict[str, float], now_s: float | None) -> int:
         """Smooth, command and bookkeep a set of NAO joint targets."""
-        if self.suspended:
-            # A motion clip owns the body; still record the frame time so
-            # staleness detection keeps working across the clip.
-            if now_s is not None:
-                self._last_command_time = now_s
-            return 0
         applied = 0
         for name, target in targets.items():
-            if name not in self.motors:
+            if name not in self.motors or self._is_suspended(name):
+                # A suspended joint is the clip's; the rest are still ours. The
+                # frame time is recorded either way so staleness detection keeps
+                # working across a clip.
                 continue
             self.base_targets[name] = target
-            smoothed = self.smoother.smooth(name, target)
+            smoothed = self._smooth(name, target)
             self._set_motor(name, smoothed, self._velocity_for(name))
             applied += 1
 
@@ -551,7 +603,7 @@ class NaoPoseDriver:
             if name not in self.motors:
                 continue
             base = self.base_targets.get(name, self.configs[name].rest_angle)
-            smoothed = self.smoother.smooth(name, base + delta)
+            smoothed = self._smooth(name, base + delta)
             self._set_motor(name, smoothed, self._velocity_for(name))
             applied += 1
         return applied
@@ -561,7 +613,7 @@ class NaoPoseDriver:
         self,
         now_s: float,
         torso_rp: tuple = (0.0, 0.0),
-        fsr: Optional[Dict[str, float]] = None,
+        fsr: dict[str, float] | None = None,
         yaw_bias: float = 0.0,
     ) -> int:
         """Advance the per-leg pose imitation one control step.
@@ -593,7 +645,15 @@ class NaoPoseDriver:
             return 0
         self._lb_meta = meta
 
-        if self.balance is not None and meta.get("balance_ok", False):
+        # The balance FEEDBACK loop now runs whenever a clip is not driving the
+        # legs, not only in quiet double support. It used to be gated on
+        # balance_ok because its objective was "centre the CoM between the feet",
+        # which is simply wrong while deliberately leaning onto one foot. The
+        # objective is now "keep the CoM inside whatever support polygon the
+        # current stance actually has" (balance.support_margins, which filters by
+        # foot contact), and that is correct in single support too -- so gating it
+        # was throwing away balance exactly when it was most needed.
+        if self.balance is not None:
             try:
                 corr = self.balance.compute_correction(state, torso_rp)
             except Exception as exc:  # noqa: BLE001
@@ -613,14 +673,14 @@ class NaoPoseDriver:
             if name not in self.motors:
                 continue
             self.base_targets[name] = value
-            # The gait smoother's snappier alpha is right here too: the legs must
-            # follow a step, not lag it into a shuffle.
-            smoothed = self.gait_smoother.smooth(name, value)
+            # The legs get the snappier alpha here too: they must follow a step,
+            # not lag it into a shuffle.
+            smoothed = self._smooth(name, value)
             self._set_motor(name, smoothed, self._gait_velocity_for(name))
             applied += 1
         return applied
 
-    def set_lower_body_observation(self, obs: Optional[object]) -> None:
+    def set_lower_body_observation(self, obs: object | None) -> None:
         """Latch a fresh lower-body observation (no-op when the layer is off)."""
         if self.lower_body is not None and obs is not None:
             self.lower_body.set_observation(obs)
@@ -630,13 +690,52 @@ class NaoPoseDriver:
         if self.lower_body is not None:
             self.lower_body.stand_down()
 
+    # Arm/head joints that the upper-body stand-down returns to neutral.
+    UPPER_BODY_JOINTS = (
+        "LShoulderPitch", "RShoulderPitch",
+        "LShoulderRoll", "RShoulderRoll",
+        "LElbowYaw", "RElbowYaw",
+        "LElbowRoll", "RElbowRoll",
+        "LWristYaw", "RWristYaw",
+        "HeadYaw", "HeadPitch",
+    )
+
+    def upper_body_stand_down(self) -> int:
+        """Ramp the arms and head back to the neutral standing posture.
+
+        The counterpart of :meth:`lower_body_stand_down`, and it was missing. On
+        staleness the legs correctly ramped to the balanced crouch while the arms
+        and head simply stopped being updated, so they froze wherever they
+        happened to be -- a recorded session ends with 80 s of *perfect* tracking
+        of a pose belonging to a human who had left the frame, which reads as a
+        crashed robot rather than an idle one.
+
+        The existing smoother supplies the ramp, so this is a target change, not a
+        jump. Deliberately does not touch ``_last_command_time`` or ``stats``:
+        standing down is a consequence of staleness, not a refutation of it.
+        """
+        if self.suspended:
+            return 0
+        applied = 0
+        for name in self.UPPER_BODY_JOINTS:
+            if name not in self.motors:
+                continue
+            cfg = self.configs.get(name)
+            if cfg is None:
+                continue
+            self.base_targets[name] = cfg.rest_angle
+            smoothed = self._smooth(name, cfg.rest_angle)
+            self._set_motor(name, smoothed, self._velocity_for(name))
+            applied += 1
+        return applied
+
     @property
-    def lower_body_meta(self) -> Dict[str, object]:
+    def lower_body_meta(self) -> dict[str, object]:
         """Latest lower-body telemetry (mode, shift, lift, stance margin, ...)."""
         return dict(self._lb_meta)
 
     # -- whole-body Webots Motion clips ------------------------------------
-    def release_to_motion(self) -> None:
+    def release_to_motion(self, joints: Iterable[str] | None = None) -> None:
         """Hand the whole body to a Webots ``Motion`` clip.
 
         Two things have to happen, and missing either one is why "play a walk
@@ -650,16 +749,30 @@ class NaoPoseDriver:
            the pre-balanced gait arrives late at every foot placement and the
            robot topples. Motors keep whatever velocity was last set, so the caps
            must be raised explicitly here.
+
+        ``joints`` narrows the handover to the joints the clip actually drives,
+        read from the clip's own header. Webots' NAO walk clips list exactly the
+        12 leg joints, so passing them keeps arm and head imitation live for the
+        clip's whole duration instead of freezing the upper body every time the
+        human takes a step. Omit it to hand over everything (the safe default:
+        handing over too much only costs expressiveness, handing over too little
+        would let us fight a clip's keyframes).
         """
         if self.suspended:
             return
-        for name, motor in self.motors.items():
+        # Default to the whole body when the clip will not say what it drives:
+        # handing over too much is safe, handing over too little is not.
+        names = [n for n in (joints or self.motors) if n in self.motors]
+        if not names:
+            names = list(self.motors)
+        for name in names:
             cfg = self.configs.get(name)
+            motor = self.motors[name]
             try:
                 motor.setVelocity(cfg.max_velocity if cfg else 6.0)
             except Exception:  # noqa: BLE001
                 pass
-        self.suspended = True
+        self._suspended = set(names)
 
     def reclaim_from_motion(self) -> None:
         """Take the body back from a motion clip without a jolt.
@@ -670,14 +783,15 @@ class NaoPoseDriver:
         """
         if not self.suspended:
             return
-        self.suspended = False
+        reclaimed = sorted(self._suspended)
+        self._suspended = set()
         self.reseed_from_measured()
-        for name in self.motors:
+        for name in reclaimed:
             self._set_motor(name, self.measured.get(name, self.commanded.get(name, 0.0)),
                             self._velocity_for(name))
 
     # -- gait / walking -----------------------------------------------------
-    def set_gait_command(self, gait: Optional[Dict[str, object]]) -> None:
+    def set_gait_command(self, gait: dict[str, object] | None) -> None:
         """Hand the latest gait command (from the Python cue extractor) to the
         walk engine. No-op when walking is disabled."""
         if self.gait_engine is not None:
@@ -692,7 +806,7 @@ class NaoPoseDriver:
         return ceiling * self.velocity_scale * self.gait_leg_velocity_factor
 
     def gait_tick(self, now_s: float, torso_rp: tuple = (0.0, 0.0),
-                  fsr: Optional[Dict[str, float]] = None) -> int:
+                  fsr: dict[str, float] | None = None) -> int:
         """Advance the walk engine one step and command the legs.
 
         When walking is enabled this REPLACES ``balance_tick`` for the lower
@@ -735,13 +849,13 @@ class NaoPoseDriver:
             if name not in self.motors:
                 continue
             self.base_targets[name] = value
-            smoothed = self.gait_smoother.smooth(name, value)
+            smoothed = self._smooth(name, value)
             self._set_motor(name, smoothed, self._gait_velocity_for(name))
             applied += 1
         return applied
 
     @property
-    def gait_meta(self) -> Dict[str, object]:
+    def gait_meta(self) -> dict[str, object]:
         """Latest walk-engine telemetry (amp_gain, phase, cadence, single_support)."""
         return dict(self._gait_meta)
 
@@ -758,10 +872,9 @@ class NaoPoseDriver:
             if val is None:
                 continue
             self.smoother.reset(name, val)
-            self.gait_smoother.reset(name, val)
             self.commanded[name] = val
 
-    def update(self, incoming: Dict[str, float], now_s: Optional[float] = None) -> int:
+    def update(self, incoming: dict[str, float], now_s: float | None = None) -> int:
         """Apply one frame of *pre-computed* pipeline joint angles (fallback).
 
         Returns the number of joints commanded.
@@ -772,7 +885,7 @@ class NaoPoseDriver:
         return self._apply_targets(targets, now_s)
 
     def update_from_keypoints(
-        self, keypoints: Dict[str, object], now_s: Optional[float] = None
+        self, keypoints: dict[str, object], now_s: float | None = None
     ) -> int:
         """Apply one camera frame: arms/head now, legs via the lower-body layer.
 
@@ -785,13 +898,16 @@ class NaoPoseDriver:
         Returns the number of joints commanded. Imported lazily to avoid a
         circular import (``nao_retarget`` depends on this module).
         """
-        from nao_retarget import retarget_upper_body
+        from nao_retarget import HeadGeometry, retarget_upper_body
 
+        if self.head_geom is None:
+            self.head_geom = HeadGeometry()
         targets = retarget_upper_body(
             keypoints,
             drive_head=self.drive_head,
             swap_sides=self.swap_sides,
             limiter=self.limiter,
+            head_geom=self.head_geom,
         )
         if self.leg_retargeter is not None:
             try:
@@ -840,11 +956,11 @@ class NaoPoseDriver:
             except Exception:  # noqa: BLE001
                 pass
 
-    def stuck_motors(self) -> List[str]:
+    def stuck_motors(self) -> list[str]:
         return [n for n in self.motors if self.health.is_stuck(n)]
 
     @property
-    def logged_joints(self) -> List[str]:
+    def logged_joints(self) -> list[str]:
         """Joints worth logging for fidelity metrics (driven joints only)."""
         joints = [
             "LShoulderPitch", "RShoulderPitch",
@@ -882,14 +998,21 @@ class JointTrajectoryLogger:
         directory: str,
         joints: Iterable[str],
         *,
-        filename: Optional[str] = None,
+        filename: str | None = None,
         flush_every: int = 50,
-        logger: Optional[Callable[[str], None]] = None,
+        diagnostics: Iterable[str] = (),
+        logger: Callable[[str], None] | None = None,
     ) -> None:
         import csv
         import os
 
         self.joints = list(joints)
+        # Extra per-step columns for the controller's own state (IMU, which leg
+        # layer ran, the balance margin, why the legs did or did not move).
+        # Without them a log tells you what the joints did but not what the
+        # controller believed, which is the half that explains the other half --
+        # every diagnosis in this project so far has needed both.
+        self.diagnostics = list(diagnostics)
         self.flush_every = max(1, flush_every)
         self.log = logger or _null_logger
         self._rows_since_flush = 0
@@ -904,6 +1027,7 @@ class JointTrajectoryLogger:
             self._file = open(path, "w", newline="", encoding="utf-8")
             self._writer = csv.writer(self._file)
             header = ["wall_time_s", "sim_time_s", "frame_index"]
+            header += list(self.diagnostics)
             for j in self.joints:
                 header += [f"{j}_cmd_rad", f"{j}_meas_rad"]
             self._writer.writerow(header)
@@ -923,13 +1047,20 @@ class JointTrajectoryLogger:
         self,
         sim_time_s: float,
         frame_index: int,
-        commanded: Dict[str, float],
-        measured: Dict[str, float],
+        commanded: dict[str, float],
+        measured: dict[str, float],
+        diagnostics: dict[str, object] | None = None,
     ) -> None:
         if self._writer is None:
             return
         try:
-            row: List[object] = [round(time_now(), 6), round(sim_time_s, 6), frame_index]
+            row: list[object] = [round(time_now(), 6), round(sim_time_s, 6), frame_index]
+            diag = diagnostics or {}
+            for name in self.diagnostics:
+                value = diag.get(name)
+                if isinstance(value, float):
+                    value = round(value, 6)
+                row.append("" if value is None else value)
             for j in self.joints:
                 cmd = commanded.get(j)
                 meas = measured.get(j)

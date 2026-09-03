@@ -16,13 +16,21 @@ Two tiers, behind config flags
   marching / walking-in-place and tracks the human precisely on the only signals
   a frontal monocular camera observes continuously (cadence, phase, stop).
 
-* **Tier B — single-support stepping** (experimental, flag-gated, default OFF).
+* **Tier B — single-support stepping** (experimental, and NOT REACHABLE in the
+  shipped configuration -- see the note below).
   True foot lift / weight transfer. Only ever lifts a foot when the model
   predicts the CoM is safely over the *stance* foot (and, when wired, the foot
   force sensors confirm the weight transfer). On any doubt it collapses the step
   height to zero and stays in the Tier-A double-support regime. Single-support on
   a free-standing NAO with on-board sensing only is genuinely unproven, so this
   tier is isolated from the demo until proven in simulation.
+
+  Two things have to change before it can run at all, and both are deliberate:
+  the controller's ``WALK_TIER`` is a module constant fixed at ``"march"``, so
+  nothing ever passes ``tier="step"``; and :meth:`GaitEngine._stance_gate`
+  returns ``False`` unconditionally when there is no CoM model, which is the case
+  whenever NumPy is missing from Webots' interpreter. Treat the code below as a
+  design record, not a feature: it is unit-tested and it does not execute.
 
 Design invariants
 -----------------
@@ -40,7 +48,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
 
 from pose_control_utils import JointLimiter, get_default_motor_configs
 
@@ -77,7 +84,21 @@ class GaitParams:
     # Posture
     base_crouch_u: float = 0.15     # symmetric standing crouch (Hip=-u,Knee=2u,Ankle=-u)
     # Tier A (double-support march) amplitudes — kept small so both feet stay loaded
-    knee_bob_rad: float = 0.18      # extra knee/hip flex of the unloaded leg per step
+    # Extra hip/knee/ankle flex of the lighter leg per step. Tier A's whole claim
+    # is that it "never fully unloads a foot", and 0.18 broke that claim: it
+    # shortens the bobbing leg enough to lift that foot clear of the floor, so the
+    # support polygon collapses to the other foot alone and the centre of mass ends
+    # up outside it. Measured against the CoM model over a full cycle:
+    #
+    #     bob    that foot lifts   worst lateral margin
+    #     0.09      3.5 mm            +0.078 m
+    #     0.12      5.1 mm            +0.078 m
+    #     0.15      6.8 mm            -0.003 m   foot off the floor
+    #     0.18      8.7 mm            -0.005 m   foot off the floor
+    #
+    # 0.11 keeps ~1.5 mm of clearance below the point where the foot leaves the
+    # ground, and still reads as a knee pump (the knee itself moves twice this).
+    knee_bob_rad: float = 0.11
     sway_rad: float = 0.06          # lateral CoM sway (same-sign roll on both legs)
     # Tier B (single-support step) amplitudes — only used when tier == "step"
     step_height_rad: float = 0.35   # swing-leg knee flex at mid-swing (foot clearance)
@@ -104,7 +125,7 @@ class GaitState:
     phase: float = 0.0       # robot gait phase [0, 2pi)
     amp_gain: float = 0.0    # [0, 1] blend crouch(0) <-> full gait(1)
     cadence: float = 0.0     # current robot cadence (Hz)
-    last_now: Optional[float] = None
+    last_now: float | None = None
 
 
 class GaitEngine:
@@ -123,10 +144,10 @@ class GaitEngine:
 
     def __init__(
         self,
-        params: Optional[GaitParams] = None,
+        params: GaitParams | None = None,
         *,
-        com_model: Optional[object] = None,
-        limiter: Optional[JointLimiter] = None,
+        com_model: object | None = None,
+        limiter: JointLimiter | None = None,
     ) -> None:
         self.params = params or GaitParams()
         self.limiter = limiter or JointLimiter(get_default_motor_configs())
@@ -152,7 +173,7 @@ class GaitEngine:
         self._cmd_conf = 0.0
 
     # -- command ingestion --------------------------------------------------
-    def set_command(self, gait: Optional[Dict[str, object]]) -> None:
+    def set_command(self, gait: dict[str, object] | None) -> None:
         """Update the target gait from a (possibly partial) command dict."""
         if not gait:
             self._cmd_state = "idle"
@@ -174,10 +195,10 @@ class GaitEngine:
         now_s: float,
         *,
         tier: str = "march",
-        torso_rp: Tuple[float, float] = (0.0, 0.0),
-        fsr: Optional[Dict[str, float]] = None,
-        measured: Optional[Dict[str, float]] = None,
-    ) -> Tuple[Dict[str, float], Dict[str, object]]:
+        torso_rp: tuple[float, float] = (0.0, 0.0),
+        fsr: dict[str, float] | None = None,
+        measured: dict[str, float] | None = None,
+    ) -> tuple[dict[str, float], dict[str, object]]:
         """Advance the gait one simulation step and emit leg targets.
 
         ``tier``      : "stand" | "march" (Tier A) | "step" (Tier B).
@@ -239,7 +260,7 @@ class GaitEngine:
         return clamped, meta
 
     # -- postures -----------------------------------------------------------
-    def _crouch(self, u: float) -> Dict[str, float]:
+    def _crouch(self, u: float) -> dict[str, float]:
         """Symmetric statically-balanced crouch (same posture as
         ``nao_retarget.crouch_posture``, which every leg layer decays back to)."""
         return {
@@ -251,7 +272,7 @@ class GaitEngine:
             "LHipYawPitch": 0.0, "RHipYawPitch": 0.0,
         }
 
-    def _tier_a_march(self, eff: float) -> Tuple[Dict[str, float], Dict[str, object]]:
+    def _tier_a_march(self, eff: float) -> tuple[dict[str, float], dict[str, object]]:
         """Double-support march: alternating knee pump + small lateral sway.
 
         Both feet stay loaded (single_support is always False), so the existing
@@ -270,7 +291,18 @@ class GaitEngine:
         lu = u0 + left_bob
         ru = u0 + right_bob
 
-        # Lateral sway shared (same-sign) on both legs -> shift weight, no splay.
+        # Lateral sway: same-sign hip roll on both legs shifts the pelvis sideways,
+        # and the ankles COUNTER-rotate by the same amount so both soles stay flat
+        # on the floor while it does.
+        #
+        # The counter-rotation is the whole ball game, and it was missing. With the
+        # ankles rolled the same way as the hips, each sole tilted by hip + ankle =
+        # 2 * sway, up to 0.12 rad -- and a tilted sole contacts along one edge, so
+        # the support polygon collapses to that edge. Measured against the CoM model
+        # over one gait cycle, the lateral margin went from +0.088 m standing to
+        # -0.083 m: the centre of mass spent most of every stride OUTSIDE the
+        # support polygon. The robot fell forward within seconds of the march
+        # starting, every time. Counter-rotated, the same sway holds +0.078 m.
         sway = p.sway_rad * eff * s
 
         targets = {
@@ -278,7 +310,7 @@ class GaitEngine:
             "LKneePitch": 2.0 * lu, "RKneePitch": 2.0 * ru,
             "LAnklePitch": -lu, "RAnklePitch": -ru,
             "LHipRoll": sway, "RHipRoll": sway,
-            "LAnkleRoll": sway, "RAnkleRoll": sway,
+            "LAnkleRoll": -sway, "RAnkleRoll": -sway,
             "LHipYawPitch": 0.0, "RHipYawPitch": 0.0,
         }
         swing = 1 if s > 0.05 else (-1 if s < -0.05 else 0)
@@ -287,9 +319,9 @@ class GaitEngine:
     def _tier_b_step(
         self,
         eff: float,
-        measured: Optional[Dict[str, float]],
-        fsr: Optional[Dict[str, float]],
-    ) -> Tuple[Dict[str, float], Dict[str, object]]:
+        measured: dict[str, float] | None,
+        fsr: dict[str, float] | None,
+    ) -> tuple[dict[str, float], dict[str, object]]:
         """Single-support stepping (experimental). Lifts a foot ONLY when the CoM
         is predicted safely over the stance foot (and FSRs, if present, confirm
         the load). Otherwise step height collapses to 0 -> safe double support.
@@ -316,10 +348,12 @@ class GaitEngine:
         shift = p.step_shift_rad * eff * shift_dir
 
         targets = self._crouch(u0)
+        # Ankles counter-rotate so the soles stay flat while the pelvis moves --
+        # same reasoning as the Tier-A sway above, and the same bug was here.
         targets["LHipRoll"] = shift
         targets["RHipRoll"] = shift
-        targets["LAnkleRoll"] = shift
-        targets["RAnkleRoll"] = shift
+        targets["LAnkleRoll"] = -shift
+        targets["RAnkleRoll"] = -shift
 
         # Safety gate: may we actually lift the swing foot this step?
         gate_ok, margin = self._stance_gate(stance, measured, fsr)
@@ -345,9 +379,9 @@ class GaitEngine:
     def _stance_gate(
         self,
         stance: str,
-        measured: Optional[Dict[str, float]],
-        fsr: Optional[Dict[str, float]],
-    ) -> Tuple[bool, float]:
+        measured: dict[str, float] | None,
+        fsr: dict[str, float] | None,
+    ) -> tuple[bool, float]:
         """Return (may_lift, stance_margin_m). Conservative: any doubt -> no lift."""
         p = self.params
         # FSR confirmation of weight transfer, when wired.
