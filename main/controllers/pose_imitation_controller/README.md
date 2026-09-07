@@ -157,6 +157,8 @@ stance leg stays near the balanced crouch because it is carrying the robot.
 | You do | Robot does | Limited by |
 |---|---|---|
 | Squat | 1:1 to 40° hip / 80° knee | knee range, not balance — see below |
+| **Walk forward** | pre-balanced walk clips, one per 2.6 s | the cue must see you walking — §4 and the `stride` channel |
+| **Turn** | pre-balanced turn clips, closed loop on the true heading | §5 |
 | Spread your legs | 1:1 to ~30°, saturating at 31.4° per leg | the **ankle** plus a bounded sole tilt — see below |
 | Lean sideways | 1:1 up to 0.45 rad, pelvis shifted to hold it | `max_lean_dev`, then pelvis travel (§3a) |
 | Split stance (one leg fwd) | 1:1, rate-limited to 1.2 rad/s | pelvis travel (§3a) |
@@ -317,6 +319,65 @@ direction and elbow bend. That is a known gap, not a fault.
 
 ## 4. Real locomotion
 
+> **The one-line bug that cost this project walking and turning.** Webots'
+> R2025a Python binding is `def play(self): wb.wbu_motion_play(self._ref)` — no
+> return statement — so `play()` is `None`, and this controller tested it as
+> `if not motion.play(): return False`. `MotionPlayer.start()` therefore returned
+> False on **every call ever made**: `leg_mode` is `"pose"` in 100.0% of the
+> frames of every recorded session (1.25 M rows), and four sessions logged
+> `clip_status = "start REFUSED by Webots"` for 198–964 frames each. Worse, the
+> clip *had* started — `wbu_motion_play` does not care what Python does with its
+> return value, and the controller library applies a playing clip's keyframes
+> every step — so the clip drove the legs while this code believed nothing was
+> playing and kept commanding them itself. Log 1788428293 has `LKneePitch`
+> **measured** at the clip's own first keyframe, 1.042 rad, while the controller
+> commanded 0.20–0.52. Two commanders, one joint set, for 19 s. Playback is now
+> confirmed by asking the clip whether it is running, which is a question the API
+> does answer.
+
+### Preparing to walk: the legs arrive before the clip does
+
+Every one of Cyberbotics' walk and turn clips **opens in a deep, sole-flat
+crouch** — `Forwards.motion` starts at `LHipPitch -0.505, LKneePitch +1.042,
+LAnklePitch -0.537`, which sum to zero, so the torso is vertical and the soles
+flat, and which is a squat of about 0.51 rad. This controller stands at
+`base_crouch_u = 0.10` (knee 0.20). Playback commands its first keyframe on its
+very first step, and `release_to_motion` has by then *lifted the velocity caps* —
+so handing over from standing asks the knees for 0.84 rad in one 20 ms step and
+the robot squats out from under itself.
+
+So the arbiter gains a state: `prepare:<action>`. It reads the clip's own first
+keyframe (`walk_motion.motion_first_pose`) and ramps the legs there via
+`NaoPoseDriver.approach_leg_pose`, then plays the clip only once the **measured**
+joints have arrived. Two details matter:
+
+* **Every joint arrives together.** The knee travels 0.842 rad, the hip 0.405 and
+  the ankle 0.437. One flat rate is not a synchronised move — and a sole's
+  attitude is Hip + Knee + Ankle, so desynchronised joints tip the feet.
+  Simulated against this repo's own CoM model, a flat rate drives that sum to
+  0.405 rad (**eight times** the 0.05 sole-tilt budget) and the fore/aft support
+  margin to **−0.064 m**: the ramp added to make the handover safe took the
+  centre of mass off the feet on its own. Each joint's rate is therefore scaled
+  by its share of the longest travel: sum 0.0000 rad, margin +0.0596 m, same
+  0.56 s.
+* **Coming back is a ramp too.** A clip *ends* in the same 0.51 rad squat, so the
+  lower body's crouch limiter is seeded from the posture the clip left
+  (`LowerBodyController.seed_crouch_from`) and comes down at
+  `crouch_rate_limit`. Otherwise the first post-clip step commands the whole
+  0.41 rad of knee travel at once — the same jolt, in reverse.
+
+If the legs cannot reach the stance within `CLIP_PREPARE_TIMEOUT_S` (2.5 s
+against 0.56 s of travel) the attempt counts as a locomotion failure, and the
+existing `MOTION_MAX_FAILURES` policy retires the clips for the session rather
+than ramping in place forever.
+
+The watchdog budget now comes from the clip's **own** duration with no ceiling.
+`TurnLeft180` runs 9.0 s, and capping it at `MOTION_WATCHDOG_S` (8.0 s)
+guaranteed it overran, was dropped as broken and counted a failure — so the one
+clip that can turn the robot right round in a single action could never be used.
+
+
+
 The robot **actually translates across the floor** by playing Webots' own
 pre-balanced NAO `.motion` clips (`Forwards`, `TurnLeft60`, …). Those clips are
 tuned by Cyberbotics for this exact robot; an online gait good enough to walk a
@@ -332,11 +393,80 @@ Two details make the difference between a walk and a stumble:
    `NaoPoseDriver.release_to_motion()` raises the caps and suspends per-joint
    commanding; `reclaim_from_motion()` reseeds the smoothers from the position
    sensors so control returns without a jolt.
-2. **Clips play to completion.** A clip boundary is a balanced double-support
-   pose — the only safe place to hand control back. Clips are therefore never
-   looped and never cut short (except by the tilt abort), which also makes clip
-   length the latency of "stop walking". That is why the short
-   `Forwards.motion` is preferred over `Forwards50.motion`.
+2. **How a clip ends decides how well it walks.** A clip boundary is a balanced
+   double-support pose, so the safe default is to play the whole clip. But that
+   makes clip length the latency of "stop walking", and it makes the robot pay
+   the clip's start/stop transient for every stride. That transient is 49 % of
+   `Forwards.motion`'s 2.60 s, and during the closing settle the torso travels
+   17 mm **backward** — which is why chained clips measured 0.036 m/s against
+   NAO's documented ~0.10, and why it looked like stepping rather than walking.
+
+   There are three exits, in order of preference:
+
+   | Exit | When | Cost |
+   |---|---|---|
+   | **Leave the gait cycle** (`GAIT_CYCLE`) | the clip has a detectable limit cycle in it — of the clips Webots ships, only `Forwards50.motion` | jump once at the phase where it is free (0.0010 rad = 0.05 rad/s), then 1.44 s of the clip's own deceleration |
+   | **Stop at a safe keyframe** (`CLIP_EXIT_TOLERANCE_S`) | any other clip, once nothing wants locomotion | wait up to 1.04 s (0.52 s for the turn clips) for a keyframe that is statically holdable **and** not carrying momentum |
+   | **Tilt abort** | the robot is going over | immediate, mid-stride |
+
+   The momentum half of that second test is easy to miss and matters: stopping
+   the legs does not stop the robot. The body keeps its velocity, and the capture
+   point sits `v/ω` ahead of the CoM (ω = √(g/h) ≈ 5.9 rad/s at this crouch), so
+   0.18 m/s throws it 30 mm past the CoM against a margin budget of 40–60 mm.
+   13 of the 46 poses in `Forwards.motion` that pass the *static* tests are
+   moving that fast.
+
+### Cyclic gait: one clip, many strides
+
+Cyberbotics' clips are animations — squat, accelerate, stride, decelerate,
+stand. The stride is fine; the transient around it is what costs. But the
+*middle* of the long walk clip is a true limit cycle, and exactly so:
+
+    max|q(2.84 s) − q(1.80 s)| = 0.0000 rad   over all 12 leg joints
+
+and the periodicity holds to that precision from 1.80 s to 5.32 s. So the
+segment can be rewound with `Motion.setTime()` without commanding any joint
+motion at the seam, and one clip becomes a gait generator that runs for as long
+as the human keeps walking. `walk_motion.gait_cycle()` derives the schedule from
+the clip's own keyframes every time — never a table — so it cannot drift from
+the files Webots actually ships, and a clip that is not cyclic is *detected* as
+not cyclic rather than looped on faith:
+
+| Field | `Forwards50.motion` | Meaning |
+|---|---|---|
+| `enter_s` | 0.72 s | playback starts here; the prepare-ramp does the opening squat instead, rate-limited and under balance supervision (worth 0.9 mm of travel) |
+| `loop_start_s` … `loop_end_s` | 1.80 → 2.84 s | rewound by `period_s` on reaching the end |
+| `period_s` | 1.04 s | one full stride, two stance exchanges |
+| `advance_m` | 0.093 m | → **0.089 m/s sustained** (forward kinematics) |
+| `exit_from_s` → `exit_to_s` | 2.24 → 5.32 s | the stop jump, taken on *crossing* that phase |
+| `exit_cost_rad` | 0.0010 rad | 0.05 rad/s over one control step |
+| `tail_s` | 1.44 s | Cyberbotics' own feet-together deceleration |
+
+Two requirements keep this honest. The seam must be exact — 1 µrad, because a
+seam is a teleport executed in one 20 ms step with the caps lifted, and
+`Forwards.motion`'s best available seam is 0.107 rad (a 5.35 rad/s jolt), which
+is why it cannot be cycled. And the cycle must **translate** the robot
+(≥ 0.02 m): every clip has some periodicity — a turn rotates through repeated
+steps, a side-step shuffles — and looping those would spin or drift the robot
+indefinitely, while turning is closed-loop on the heading and needs discrete,
+countable clips.
+
+Because a cyclic clip is rewound before it can ever report itself "over", it sits
+permanently in the state the watchdog exists to catch. Each completed stride is
+therefore treated as proof of life and extends the deadline; if rewinding stops
+happening, the deadline arrives exactly as it always did.
+
+What this does **not** claim: the stride is the same stride either clip walks —
+both take a 0.051 m half-step and both peak at 0.18 m/s. Cycling does not make
+the steps faster. It removes the start/stop transient between them, which is
+where the time was going. For a 10 s walk that is 47 stand/squat cycles reduced
+to 1.
+
+One recorded exceedance, for the record: `Forwards50.motion` asks 6.55 rad/s of
+the knees (102.3 % of the declared 6.40) in 5 of its 2028 joint-intervals, all
+at stance exchange. The cycled window plays exactly one of them per stride, at
+6.425 rad/s — a 0.001 rad lag every 1.04 s. Pinned by
+`test_the_cycled_window_stays_within_the_motors_declared_speed`.
 
 If no clips are found on disk the controller says so in the log and falls back
 to the **march engine** (`gait.py`), which tracks your cadence, phase and stop
@@ -363,6 +493,23 @@ velocity — a permanently dead robot from a single bad frame.
 ---
 
 ## 5. Turning: a heading servo, not a gesture
+
+> **Turning needs a heading, and this robot has none of its own.** The proto
+> disables the InertialUnit's yaw axis *and* the Gyro's z axis, so neither the
+> angle nor the rate is measurable — and what the InertialUnit returns in place
+> of a heading is a copy of its own half-scale pitch (§9). The loop now closes on
+> `Supervisor.getSelf().getOrientation()`: the robot's forward axis is +x in its
+> own frame, so the heading is `atan2(m[3], m[0])` of the row-major matrix,
+> counter-clockwise-positive, which is the sign `YawServo` and `TURN_SIGN`
+> already expect. Set `HEADING_SOURCE = "off"` to go back to no turning.
+>
+> `overshoot_frac` was also 0.5, which is exactly the value at which a
+> discrete-clip turn **cannot converge**: firing at |error| = f·nominal leaves
+> |error − nominal| = |1 − 1/f|·|error|, which is ≥ |error| for every f ≤ 0.5, so
+> a clip turned the robot from +e to −e forever. At 0.65 each turn cuts the error
+> to at most 0.54 of what it was.
+
+
 
 NAO has no torso-yaw joint, so "the human turned round" cannot be imitated by a
 joint angle — the robot has to step round. And it cannot be done open-loop

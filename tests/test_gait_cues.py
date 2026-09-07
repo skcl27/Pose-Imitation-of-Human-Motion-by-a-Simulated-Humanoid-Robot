@@ -150,7 +150,7 @@ def test_as_dict_is_json_friendly() -> None:
     json.dumps(d)  # must not raise
     assert set(d) == {
         "state", "cadence_hz", "phase", "swing_side", "intensity", "turn", "conf",
-        "body_yaw_rad", "yaw_conf",
+        "body_yaw_rad", "yaw_conf", "cue_channel",
     }
 
 
@@ -332,3 +332,74 @@ def test_yaw_survives_a_steady_rotation_all_the_way_round() -> None:
     # Monotonically increasing heading, covering most of a full turn.
     assert unwrapped[-1] - unwrapped[0] > math.radians(250)
     assert all(b >= a - 1e-6 for a, b in zip(unwrapped, unwrapped[1:], strict=False))
+
+
+# ---------------------------------------------------------------------------
+# The channel that sees actual WALKING
+# ---------------------------------------------------------------------------
+def _walking_frames(n=120, hz=1.0, fps=15.0, stride_mm=320.0, depth=2500.0):
+    """A subject facing the camera and WALKING: the ankles swing fore/aft past
+    each other while the knees barely change height. That is the case the
+    knee-differential cue cannot see -- measured on recorded sessions, the knee
+    differential had a median of 8 mm against the ankle separation's 102 mm."""
+    frames = []
+    for i in range(n):
+        t = i / fps
+        swing = math.sin(2.0 * math.pi * hz * t)
+        kps = {
+            "left_shoulder": Keypoint(-170.0, -600.0, depth, 1.0),
+            "right_shoulder": Keypoint(170.0, -600.0, depth, 1.0),
+            "left_hip": Keypoint(-90.0, 0.0, depth, 1.0),
+            "right_hip": Keypoint(90.0, 0.0, depth, 1.0),
+            # Knees stay at the same height: no marching.
+            "left_knee": Keypoint(-90.0, 420.0, depth + 0.30 * stride_mm * swing, 1.0),
+            "right_knee": Keypoint(90.0, 420.0, depth - 0.30 * stride_mm * swing, 1.0),
+            # The ankles swing fore/aft (in depth) past each other.
+            "left_ankle": Keypoint(-90.0, 840.0, depth + 0.5 * stride_mm * swing, 1.0),
+            "right_ankle": Keypoint(90.0, 840.0, depth - 0.5 * stride_mm * swing, 1.0),
+        }
+        frames.append(PoseFrame(timestamp_s=t, keypoints=kps, frame_index=i))
+    return frames
+
+
+def test_a_walking_human_is_recognised_by_the_stride_channel() -> None:
+    """Before this channel existed the cue read only a march-in-place signal, so
+    a walking human produced "idle" and the robot was never asked to walk:
+    gait_state was "march" in 0.25% of the frames of a recorded session. Replayed
+    over the same recordings, the stride channel raises the march share and -- the
+    part that matters -- finally yields episodes longer than one 2.6 s walk clip
+    (0 before, 10 after in the newest session)."""
+    ex = GaitCueExtractor()
+    seen = []
+    for frame in _walking_frames():
+        seen.append(ex.update(frame))
+    marching = [c for c in seen if c.state == "march"]
+    assert marching, "a walking human still reads as idle"
+    assert any(c.cue_channel == "stride" for c in marching), \
+        [c.cue_channel for c in marching[:5]]
+    best = max(c.cadence_hz for c in marching)
+    assert 0.5 < best < 2.0, best          # roughly the 1 Hz we synthesised
+
+
+def test_the_stride_channel_needs_both_ankles() -> None:
+    """With an ankle out of frame the stride signal is not computable, and the
+    knee channel must carry the cue alone rather than the extractor guessing."""
+    ex = GaitCueExtractor()
+    for frame in _walking_frames():
+        cropped = dict(frame.keypoints)
+        cropped["left_ankle"] = Keypoint(-90.0, 840.0, 2500.0, 0.1)   # not visible
+        ex.update(PoseFrame(timestamp_s=frame.timestamp_s, keypoints=cropped,
+                            frame_index=frame.frame_index))
+    # No crash, and no stride-driven march from an unusable signal.
+    assert ex._stride.crossings() == 0
+
+
+def test_the_cue_channel_reaches_the_wire() -> None:
+    """The robot logs which cue fired, so a session can say WHY it did or did not
+    walk instead of leaving that to guesswork."""
+    ex = GaitCueExtractor()
+    cmd = None
+    for frame in _walking_frames():
+        cmd = ex.update(frame)
+    assert "cue_channel" in cmd.as_dict()
+    assert cmd.as_dict()["cue_channel"] in ("knee", "stride", "none")

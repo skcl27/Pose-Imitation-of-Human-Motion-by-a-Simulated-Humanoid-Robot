@@ -24,6 +24,8 @@ import types
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from conftest import write_cyclic_clip  # noqa: E402
+
 CONTROLLER_DIR = os.path.join(REPO, "main", "controllers", "pose_imitation_controller")
 sys.path.insert(0, os.path.join(REPO, "main", "libraries"))
 
@@ -121,13 +123,91 @@ class FakeAccelerometer:
         return [ux, -uy, -uz]
 
 
+class FakeNode:
+    """The robot's own scene-tree node, as the Supervisor hands it over.
+
+    Its heading comes from the fake InertialUnit's yaw slot, because that slot is
+    what every turn test in this file has always used to mean "the robot has
+    physically turned". On the real robot that channel is useless (the proto
+    disables the yaw axis, so it reports a copy of the half-scale pitch) and the
+    heading comes from here instead -- so wiring the fake this way means those
+    tests now exercise the path that actually runs.
+
+    getOrientation returns the row-major 3x3 the real API returns; the balance
+    ground truth (centre of mass, static balance, contact points) is answered
+    plausibly so the logging path is exercised, but nothing controls from it.
+    """
+
+    def __init__(self, robot):
+        self.robot = robot
+
+    def getOrientation(self):  # noqa: N802
+        """The row-major world<-torso matrix, R = Rz(yaw) Ry(pitch) Rx(roll).
+
+        Built from the robot's TRUE attitude, which the fake keeps in the
+        InertialUnit's rpy slots minus ``mount_roll`` -- the offset a rotated
+        sensor adds to its own reading and the scene tree does not have. Tests
+        that inject "the robot is rolled 0.6 rad" via imu.rpy therefore reach the
+        control path, which now takes its attitude from here (see
+        ATTITUDE_SOURCE), and the tests specifically about the sensor's mounting
+        offset set mount_roll so the node correctly reports an upright robot
+        while the device reports +1.618.
+        """
+        roll = self.robot.imu.rpy[0] - self.robot.mount_roll
+        pitch = self.robot.imu.rpy[1]
+        yaw = self.robot.imu.rpy[2]
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        return [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr,
+                sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr,
+                -sp, cp * sr, cp * cr]
+
+    def getPosition(self):  # noqa: N802
+        return [0.0, 0.0, 0.334]
+
+    def getCenterOfMass(self):  # noqa: N802
+        return [0.0, 0.0, 0.29]
+
+    def getStaticBalance(self):  # noqa: N802
+        return True
+
+    def getContactPoints(self, includeDescendants=False):  # noqa: N802, ARG002
+        return [object(), object()]
+
+    def getVelocity(self):  # noqa: N802
+        return [0.0] * 6
+
+
 class FakeMotion:
     """Stand-in for Webots' Motion: finishes after ``STEPS`` polls.
 
+    FAITHFUL TO THE R2025a PYTHON BINDING, in two ways that look like pedantry
+    and were in fact the reason this whole harness certified a locomotion layer
+    that had never once run:
+
+    * ``play()`` returns **None**. The real binding is
+      ``def play(self): wb.wbu_motion_play(self._ref)`` -- no return statement.
+      This fake used to return True, so ``if not motion.play()`` passed here and
+      failed on the real robot, every single time. Four recorded sessions logged
+      "start REFUSED by Webots" for 198-964 frames each and not one frame of
+      playback, while the clip was in fact running in Webots and fighting the
+      per-joint commands (measured: LKneePitch reached the clip's own first
+      keyframe, 1.042 rad, while the controller was commanding 0.20-0.52).
+    * ``isValid()`` returns True unconditionally, because the real one compares
+      two freshly-constructed ``ctypes.c_void_p`` objects, which are never equal
+      -- so it is True even for a file Webots failed to load.
+
     ``NEVER_OVER`` reproduces the failure mode that matters most: a clip that
     plays but never reports being over. Because playback suspends per-joint
-    commanding for the WHOLE body, that used to freeze the entire robot
+    commanding for the joints it declares, that used to freeze the legs
     indefinitely with no diagnostic.
+
+    It also models a real PLAYHEAD: ``getTime`` reports a position that
+    ``setTime`` moves and playback advances, and how much is left to play follows
+    from where the playhead is. A fake whose ``getTime`` ignored ``setTime`` could
+    not test cyclic playback at all -- the rewind would appear to do nothing, and
+    a loop that never advances looks identical to a loop that works.
     """
 
     STEPS = 20
@@ -140,23 +220,49 @@ class FakeMotion:
         self.loop = False
         self.time = 0.0
         self.rewinds = 0
+        self.seeks = []
         self._remaining = 0
 
     def isValid(self):  # noqa: N802
+        # Always True -- see the class docstring. The real binding cannot tell.
         return True
 
     def setLoop(self, value):  # noqa: N802
         self.loop = value
 
     def setTime(self, ms):  # noqa: N802
-        self.time = ms
+        """Move the playhead, and with it how much is left to play.
+
+        Both halves matter. A rewind that moved ``getTime`` but not the remaining
+        count would end the clip on schedule however often it was rewound, so a
+        cyclic walk would look like it worked while lasting exactly one clip.
+        """
+        self.time = float(ms)
+        self.seeks.append(float(ms))
         if ms == 0:
             self.rewinds += 1
+        self._remaining = self._steps_left()
+
+    def _steps_left(self):
+        span = max(0.0, self._end_ms() - self.time)
+        return int(round(span / TIMESTEP_MS))
+
+    def _end_ms(self):
+        """Where playback ends.
+
+        ``STEPS`` is what the tests tune, so it -- not DURATION_MS -- defines the
+        end of the clip, measured from wherever ``play()`` was called.
+        """
+        return self._played_from + self.STEPS * TIMESTEP_MS
+
+    _played_from = 0.0
 
     def play(self):
+        self._played_from = self.time
         self._remaining = self.STEPS
         FakeMotion.played.append(os.path.basename(self.path))
-        return True
+        # Returns None, like the real binding. Anything that tests the return
+        # value of this call is broken on the real robot.
 
     def stop(self):
         self._remaining = 0
@@ -164,11 +270,22 @@ class FakeMotion:
     def getDuration(self):  # noqa: N802
         return self.DURATION_MS
 
+    def getTime(self):  # noqa: N802
+        """Playback position in ms, advancing one SIMULATION step per poll.
+
+        A real clip's time advances with the simulation, not by one keyframe
+        spacing per step -- the keyframes are 40 ms apart but the control step is
+        20 ms, so playback interpolates. The early-exit logic reads this against
+        the clip's safe keyframe times, so the rate has to be right.
+        """
+        return max(0.0, self.time)
+
     def isOver(self):  # noqa: N802
         if FakeMotion.NEVER_OVER:
             return False
         if self._remaining > 0:
             self._remaining -= 1
+            self.time += TIMESTEP_MS
             return False
         return True
 
@@ -216,6 +333,10 @@ class FakeRobot:
             self.devices[name + "S"] = FakeSensor(motor)
         self.imu = FakeInertialUnit()
         self.devices["inertial unit"] = self.imu
+        # How far the InertialUnit's own reading is offset from the truth. Zero
+        # by default; the tests about the rotated mount set it (see FakeNode).
+        self.mount_roll = 0.0
+        self._self_node = FakeNode(self)
         self.devices["gyro"] = FakeVector3()
         self.devices["accelerometer"] = FakeAccelerometer(self)
         if with_fsr:
@@ -231,6 +352,10 @@ class FakeRobot:
     def getTime(self):  # noqa: N802
         return self.time
 
+    def getSelf(self):  # noqa: N802
+        """The Supervisor's view of ourselves -- the heading source."""
+        return self._self_node
+
     def step(self, ms):
         self.time += ms / 1000.0
         return 0
@@ -239,7 +364,12 @@ class FakeRobot:
     def simulationReset(self):  # noqa: N802 - Webots API name
         """Restore the initial state, as Webots does: the robot stands back up."""
         self.resets += 1
-        self.imu.rpy = [0.0, 0.0, 0.0]
+        # An upright robot whose sensor is mounted rotated reads its MOUNT
+        # OFFSET, not zero -- the offset is a property of the sensor and a reset
+        # does not change it. Zeroing it here made the scene-tree node (which
+        # subtracts the offset) report a robot rolled by -mount_roll after every
+        # recovery, i.e. permanently fallen.
+        self.imu.rpy = [self.mount_roll, 0.0, 0.0]
         for motor in self.motors.values():
             motor.position = 0.0
 
@@ -274,8 +404,25 @@ def controller_module(monkeypatch, tmp_path):
         for j in ("HipYawPitch", "HipRoll", "HipPitch", "KneePitch",
                   "AnklePitch", "AnkleRoll")
     ) + "\n"
+    # ...and they must carry a first KEYFRAME, because the posture a clip opens
+    # in is the whole reason the handover needs a ramp. These are Cyberbotics'
+    # own opening values for Forwards.motion: a sole-flat crouch of about 0.51
+    # rad (hip + knee + ankle = 0), against the controller's standing 0.10. A
+    # header-only fake made motion_first_pose return {} and the prepare stage
+    # was skipped in every test.
+    values = ",".join(
+        str(v) for _ in ("L", "R")
+        for v in (0, 0.027, -0.505, 1.042, -0.537, -0.027)
+    )
+    # 60 keyframes at the real 40 ms spacing, so the clip has safe places to be
+    # stopped along its WHOLE length (balance.safe_exit_times reads them) rather
+    # than only at t=0. A real walk clip offers 46 of its 66.
+    body = "".join(
+        f"00:{i * 40 // 1000:02d}:{i * 40 % 1000:03d},Pose{i + 1},{values}\n"
+        for i in range(60)
+    )
     for name in ("Forwards.motion", "TurnLeft60.motion", "TurnRight60.motion"):
-        (clips / name).write_text(header, encoding="utf-8")
+        (clips / name).write_text(header + body, encoding="utf-8")
 
     # The shipped default is LEG_CONTROL="pose" -- the legs imitate continuously
     # and locomotion clips are opt-in, because a clip is a 2-3 second commitment
@@ -283,13 +430,10 @@ def controller_module(monkeypatch, tmp_path):
     # locomotion layer, so they opt in; the default itself is asserted by
     # test_the_shipped_default_is_imitation_not_locomotion.
     monkeypatch.setattr(mod, "LEG_CONTROL", "auto")
-    # Likewise the heading: it ships OFF because this proto disables both yaw axes
-    # (see HEADING_FROM_IMU), so turning cannot be closed-loop on the real robot.
-    # The turn tests below are about the servo and the clip planner, which are
-    # correct code that a better sensor would re-enable, so they opt in. The
-    # shipped default is asserted by test_the_shipped_default_has_no_heading_loop.
-    monkeypatch.setattr(mod, "HEADING_FROM_IMU", True)
     monkeypatch.setattr(mod, "MOTION_SEARCH_DIRS_EXTRA", [str(clips)])
+    # So a test can drop another clip in before the controller is constructed --
+    # clip discovery and gait-cycle detection both happen in its __init__.
+    mod._TEST_CLIP_DIR = clips
     # Clip discovery has to be HERMETIC. Setting MOTION_SEARCH_DIRS_EXTRA alone is
     # not enough: default_motion_search_dirs() also appends $WEBOTS_HOME and eight
     # well-known install roots, so on a machine that actually has Webots the real
@@ -304,8 +448,10 @@ def controller_module(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "UDP_PORT", _free_port())
     FakeMotion.played = []
     FakeMotion.NEVER_OVER = False
+    FakeMotion.STEPS = 20            # class state; tests may raise it
     yield mod
     FakeMotion.NEVER_OVER = False
+    FakeMotion.STEPS = 20
     sys.modules.pop("pose_imitation_controller", None)
 
 
@@ -353,6 +499,30 @@ def harness(controller_module):
     h = Harness(controller_module)
     yield h
     h.close()
+
+
+@pytest.fixture
+def cyclic_harness(controller_module):
+    """A harness whose forward clip has a real gait cycle in it.
+
+    The default fixture's clips are 60 IDENTICAL keyframes, which translate
+    nothing, so ``gait_cycle`` correctly refuses them and every other test in
+    this file exercises one-shot playback. This one writes a clip built from a
+    parametric gait (see tests/conftest.py) as ``Forwards50.motion``, which is
+    the filename ``select_walk_clip`` looks for, so the controller discovers it,
+    detects the cycle and promotes it over the short clip -- exactly the path the
+    real robot takes.
+    """
+    clips = controller_module._TEST_CLIP_DIR
+    write_cyclic_clip(clips / "Forwards50.motion", period=26, cycles=3,
+                      lead=8, tail=10)
+    # 6.76 s of clip at 40 ms keyframes is 169 keyframes; the fixture is 97, so
+    # STEPS has to cover its whole length or the fake ends before the cycle does.
+    FakeMotion.STEPS = int(round(96 * 0.04 / (TIMESTEP_MS / 1000.0)))
+    h = Harness(controller_module)
+    yield h
+    h.close()
+    FakeMotion.STEPS = 20
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +586,25 @@ SQUAT = subject(left_leg=(0.0, -0.55, 1.1), right_leg=(0.0, -0.55, 1.1))
 # Legs spread outward: both hips abducted by the same amount.
 LEGS_APART = subject(left_leg=(0.35, 0.0, 0.0), right_leg=(0.35, 0.0, 0.0))
 LEGS_WIDE = subject(left_leg=(0.70, 0.0, 0.0), right_leg=(0.70, 0.0, 0.0))
+# Steps a clip needs before it is PLAYING: the legs must first ramp into the
+# stance the clip opens in (0.84 rad of knee travel at the driver's 1.5 rad/s is
+# 29 steps -- see CLIP_PREPARE_TIMEOUT_S and approach_leg_pose), and only then is
+# playback started. Tests written before that ramp existed spun 4-20 steps and
+# asserted a clip was already running.
+CLIP_RAMP_STEPS = 29
+
+
+def spin_to_clip(harness, keypoints=None, gait=None, limit=None) -> bool:
+    """Spin until a clip is actually playing. True if one started."""
+    keypoints = STANDING if keypoints is None else keypoints
+    gait = MARCH_GAIT if gait is None else gait
+    for _ in range(limit if limit is not None else CLIP_RAMP_STEPS + 30):
+        harness.spin(1, keypoints, gait)
+        if harness.ctl.motion.active:
+            return True
+    return False
+
+
 MARCH_GAIT = {"state": "march", "cadence_hz": 0.9, "phase": 0.5, "swing_side": 1,
               "intensity": 0.8, "turn": 0.0, "conf": 0.95,
               "body_yaw_rad": 0.0, "yaw_conf": 0.95}
@@ -563,8 +752,8 @@ def test_lowering_the_leg_returns_to_a_symmetric_stance(harness) -> None:
 
 def test_marching_plays_a_forward_clip(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
-    mode = harness.spin(20, STANDING, MARCH_GAIT)
-    assert mode == "motion:forward"
+    assert spin_to_clip(harness)
+    assert harness.ctl.leg_mode == "motion:forward"
     assert "Forwards.motion" in FakeMotion.played
 
 
@@ -572,7 +761,7 @@ def test_a_clip_suspends_per_joint_commanding(harness) -> None:
     """While a clip owns the body, our targets must not fight its keyframes --
     and the velocity caps must be lifted or it cannot reach them."""
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(4, STANDING, MARCH_GAIT)
+    assert spin_to_clip(harness)
     assert harness.ctl.driver.suspended is True
     motor = harness.ctl.robot.motors["LKneePitch"]
     assert motor.velocity == pytest.approx(CONFIGS["LKneePitch"].max_velocity)
@@ -609,7 +798,7 @@ def test_a_multi_clip_rotation_keeps_going_until_aligned(harness) -> None:
 
 def test_control_is_reclaimed_when_the_clip_ends(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(4, STANDING, MARCH_GAIT)
+    assert spin_to_clip(harness)
     assert harness.ctl.driver.suspended is True
     mode = harness.spin(200, STANDING, IDLE_GAIT)
     assert harness.ctl.driver.suspended is False
@@ -620,7 +809,7 @@ def test_control_is_reclaimed_when_the_clip_ends(harness) -> None:
 
 def test_falling_aborts_the_clip(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(4, STANDING, MARCH_GAIT)
+    assert spin_to_clip(harness)
     assert harness.ctl.driver.suspended is True
     harness.ctl.imu.rpy = [0.6, 0.0, 0.0]     # well past TILT_ABORT_RAD
     harness.spin(6, STANDING, MARCH_GAIT)
@@ -769,15 +958,20 @@ def test_a_clip_that_never_ends_cannot_freeze_the_robot(harness) -> None:
     mod = harness.mod
     FakeMotion.NEVER_OVER = True
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(10, STANDING, MARCH_GAIT)
+    assert spin_to_clip(harness)
     assert harness.ctl.driver.suspended is True      # clip took the body
 
-    # Spin well past the watchdog budget.
+    # Spin well past the watchdog budget, with the human STILL WALKING -- so the
+    # clip stays wanted and the early exit does not end it first. The watchdog is
+    # the protection against a clip that never reports itself over, which is a
+    # different failure from "nothing wants this clip any more".
     steps = int((mod.MOTION_WATCHDOG_S + 2.0) / (TIMESTEP_MS / 1000.0))
-    mode = harness.spin(steps, STANDING, IDLE_GAIT)
+    mode = harness.spin(steps, STANDING, MARCH_GAIT)
 
     assert harness.ctl.driver.suspended is False     # ... and gave it back
-    assert mode == "pose"
+    # With the human still marching and the forward clip retired, the legs fall
+    # back to marching in place rather than standing there.
+    assert mode in ("pose", "march:march"), mode
     # The offending clip is not tried again.
     assert "forward" not in harness.ctl.motion.available
 
@@ -787,7 +981,7 @@ def test_the_watchdog_uses_the_clips_own_duration(harness) -> None:
     mod = harness.mod
     FakeMotion.NEVER_OVER = True
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(4, STANDING, MARCH_GAIT)
+    assert spin_to_clip(harness)
     assert harness.ctl.driver.suspended is True
     budget = harness.ctl._motion_deadline - harness.ctl._motion_started_at
     assert budget < mod.MOTION_WATCHDOG_S
@@ -799,7 +993,7 @@ def test_repeated_bad_locomotion_gives_up_on_clips(harness) -> None:
     mod = harness.mod
     harness.spin(60, STANDING, IDLE_GAIT)
     for _ in range(mod.MOTION_MAX_FAILURES):
-        harness.spin(6, STANDING, MARCH_GAIT)
+        assert spin_to_clip(harness)
         harness.ctl.imu.rpy = [0.6, 0.0, 0.0]        # tilt abort
         harness.spin(4, STANDING, MARCH_GAIT)
         harness.ctl.imu.rpy = [0.0, 0.0, 0.0]
@@ -816,8 +1010,8 @@ def test_a_clip_is_not_started_while_the_robot_is_wobbling(harness) -> None:
     assert not FakeMotion.played
     assert mode == "pose"
     harness.ctl.gyro.values = [0.0, 0.0, 0.0]
-    harness.spin(20, STANDING, MARCH_GAIT)
-    assert "Forwards.motion" in FakeMotion.played    # ... and once calm, it goes
+    assert spin_to_clip(harness)                     # ... and once calm, it goes
+    assert "Forwards.motion" in FakeMotion.played
 
 
 def test_a_clip_stays_blocked_for_a_while_after_a_tilt_spike(harness) -> None:
@@ -842,8 +1036,8 @@ def test_a_clip_stays_blocked_for_a_while_after_a_tilt_spike(harness) -> None:
     assert mode == "march:march"
     # Give risk time to decay back down toward the current (calmer) tilt.
     harness.spin(400, STANDING, IDLE_GAIT)          # ~8s, several time constants
-    harness.spin(20, STANDING, MARCH_GAIT)
-    assert "Forwards.motion" in FakeMotion.played   # ... and once it has, it goes
+    assert spin_to_clip(harness)                    # ... and once it has, it goes
+    assert "Forwards.motion" in FakeMotion.played
 
 
 def test_a_failing_step_does_not_end_the_loop_or_limp_the_robot(harness) -> None:
@@ -878,7 +1072,7 @@ def test_a_failing_step_does_not_end_the_loop_or_limp_the_robot(harness) -> None
 
 def test_recovery_forces_the_body_back_if_a_step_fails_mid_clip(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(4, STANDING, MARCH_GAIT)
+    assert spin_to_clip(harness)
     assert harness.ctl.driver.suspended is True
     harness.ctl._recover_from_error()
     assert harness.ctl.driver.suspended is False
@@ -996,8 +1190,8 @@ def test_a_wobbling_heading_does_not_thrash_turn_clips(harness) -> None:
 
 def test_walking_is_not_starved_by_a_settled_heading(harness) -> None:
     harness.spin(60, STANDING, IDLE_GAIT)
-    mode = harness.spin(20, STANDING, MARCH_GAIT)
-    assert mode == "motion:forward"
+    assert spin_to_clip(harness)
+    assert harness.ctl.leg_mode == "motion:forward"
     assert "Forwards.motion" in FakeMotion.played
 
 
@@ -1050,8 +1244,7 @@ def test_a_walk_clip_only_takes_the_legs_not_the_arms(harness) -> None:
     walk clips never command an arm joint, so there was nothing to protect.
     """
     harness.spin(60, STANDING, IDLE_GAIT)
-    harness.spin(4, STANDING, MARCH_GAIT)
-    assert harness.ctl.motion.active
+    assert spin_to_clip(harness)
     d = harness.ctl.driver
     assert d.suspended is True
     # Legs handed over ...
@@ -1079,8 +1272,7 @@ def test_a_clip_that_declares_nothing_still_gets_the_whole_body(harness, tmp_pat
     c = harness.ctl
     harness.spin(60, STANDING, IDLE_GAIT)
     c.motion._joints["forward"] = []                  # as if the header were junk
-    harness.spin(4, STANDING, MARCH_GAIT)
-    assert c.motion.active
+    assert spin_to_clip(harness)
     assert c.driver._is_suspended("LShoulderPitch")
     assert c.driver._is_suspended("LKneePitch")
 
@@ -1226,6 +1418,7 @@ def test_a_rotated_inertial_unit_does_not_read_as_a_fall(harness) -> None:
     the robot onto one foot.
     """
     c = harness.ctl
+    c.robot.mount_roll = 1.618                 # the sensor is rotated, the robot is not
     c.imu.rpy = [1.618, 0.0, 0.0]              # what the real robot reports
     harness.spin(120, STANDING, IDLE_GAIT)
 
@@ -1246,6 +1439,7 @@ def test_a_real_tilt_on_top_of_the_offset_is_still_detected(harness) -> None:
     """Correcting the zero must not blind the tilt gates -- that would trade one
     silent failure for a much worse one."""
     c = harness.ctl
+    c.robot.mount_roll = 1.618
     c.imu.rpy = [1.618, 0.0, 0.0]
     harness.spin(120, STANDING, IDLE_GAIT)
     assert c._imu_zero is not None
@@ -1264,6 +1458,7 @@ def test_the_zero_is_not_latched_from_a_fallen_robot(harness, monkeypatch) -> No
     lying down is upright. The foot sensors are the independent witness: soles
     carrying body weight mean standing, whatever the IMU claims."""
     c = harness.ctl
+    c.robot.mount_roll = 1.60
     c.imu.rpy = [1.60, 0.0, 0.0]
     # Feet carrying nothing -- the robot is not standing on them.
     monkeypatch.setattr(FakeFsr, "TOTAL_N", 0.0)
@@ -1291,6 +1486,7 @@ def test_the_learned_zero_reaches_the_log(harness, monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(mod, "UDP_PORT", _free_port())   # the fixture holds the other
     other = Harness(mod)
     try:
+        other.ctl.robot.mount_roll = 1.618
         other.ctl.imu.rpy = [1.618, 0.0, 0.0]
         other.spin(140, STANDING, IDLE_GAIT)
         other.ctl.trajectory_log.close()
@@ -1444,15 +1640,16 @@ def test_head_height_is_reported_in_the_log(harness, monkeypatch, tmp_path) -> N
         other.ctl.sock.close()
 
 
-def test_the_shipped_default_is_imitation_not_locomotion() -> None:
-    """The lower body should follow your legs in real time, not hand them to a
-    canned clip.
+def test_the_shipped_default_drives_the_whole_stack() -> None:
+    """LEG_CONTROL ships as "auto": clips for locomotion, imitation for the rest.
 
-    A .motion clip is a fixed keyframe sequence played to completion, and while it
-    runs the camera is ignored for the 12 leg joints -- the opposite of imitation.
-    Balance is handled instead by shifting the centre of mass to make the imitated
-    pose holdable (lower_body._shift_com), so the clips are no longer needed to
-    keep the robot up and are opt-in for covering ground.
+    It was "pose" for a while, on the reasoning that a clip is a 2-3 second
+    commitment during which the camera is ignored for the leg joints. That is
+    true, and it cost the project walking and turning entirely -- the alternative
+    it left in place can do neither, because NAO has no torso-yaw joint (a
+    rotation can only be imitated by stepping round) and translating a
+    free-standing NAO needs a balanced gait, which is what the clips are. The
+    arms, head and torso keep imitating throughout playback.
     """
     import importlib.util
     import os
@@ -1464,7 +1661,7 @@ def test_the_shipped_default_is_imitation_not_locomotion() -> None:
     # regardless of what any fixture monkeypatched.
     for line in source.splitlines():
         if line.startswith("LEG_CONTROL"):
-            assert line.split("=")[1].strip() == '"pose"', line
+            assert line.split("=")[1].split("#")[0].strip() == '"auto"', line
             break
     else:
         raise AssertionError("LEG_CONTROL not found")
@@ -1636,14 +1833,20 @@ def test_the_inertial_unit_halves_the_pitch_and_leaks_the_heading() -> None:
 
 
 def _enabled_gravity_harness(mod, monkeypatch):
-    """A controller with the gravity attitude path switched on (it ships off)."""
+    """A controller with the gravity attitude path switched on (it ships off).
+
+    Also selects it as the attitude SOURCE: the shipped source is the Supervisor
+    (see ATTITUDE_SOURCE), which would otherwise answer first and these tests
+    would certify a path that never runs.
+    """
+    monkeypatch.setattr(mod, "ATTITUDE_SOURCE", "accel")
     monkeypatch.setattr(mod, "TILT_FROM_ACCELEROMETER", True)
     monkeypatch.setattr(mod, "LEG_CONTROL", "pose")
     monkeypatch.setattr(mod, "UDP_PORT", _free_port())
     return Harness(mod)
 
 
-def test_gravity_is_measured_and_logged_but_not_acted_on(harness) -> None:
+def test_gravity_is_measured_and_logged_even_when_not_acted_on(harness) -> None:
     """The shipped configuration computes the gravity attitude, logs it, and does
     NOT control from it -- see test_the_shipped_default_does_not_control_from_gravity
     for why. It still has to be measured, because it is the only honest witness to
@@ -1653,7 +1856,7 @@ def test_gravity_is_measured_and_logged_but_not_acted_on(harness) -> None:
     assert c.accel is not None
     assert c._acc_zero is not None, "no gravity zero was learned"
     assert c._acc_tilt is not None, "gravity was never computed"
-    assert c._tilt_source == "imu", c._tilt_source
+    assert c._tilt_source == "supervisor", c._tilt_source
     diag = c._diagnostics(0.0, 0.0, 0.0)
     assert diag["acc_roll"] is not None and diag["acc_pitch"] is not None
 
@@ -1732,13 +1935,16 @@ def test_the_shipped_default_does_not_control_from_gravity() -> None:
         raise AssertionError("TILT_FROM_ACCELEROMETER not found")
 
 
-def test_the_pitch_scale_is_applied_to_pitch_alone(harness) -> None:
+def test_the_pitch_scale_is_applied_to_pitch_alone(harness, monkeypatch) -> None:
     """The device reports half the real pitch, so IMU_PITCH_SCALE exists to undo
     that -- and it ships at 1.0, the conservative end, because the only session
     that ran the loop on a full-scale pitch limit-cycled (see IMU_PITCH_SCALE for
     the numbers). Whatever it is set to, it must reach the pitch channel and
     nothing else, and both readings must be logged separately."""
     c = harness.ctl
+    # This is about the InertialUnit FALLBACK, so select it: the shipped source
+    # is the Supervisor and it would otherwise answer first.
+    monkeypatch.setattr(harness.mod, "ATTITUDE_SOURCE", "imu")
     harness.spin(120, STANDING, IDLE_GAIT)
     scale = mod_const(harness, "IMU_PITCH_SCALE")
     assert 1.0 <= scale <= 2.0, "the honest range: half-scale reading, or undone"
@@ -1782,26 +1988,28 @@ def test_a_recovery_clears_the_balance_correction(harness) -> None:
     assert abs(harness.angle("LHipPitch")) < 0.2, harness.angle("LHipPitch")
 
 
-def test_the_shipped_default_has_no_heading_loop() -> None:
+def test_the_heading_never_comes_from_the_inertial_unit() -> None:
     """This proto disables the yaw axis on the InertialUnit AND the z axis on the
-    Gyro, so the robot cannot observe its own rotation at all. What the IMU
-    returns in place of a heading is the pitch channel (see
+    Gyro, so the robot cannot observe its own rotation with either. What the IMU
+    returns in place of a heading is its own half-scale pitch channel (see
     test_the_inertial_unit_halves_the_pitch_and_leaks_the_heading), and servoing
-    on that produced a heading "error" while standing still -- median 21 deg on
-    recorded sessions."""
+    on that produced a heading "error" of a median 21 deg while standing still.
+
+    Turning therefore closes its loop on the Supervisor's orientation instead --
+    the one place this project uses simulator ground truth, and it steers rather
+    than balances."""
     import os
 
     path = os.path.join(CONTROLLER_DIR, "pose_imitation_controller.py")
     with open(path, encoding="utf-8") as handle:
         source = handle.read()
-    # Read the constant out of the source, not the module: the clip fixture
-    # monkeypatches it on so the turn planner can be tested.
+    values = {}
     for line in source.splitlines():
-        if line.startswith("HEADING_FROM_IMU"):
-            assert line.split("=")[1].strip() == "False", line
-            break
-    else:
-        raise AssertionError("HEADING_FROM_IMU not found")
+        for name in ("HEADING_FROM_IMU", "HEADING_SOURCE"):
+            if line.startswith(name) and name not in values:
+                values[name] = line.split("=")[1].split("#")[0].strip()
+    assert values.get("HEADING_FROM_IMU") == "False", values
+    assert values.get("HEADING_SOURCE") == '"supervisor"', values
 
 
 def test_no_hip_yaw_bias_without_a_heading(controller_module, monkeypatch) -> None:
@@ -1825,3 +2033,569 @@ def test_no_hip_yaw_bias_without_a_heading(controller_module, monkeypatch) -> No
             assert abs(tilt) <= p.sole_tilt_budget + 1e-6, (side, tilt)
     finally:
         other.close()
+
+
+# ---------------------------------------------------------------------------
+# Locomotion: the handover
+# ---------------------------------------------------------------------------
+def test_a_clip_starts_even_though_play_returns_nothing(harness) -> None:
+    """The bug that cost this project walking AND turning.
+
+    Webots' R2025a Python binding is ``def play(self): wb.wbu_motion_play(...)``
+    -- no return statement -- so ``play()`` is None. The controller tested it as
+    ``if not motion.play(): return False``, so MotionPlayer.start() returned False
+    on every call ever made: leg_mode is "pose" in 100.0% of the frames of every
+    recorded session, and four sessions logged "start REFUSED by Webots" for
+    198-964 frames each.
+
+    And the clip HAD started -- wbu_motion_play does not care what Python does
+    with its return value, and the controller library applies a playing clip's
+    keyframes every step. So the clip drove the legs while the controller believed
+    nothing was playing and kept commanding them itself: log 1788428293 has
+    LKneePitch MEASURED at the clip's own first keyframe, 1.042 rad, while the
+    controller commanded 0.20-0.52. Two commanders, one joint set.
+    """
+    c = harness.ctl
+    assert c.motion._load("forward") is not None
+    motion = c.motion._load("forward")
+    assert motion.play() is None, "the fake must match the real binding"
+
+    harness.spin(150, STANDING, IDLE_GAIT)
+    harness.spin(200, STANDING, MARCH_GAIT)
+    assert "Forwards.motion" in FakeMotion.played, FakeMotion.played
+    assert c.motion.active is True
+    assert c.leg_mode == "motion:forward", c.leg_mode
+    assert c._diagnostics(0.0, 0.0, 0.0)["clip_status"] == "playing"
+    # ...and the joints the clip declares are no longer ours to command.
+    assert c.driver.suspended is True
+
+
+def test_the_legs_reach_the_clips_stance_before_it_plays(harness) -> None:
+    """A clip opens in a deep sole-flat crouch (knee 1.042 rad) and commands that
+    first keyframe on its first step, with the velocity caps already lifted. The
+    controller stands at knee 0.20. Handing over from there asks for 0.84 rad in
+    one 20 ms step, so the legs are ramped into the clip's own stance first and
+    the clip is played only once they are measurably there."""
+    c = harness.ctl
+    pose = c.motion.first_pose("forward")
+    assert pose, "the clip's opening keyframe must be readable"
+    target = pose["LKneePitch"]
+    assert target > 0.9, target                      # it really is a deep crouch
+
+    harness.spin(150, STANDING, IDLE_GAIT)
+    assert harness.angle("LKneePitch") < 0.35        # standing crouch
+
+    # One step of wanting to walk must NOT start the clip -- it must ramp.
+    FakeMotion.played.clear()
+    harness.spin(2, STANDING, MARCH_GAIT)
+    assert not FakeMotion.played, "played before reaching the stance"
+    assert c.leg_mode == "prepare:forward", c.leg_mode
+    assert c._preparing == "forward"
+
+    # The ramp is rate-limited: no step bigger than the driver allows.
+    prev = harness.angle("LKneePitch")
+    for _ in range(40):
+        harness.spin(1, STANDING, MARCH_GAIT)
+        now = harness.angle("LKneePitch")
+        assert now - prev <= c.driver.LEG_POSE_RATE * 0.02 + 1e-6, (prev, now)
+        prev = now
+        if FakeMotion.played:
+            break
+    assert FakeMotion.played, "never got there"
+    # It arrived at the clip's stance, and only then played.
+    assert abs(prev - target) <= c.driver.LEG_POSE_TOL + 1e-6, (prev, target)
+
+
+def test_a_clip_that_will_not_say_what_it_opens_in_is_still_played(harness,
+                                                                   monkeypatch) -> None:
+    """Refusing to walk at all is worse than a jerky start."""
+    monkeypatch.setattr(harness.ctl.motion, "_first_pose", {"forward": {}})
+    harness.spin(150, STANDING, IDLE_GAIT)
+    harness.spin(30, STANDING, MARCH_GAIT)
+    assert "Forwards.motion" in FakeMotion.played
+
+
+def test_an_unreachable_stance_gives_up_instead_of_stalling(harness,
+                                                            monkeypatch) -> None:
+    """If a leg cannot get to the clip's stance -- blocked, or another layer
+    fighting -- locomotion must count a failure and eventually stop trying, not
+    ramp forever. Each attempt is bounded by CLIP_PREPARE_TIMEOUT_S and the
+    existing MOTION_MAX_FAILURES policy then retires the clips for the session,
+    so the robot falls back to imitating instead of ramping in place."""
+    c = harness.ctl
+    mod = harness.mod
+    monkeypatch.setattr(type(c.driver), "approach_leg_pose",
+                        lambda *a, **k: False)      # never arrives
+    harness.spin(150, STANDING, IDLE_GAIT)
+    per_attempt = int(mod.CLIP_PREPARE_TIMEOUT_S / 0.02) + 4
+    for _ in range(mod.MOTION_MAX_FAILURES):
+        harness.spin(per_attempt, STANDING, MARCH_GAIT)
+    assert not FakeMotion.played, "played without reaching the stance"
+    assert c._motion_failures >= mod.MOTION_MAX_FAILURES, c._motion_failures
+    assert c.motion.available == {}, "clips were not retired after repeated failures"
+    # ...and the robot is still under control, imitating.
+    mode = harness.spin(30, STANDING, IDLE_GAIT)
+    assert mode in ("pose", "march:march"), mode
+    assert c.driver.suspended is False
+
+
+def test_the_crouch_comes_back_down_gently_after_a_clip(harness) -> None:
+    """A clip ENDS in the same 0.51 rad squat it opened in, and the lower body
+    stands at 0.10. Its crouch rate limiter snaps to its first sample, so without
+    seeding it the first post-clip step commands the whole 0.41 rad of knee travel
+    at once -- the handover jolt again, in reverse."""
+    c = harness.ctl
+    harness.spin(150, STANDING, IDLE_GAIT)
+    harness.spin(40, STANDING, MARCH_GAIT)           # ramp + start
+    assert c.motion.active
+    knee_in_clip = harness.angle("LKneePitch")
+    # Long enough for the WALK LATCH to expire as well as the clip to finish:
+    # while the latch holds, a finished clip is immediately followed by another
+    # (that is the point of it -- see WALK_LATCH_RELEASE_S), so a few steps of
+    # idle gait is not enough to see the robot stand up.
+    limit = int((mod_const(harness, "WALK_LATCH_RELEASE_S") + 2.0) / 0.02)
+    for _ in range(limit):
+        harness.spin(1, STANDING, IDLE_GAIT)
+        if not c.motion.active and c._walk_latch_until is None:
+            break
+    assert not c.motion.active
+    lb = c.driver.lower_body
+    assert lb._crouch is not None, "the crouch limiter was not seeded"
+    assert lb._crouch > 0.2, lb._crouch               # seeded from the clip's squat
+    # And it comes down at the rate limit, not in one step.
+    prev = harness.angle("LKneePitch")
+    for _ in range(10):
+        harness.spin(1, STANDING, IDLE_GAIT)
+        now = harness.angle("LKneePitch")
+        assert prev - now <= 2.0 * lb.params.crouch_rate_limit * 0.02 + 0.02, (prev, now)
+        prev = now
+    assert prev < knee_in_clip
+
+
+# ---------------------------------------------------------------------------
+# Turning: the heading
+# ---------------------------------------------------------------------------
+def test_turning_closes_its_loop_on_the_supervisor_heading(harness) -> None:
+    """The robot's own rotation is not measurable with its sensors (both yaw axes
+    are disabled in the proto), so the loop closes on the Supervisor's
+    orientation: the robot's forward axis is +x in its own frame, so the heading
+    is atan2(m[3], m[0]) of the row-major orientation matrix, CCW-positive =
+    toward its own left, which is the sign YawServo expects."""
+    c = harness.ctl
+    assert c.self_node is not None
+    assert c.heading_available is True
+    for yaw in (0.0, 0.4, -0.9, 2.5):
+        c.imu.rpy = [c._imu_zero[0] if c._imu_zero else 0.0, 0.0, yaw]
+        assert c._heading(999.0) == pytest.approx(yaw, abs=1e-9), yaw
+    # It reaches the log, so a session can be read afterwards.
+    c.imu.rpy = [0.0, 0.0, 0.4]
+    diag = c._diagnostics(0.0, 0.0, 999.0)
+    assert diag["sv_heading"] == pytest.approx(0.4, abs=1e-9)
+
+
+def test_without_a_supervisor_there_is_no_turning(controller_module,
+                                                  monkeypatch) -> None:
+    """A world without `supervisor TRUE` must degrade to no turning and no hip-yaw
+    bias, loudly, rather than servoing on a number that is not a heading."""
+    monkeypatch.setattr(controller_module, "UDP_PORT", _free_port())
+    monkeypatch.setattr(FakeRobot, "getSelf", lambda self: None)
+    other = Harness(controller_module)
+    try:
+        c = other.ctl
+        assert c.self_node is None
+        assert c.heading_available is False
+        other.spin(150, STANDING, dict(IDLE_GAIT, body_yaw_rad=0.9))
+        assert not FakeMotion.played, "turned without a heading"
+        assert other.angle("LHipYawPitch") == pytest.approx(0.0, abs=1e-6)
+    finally:
+        other.close()
+
+
+def test_the_ground_truth_is_logged_but_never_controlled_from(harness) -> None:
+    """The simulator can be asked for the true centre of mass and whether it is
+    inside the convex hull of the real contact points. That is logged beside the
+    model's own estimate so the model can be VALIDATED -- but the balance loop
+    stays model-based, so the algorithm remains one a real NAO could run."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    cols = set(harness.mod.DIAGNOSTIC_COLUMNS)
+    for name in ("sv_com_x", "sv_com_y", "sv_com_z", "sv_balanced", "sv_contacts",
+                 "sv_heading"):
+        assert name in cols, name
+    diag = c._diagnostics(0.0, 0.0, 0.0)
+    assert diag["sv_com_z"] == pytest.approx(0.29, abs=1e-9)
+    assert diag["sv_balanced"] == 1
+    assert diag["sv_contacts"] == 2
+    # The balance loop is still the model's: its correction comes from
+    # BalanceController, which never sees a Supervisor.
+    assert c.driver.balance is not None
+    assert not hasattr(c.driver.balance, "self_node")
+
+
+# ---------------------------------------------------------------------------
+# The attitude: from the scene tree, not from a sensor that cannot report it
+# ---------------------------------------------------------------------------
+def test_the_attitude_comes_from_the_scene_tree(harness) -> None:
+    """Both of this robot's attitude sensors are provably wrong (see
+    ATTITUDE_SOURCE), so the controller asks the scene tree instead -- the same
+    call it already makes for the heading."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c._tilt_source == "supervisor", c._tilt_source
+    assert c.attitude_ready is True
+    for roll, pitch in ((0.0, 0.0), (0.25, 0.0), (0.0, -0.30), (-0.15, 0.20)):
+        c.imu.rpy = [roll, pitch, 0.0]
+        got = c._torso_tilt(c.robot.getTime(), 999.0, 999.0, None)
+        assert got[0] == pytest.approx(roll, abs=1e-6), (roll, got)
+        assert got[1] == pytest.approx(pitch, abs=1e-6), (pitch, got)
+    # ...and it needs no learned zero to be meaningful, unlike the sensors.
+    fresh = c._supervisor_tilt()
+    assert fresh is not None
+
+
+def test_a_turned_robot_is_not_reported_as_pitched(harness) -> None:
+    """The fall this fixes, and the reason walking could never start.
+
+    The InertialUnit's yaw axis is disabled, which makes its pitch channel carry
+    a body rotation one-for-one at half scale. In log 1788768834 an episode ran
+    3,735 s with the robot standing on two evenly loaded flat soles
+    (hip+knee+ankle = 0.0000, head 0.439 m, 25.258 N per foot, model margin
+    +0.062 m) while the InertialUnit reported -0.263 rad of pitch and
+    imu_yaw/imu_pitch_raw = 1.073 -- the robot had merely shuffled ~30 deg off
+    its spawn heading. The balance loop held +0.18 rad of pelvis correction for
+    an hour against a tilt that did not exist, and _settled() -- which the clip
+    layer needs before it will play anything -- passed in 0.015% of that episode
+    against 71.2% elsewhere. So the phantom did not just risk a fall; it made
+    walking impossible.
+    """
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    # A pure 30 deg body rotation, no tilt whatsoever.
+    c.imu.rpy = [0.0, 0.0, math.radians(30.0)]
+    roll, pitch = c._torso_tilt(c.robot.getTime(), 999.0, 999.0, None)
+    assert abs(pitch) < 1e-6, pitch          # NOT -0.26
+    assert abs(roll) < 1e-6, roll
+    # The heading, meanwhile, is exactly the rotation -- reported separately.
+    assert c._heading(999.0) == pytest.approx(math.radians(30.0), abs=1e-9)
+    # And the robot stays settled enough to start a clip.
+    harness.spin(60, STANDING, IDLE_GAIT)
+    assert c._settled(roll, pitch) is True
+
+
+def test_the_ramp_into_a_clip_keeps_both_soles_flat(harness) -> None:
+    """The ramp added to make the handover safe was unsafe on its own.
+
+    A sole's attitude is Hip + Knee + Ankle, and from the standing crouch to a
+    walk clip's opening stance the knee travels 0.842 rad against the hip's 0.405
+    and the ankle's 0.437. Rate-limiting every joint at the same speed leaves the
+    knee still moving when the others have stopped: simulated against the repo's
+    CoM model that drives the sum to 0.405 rad -- eight times the 0.05 sole-tilt
+    budget -- and the fore/aft support margin to -0.064 m. Each joint's rate is
+    therefore scaled by its share of the longest travel, so they arrive together.
+    """
+    c = harness.ctl
+    budget = c.driver.lower_body.params.sole_tilt_budget
+    harness.spin(150, STANDING, IDLE_GAIT)
+    worst = 0.0
+    for _ in range(CLIP_RAMP_STEPS + 20):
+        harness.spin(1, STANDING, MARCH_GAIT)
+        for side in ("L", "R"):
+            total = (harness.angle(f"{side}HipPitch")
+                     + harness.angle(f"{side}KneePitch")
+                     + harness.angle(f"{side}AnklePitch"))
+            worst = max(worst, abs(total))
+        if c.motion.active:
+            break
+    assert c.motion.active, "never reached the clip"
+    assert worst <= budget + 0.02, f"the ramp tipped the soles by {worst:.3f} rad"
+
+
+def test_the_longest_turn_clip_is_not_killed_by_the_watchdog(harness,
+                                                             monkeypatch) -> None:
+    """TurnLeft180 runs 9.0 s. Capping the watchdog budget at MOTION_WATCHDOG_S
+    (8.0) guaranteed it overran, was dropped as broken and counted a failure --
+    so the only clip that can turn the robot right round in one action could
+    never be used. The clip's own duration sets the budget when it is knowable."""
+    monkeypatch.setattr(FakeMotion, "DURATION_MS", 9000.0)
+    c = harness.ctl
+    harness.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(harness)
+    budget = c._motion_deadline - c._motion_started_at
+    assert budget > 9.0, budget
+    assert budget == pytest.approx(9.0 * 1.5 + 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Smoothness: stopping a clip early, and holding the walk request
+# ---------------------------------------------------------------------------
+def test_a_clip_stops_early_instead_of_running_to_its_end(harness) -> None:
+    """A clip used to be played to completion, which made its length the latency
+    of "stop walking" -- and that is what kept the robot on Cyberbotics' short
+    2.60 s stride, one start-and-stop transient per 0.095 m, measured at 0.036 m/s
+    against NAO's ~0.10.
+
+    Not every keyframe qualifies, and the gate that matters is momentum: a pose
+    can be in double support with both soles flat and the CoM inside the polygon
+    and still be travelling at 0.18 m/s, and freezing the legs there hands back a
+    robot that walks itself over. With that gate, Forwards.motion offers 33 of its
+    66 keyframes (longest wait 1.04 s) and the turn clips 49 of 73 and 108 of 226
+    (0.52 s). A continuous walk clip offers very few -- 38 of 170, up to 2.56 s
+    apart -- which is why it is stopped by leaving its gait cycle instead; see
+    the cyclic tests at the end of this file.
+    """
+    c = harness.ctl
+    # A clip long enough to outlive the walk latch, so "stopped early" is
+    # distinguishable from "ran out of keyframes".
+    FakeMotion.STEPS = 90
+    harness.spin(150, STANDING, IDLE_GAIT)
+    assert spin_to_clip(harness)
+    started = c.motion.time_s()
+    assert started is not None
+
+    # The human stops. Wait out the latch; the clip must then end EARLY.
+    limit = int((mod_const(harness, "WALK_LATCH_RELEASE_S") + 0.5) / 0.02)
+    for _ in range(limit):
+        harness.spin(1, STANDING, IDLE_GAIT)
+        if not c.motion.active:
+            break
+    assert not c.motion.active, "the clip ran to its end instead of exiting"
+    assert c._early_exits >= 1, "the clip was not stopped early"
+    assert c.driver.suspended is False          # the legs came back
+
+
+def test_the_walk_request_survives_a_cue_dropout(harness) -> None:
+    """The cue flickers: measured over the first session that ever walked, the
+    median "march" run was 1.32 s -- shorter than one clip -- and 33 of the 65
+    idle runs were under 1.2 s, totalling 18.2 s. Each of those used to end a walk
+    and pay for a fresh 0.6-1.0 s prepare ramp, which is the stutter the user
+    sees. The request is therefore latched for WALK_LATCH_RELEASE_S."""
+    c = harness.ctl
+    harness.spin(150, STANDING, IDLE_GAIT)
+    assert spin_to_clip(harness)
+    assert c._walk_latch_until is not None
+
+    # A short dropout -- well inside the latch -- must not stop the walk.
+    harness.spin(int(0.4 / 0.02), STANDING, IDLE_GAIT)
+    assert c.motion.active, "a 0.4 s cue dropout ended the walk"
+    assert c._walk_latch_until is not None
+
+    # The cue comes back: the walk simply continues, with no fresh ramp.
+    FakeMotion.played.clear()
+    harness.spin(20, STANDING, MARCH_GAIT)
+    assert c.motion.active
+    assert c.leg_mode.startswith("motion:"), c.leg_mode
+
+
+def test_the_latch_does_not_outlive_the_human(harness) -> None:
+    """A human who has walked out of frame is not walking, whatever the last cue
+    said -- otherwise the robot would keep going on a stale request."""
+    c = harness.ctl
+    harness.spin(150, STANDING, IDLE_GAIT)
+    assert spin_to_clip(harness)
+    assert c._walk_latch_until is not None
+    # Stop sending frames at all: the driver goes stale.
+    harness.spin(int((mod_const(harness, "STALE_AFTER_S") + 0.2) / 0.02), None)
+    assert c.driver.stats.stale is True
+    assert c._walk_latch_until is None, "the walk latch outlived the human"
+
+
+def test_the_clip_time_and_latch_reach_the_log(harness) -> None:
+    c = harness.ctl
+    cols = set(harness.mod.DIAGNOSTIC_COLUMNS)
+    assert {"clip_time", "walk_latched"} <= cols
+    harness.spin(150, STANDING, IDLE_GAIT)
+    assert spin_to_clip(harness)
+    diag = c._diagnostics(0.0, 0.0, 0.0)
+    assert diag["clip_time"] is not None
+    assert diag["walk_latched"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cyclic gait (GAIT_CYCLE)
+# ---------------------------------------------------------------------------
+def test_the_controller_promotes_a_cyclic_clip_over_the_short_one(cyclic_harness) -> None:
+    """Selection happens at startup, from the clips actually on disk.
+
+    Both candidates are discovered; the long one wins only because a cycle was
+    found inside it. Nothing downstream ever sees two forward actions.
+    """
+    c = cyclic_harness.ctl
+    assert os.path.basename(c.motion.available["forward"]) == "Forwards50.motion"
+    assert "forward_continuous" not in c.motion.available
+    cycle = c.motion.cycle("forward")
+    assert cycle is not None
+    assert cycle.speed_mps > 0.0
+
+
+def test_a_cyclic_clip_repeats_its_stride_instead_of_restarting(cyclic_harness) -> None:
+    """The heart of it: one clip, many strides, no transient in between.
+
+    Played one-shot the robot pays a start-and-stop for every 0.095 m -- a squat,
+    an acceleration, a settle that travels BACKWARD, and then a fresh prepare
+    ramp before it can go again. Cycled, the clip is rewound at a seam where no
+    joint moves, so the stride simply repeats: 47 start/stop cycles in a 10 s
+    walk become 1.
+    """
+    h, c = cyclic_harness, cyclic_harness.ctl
+    h.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(h)
+    clip = c.motion._cache["forward"]
+    plays_at_start = FakeMotion.played.count("Forwards50.motion")
+
+    # Keep asking to walk for several stride-lengths' worth of steps.
+    cycle = c.motion.cycle("forward")
+    steps = int(round(cycle.period_s * 3.0 / (TIMESTEP_MS / 1000.0)))
+    h.spin(steps, STANDING, MARCH_GAIT)
+
+    assert c.motion.active, "the walk stopped on its own"
+    assert c._cycles_walked >= 2, f"only {c._cycles_walked} strides repeated"
+    # It repeated by REWINDING, not by replaying: the clip was played once.
+    assert FakeMotion.played.count("Forwards50.motion") == plays_at_start
+    # ...and each rewind moved the playhead back by exactly one period.
+    rewinds = [t for t in clip.seeks if t > 0.0]
+    assert rewinds, "no seek was ever issued"
+    # The playhead stays inside the loop window for the whole walk.
+    now = c.motion.time_s()
+    assert cycle.loop_start_s - 0.05 <= now <= cycle.loop_end_s + 0.05
+
+
+def test_a_cyclic_clip_leaves_through_the_clips_own_deceleration(cyclic_harness) -> None:
+    """How it stops. Not by freezing mid-stride -- the legs would stop and the
+    body would keep its momentum -- but by jumping once into the clip's own
+    closing settle, so Cyberbotics' balanced feet-together deceleration is what
+    brings the robot to rest."""
+    h, c = cyclic_harness, cyclic_harness.ctl
+    h.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(h)
+    cycle = c.motion.cycle("forward")
+    clip = c.motion._cache["forward"]
+    h.spin(int(round(cycle.period_s * 2.0 / (TIMESTEP_MS / 1000.0))),
+           STANDING, MARCH_GAIT)
+    assert c.motion.active
+
+    # The human stops walking. Allow the latch to expire, then the phase to come
+    # round, then the tail to play out.
+    budget = mod_const(h, "WALK_LATCH_RELEASE_S") + cycle.stop_latency_s + 1.0
+    left_at = None
+    for _ in range(int(budget / (TIMESTEP_MS / 1000.0))):
+        h.spin(1, STANDING, IDLE_GAIT)
+        if left_at is None and c._cycle_state == "leaving":
+            left_at = c.motion.time_s()
+        if not c.motion.active:
+            break
+    assert not c.motion.active, "the cyclic clip never stopped"
+    assert left_at is not None, "it stopped without taking the exit jump"
+    # It jumped to the deceleration rather than stopping where it was. (The
+    # Motion API works in milliseconds; the controller works in seconds.)
+    assert cycle.exit_to_s * 1000.0 == pytest.approx(clip.seeks[-1])
+    assert left_at >= cycle.exit_to_s - 0.05
+    # It walked several strides on one clip before leaving, which is the point.
+    assert c._cycles_walked >= 2
+    # And it was NOT counted as an early exit -- nothing was cut short.
+    assert c._early_exits == 0
+
+
+def test_a_cycling_clip_waits_for_the_right_phase_before_leaving(cyclic_harness) -> None:
+    """The exit is only free at one phase of the stride, so the request to stop
+    has to wait for it. That wait is bounded by one period, and while it waits
+    the robot keeps walking normally rather than freezing."""
+    h, c = cyclic_harness, cyclic_harness.ctl
+    h.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(h)
+    cycle = c.motion.cycle("forward")
+    h.spin(int(round(cycle.period_s / (TIMESTEP_MS / 1000.0))), STANDING, MARCH_GAIT)
+
+    # Drop the latch immediately so only the phase wait remains.
+    c._drop_walk_latch()
+    states = []
+    for _ in range(int(round((cycle.period_s + 0.2) / (TIMESTEP_MS / 1000.0)))):
+        h.spin(1, STANDING, IDLE_GAIT)
+        states.append(c._cycle_state)
+        if c._cycle_state == "leaving":
+            break
+    assert "leaving" in states, "never took the exit"
+    assert "stopping" in states, "left without waiting for the phase at all"
+    # Waiting means walking, not standing still mid-stride.
+    assert c.leg_mode.startswith("motion:")
+
+
+def test_the_watchdog_does_not_kill_a_healthy_cycling_clip(cyclic_harness) -> None:
+    """A cyclic clip is, by design, in exactly the state the watchdog exists to
+    catch: it never reports itself over, because it is rewound before it can.
+    Each completed stride is proof of life and buys another one."""
+    h, c = cyclic_harness, cyclic_harness.ctl
+    h.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(h)
+    cycle = c.motion.cycle("forward")
+    # Walk for several times the clip's own length.
+    duration = c.motion.duration_s() or 2.0
+    h.spin(int(round(duration * 3.0 / (TIMESTEP_MS / 1000.0))), STANDING, MARCH_GAIT)
+    assert c.motion.active, "the watchdog killed a walk that was working"
+    assert c._motion_failures == 0
+    assert c._cycles_walked >= 2
+
+
+def test_a_cycling_clip_still_stops_dead_for_a_fall(cyclic_harness) -> None:
+    """The one thing that must break the loop immediately, with no waiting for a
+    phase and no deceleration: the robot going over."""
+    h, c = cyclic_harness, cyclic_harness.ctl
+    h.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(h)
+    h.spin(20, STANDING, MARCH_GAIT)
+    assert c.motion.active
+    c.imu.rpy = [0.6, 0.0, 0.0]              # well past TILT_ABORT_RAD
+    h.spin(6, STANDING, MARCH_GAIT)
+    assert not c.motion.active, "a cycling clip ignored a fall"
+    assert c.driver.suspended is False, "the body was not handed back"
+    # It did NOT ride the deceleration out: a fall is the one case where
+    # stopping now beats stopping gracefully.
+    assert c._cycle_state != "leaving"
+
+
+def test_the_prepare_ramp_targets_the_pose_playback_will_start_from(cyclic_harness) -> None:
+    """Playback starts past the clip's opening squat, so the ramp target is the
+    pose at that offset -- not the first keyframe. Ramping to the wrong one would
+    hand over with a posture step exactly as large as the part being skipped."""
+    c = cyclic_harness.ctl
+    cycle = c.motion.cycle("forward")
+    entry = c.motion.entry_pose("forward")
+    first = c.motion.first_pose("forward")
+    assert entry
+    assert c.motion.entry_time_s("forward") == pytest.approx(cycle.enter_s)
+    if cycle.enter_s > 0.0:
+        assert entry != first
+    # Whatever the target, it must be a balanced sole-flat crouch: hip + knee +
+    # ankle == 0 keeps the torso vertical and the soles on the floor.
+    for side in ("L", "R"):
+        total = (entry[f"{side}HipPitch"] + entry[f"{side}KneePitch"]
+                 + entry[f"{side}AnklePitch"])
+        assert abs(total) < 0.01
+
+
+def test_playback_begins_at_the_entry_offset_not_at_zero(cyclic_harness) -> None:
+    """The skipped prefix is the clip's own squat, which the prepare ramp has
+    just done under its own rate limits and balance supervision. Playing it
+    again would repeat it with the velocity caps lifted."""
+    h, c = cyclic_harness, cyclic_harness.ctl
+    cycle = c.motion.cycle("forward")
+    h.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(h)
+    clip = c.motion._cache["forward"]
+    # The seek issued before play() put the playhead at the entry offset.
+    assert clip.seeks
+    assert clip.seeks[-1] == pytest.approx(cycle.enter_s * 1000.0, abs=1.0)
+    assert c.motion.time_s() >= cycle.enter_s - 1e-6
+
+
+def test_one_shot_clips_are_untouched_by_the_cyclic_path(harness) -> None:
+    """The default harness's clips have no cycle in them, and must therefore run
+    exactly as they did before: played to completion, or released at a safe
+    keyframe. A detector that guessed would have broken every turn."""
+    c = harness.ctl
+    assert c.motion.cycle("forward") is None
+    harness.spin(60, STANDING, IDLE_GAIT)
+    assert spin_to_clip(harness)
+    assert c.motion.cycling is False
+    harness.spin(10, STANDING, MARCH_GAIT)
+    assert c._cycles_walked == 0
+    assert c._cycle_state == ""

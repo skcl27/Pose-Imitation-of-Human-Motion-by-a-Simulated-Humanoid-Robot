@@ -421,6 +421,29 @@ class LowerBodyController:
         self._contact = None
         self._crouch = None
 
+    def seed_crouch_from(self, measured: dict[str, float] | None) -> None:
+        """Start the crouch rate limiter from the posture the legs are ACTUALLY in.
+
+        Called when control comes back from a whole-body motion clip. The clips
+        end in the same deep squat they open in (knee ~1.04 rad, so u ~ 0.51),
+        while this layer's standing depth is 0.10 -- and a fresh rate limiter
+        snaps to its first sample, so the first post-clip step would command the
+        whole 0.41 rad of knee travel at once. Seeding it means the ramp starts
+        where the robot is and comes down at crouch_rate_limit like any other
+        crouch change.
+        """
+        if not measured:
+            self._crouch = None
+            return
+        knees = [measured.get("LKneePitch"), measured.get("RKneePitch")]
+        knees = [k for k in knees if k is not None]
+        if not knees:
+            self._crouch = None
+            return
+        # crouch_posture(u) puts the knee at +2u.
+        self._crouch = _clamp(0.5 * (sum(knees) / len(knees)),
+                              0.0, self.params.max_crouch_u)
+
     def set_observation(self, obs: LowerBodyObservation | None) -> None:
         """Latch the newest camera observation (control runs at sim rate)."""
         if obs is not None:
@@ -694,9 +717,14 @@ class LowerBodyController:
     def _crouch_limited(self, wanted: float) -> float:
         """The squat depth actually commanded: ``wanted`` approached at no more
         than ``crouch_rate_limit`` rad/s (see LowerBodyParams)."""
-        if self._crouch is None or self._dt <= 0.0:
+        # dt == 0 means no time has passed, so HOLD -- it does not mean "first
+        # sample". Snapping on it discarded the crouch seeded from the posture a
+        # motion clip left the legs in (the sequencer's clock is reset with the
+        # rest of its state, so dt is 0 on exactly that tick), which put the
+        # 0.41 rad knee jump back into the first post-clip step.
+        if self._crouch is None:
             self._crouch = wanted
-        else:
+        elif self._dt > 0.0:
             step = self.params.crouch_rate_limit * self._dt
             self._crouch = self._crouch + _clamp(wanted - self._crouch, -step, step)
         return self._crouch
@@ -942,9 +970,11 @@ class LowerBodyController:
         ``asym_rate_limit`` (see LowerBodyParams). Stateful per channel; the first
         sample passes through so a fresh controller does not start from zero."""
         prev = self._asym_prev.get(key)
-        if prev is None or self._dt <= 0.0:
+        if prev is None:
             self._asym_prev[key] = value
             return value
+        if self._dt <= 0.0:
+            return prev            # no time has passed: hold, do not snap
         step = self.params.asym_rate_limit * self._dt
         out = prev + _clamp(value - prev, -step, step)
         self._asym_prev[key] = out

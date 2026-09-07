@@ -653,12 +653,29 @@ def check_attitude_source(rows, out):
                 "298 s. See TILT_FROM_ACCELEROMETER.",
             ))
         elif share < 1.0:
-            out.append(finding(
-                "INFO", "attitude source",
-                f"the InertialUnit throughout ({len(source)} frames), with its "
-                f"pitch doubled to undo the half-scale reading and gravity logged "
-                f"alongside for comparison. That is the intended configuration.",
-            ))
+            supervised = sum(1 for v in source if v == "supervisor")
+            if supervised > 0:
+                out.append(finding(
+                    "INFO", "attitude source",
+                    f"the SUPERVISOR node orientation in "
+                    f"{pct(supervised, len(source)):.1f}% of frames -- the truth, "
+                    f"and the intended configuration. Both sensor channels are "
+                    f"provably wrong on this proto (the InertialUnit's pitch is "
+                    f"half-scale and carries the heading; the accelerometer "
+                    f"measures the robot's own acceleration), and they are logged "
+                    f"alongside for comparison.",
+                ))
+            else:
+                out.append(finding(
+                    "WARNING", "attitude source",
+                    f"the InertialUnit throughout ({len(source)} frames). Its "
+                    f"pitch reads half-scale AND carries a body rotation "
+                    f"one-for-one, so a robot that has merely turned reads as "
+                    f"pitched -- measured at -0.26 rad on a provably vertical "
+                    f"robot. Expect the balance loop to fight a phantom and the "
+                    f"clip layer never to settle. Is `supervisor TRUE` set on the "
+                    f"Nao node?",
+                ))
     acc_p, imu_p = [], []
     for row in rows:
         a, b = num(row, "acc_pitch"), num(row, "imu_pitch")
@@ -720,6 +737,92 @@ def check_episode_starts(rows, out):
         ))
 
 
+def check_locomotion_chain(rows, out):
+    """Did the robot walk or turn -- and if not, WHICH link in the chain failed?
+
+    Walking needs five things in a row, and every one of them has failed silently
+    at some point in this project's history:
+
+      1. the human has to be SEEN to walk       -> gait_state == "march"
+      2. the arbiter has to reach the clip layer -> leg_mode not stuck on "pose"
+      3. the clip has to be planned              -> clip_planned
+      4. the legs have to reach the clip's stance -> leg_mode "prepare:*"
+      5. playback has to actually start           -> leg_mode "motion:*"
+
+    Reporting the first one that broke turns "it doesn't walk" from a guess into
+    a measurement. For reference, before 2026-09-07 the answer was always (5):
+    2,080 frames of clip_status "start REFUSED by Webots" across four sessions
+    and not one frame of "motion:*" in 1.25 million rows, because Motion.play()
+    returns None in Webots' Python binding and the caller tested its truthiness.
+    """
+    modes = [r.get("leg_mode", "") for r in rows]
+    if not any(modes):
+        return
+    total = len(modes)
+    walking = sum(1 for m in modes if m.startswith("motion:"))
+    preparing = sum(1 for m in modes if m.startswith("prepare:"))
+    marching = sum(1 for m in modes if m.startswith("march"))
+    states = [r.get("gait_state", "") for r in rows]
+    asked = sum(1 for v in states if v == "march")
+    planned = sum(1 for r in rows if (r.get("clip_planned") or "").strip())
+    statuses: dict[str, int] = {}
+    for r in rows:
+        key = (r.get("clip_status") or "").strip()
+        if key:
+            statuses[key] = statuses.get(key, 0) + 1
+    channels: dict[str, int] = {}
+    for r in rows:
+        key = (r.get("gait_cue_channel") or "").strip()
+        if key and key != "none":
+            channels[key] = channels.get(key, 0) + 1
+
+    detail = (f"leg_mode: {pct(walking, total):.1f}% playing a clip, "
+              f"{pct(preparing, total):.1f}% ramping into one, "
+              f"{pct(marching, total):.1f}% marching in place. "
+              f"The human was seen walking in {pct(asked, total):.1f}% of frames"
+              + (f" (cue channels: {channels})" if channels else "")
+              + f"; a clip was planned in {pct(planned, total):.1f}%.")
+    if statuses:
+        top = sorted(statuses.items(), key=lambda kv: -kv[1])[:3]
+        detail += " clip_status: " + "; ".join(
+            f"{pct(n, total):.0f}% {k!r}" for k, n in top)
+
+    if walking:
+        out.append(finding("INFO", "the robot walked", detail))
+        return
+    if asked == 0:
+        out.append(finding(
+            "CRITICAL", "the robot was never asked to walk",
+            "No frame carried gait_state == \"march\", so the locomotion layer "
+            "was never even consulted -- this is a PERCEPTION result, not a "
+            "balance one. Either the human did not walk in view, or the cue "
+            "could not see it: check that both ankles are in frame and that the "
+            "subject is close enough (at 4 m the knee-lift cue is a few pixels "
+            "wide; 2-2.5 m is what the stride cue was measured at). " + detail))
+    elif planned == 0:
+        out.append(finding(
+            "CRITICAL", "the human walked but no clip was planned",
+            "gait_state reached \"march\" yet clip_planned stayed empty. Either "
+            "LEG_CONTROL is not \"auto\", or no .motion files were found on "
+            "disk, or the cadence/confidence gates in plan_action rejected it. "
+            + detail))
+    elif preparing and not walking:
+        out.append(finding(
+            "CRITICAL", "the legs never reached the clip's opening stance",
+            "A clip was planned and the ramp started, but playback never began: "
+            "the legs could not get to the stance within CLIP_PREPARE_TIMEOUT_S. "
+            "Suspect a leg joint fighting another layer, or a clip whose first "
+            "keyframe is outside the joint limits. " + detail))
+    else:
+        out.append(finding(
+            "CRITICAL", "a clip was planned but never played",
+            "Look at clip_status. \"declined: not settled\" means the tilt gate "
+            "never opened -- which on this robot usually means the attitude is "
+            "wrong rather than the robot unsteady (see the attitude findings). "
+            "\"start REFUSED by Webots\" is the Motion.play() return-value bug "
+            "and should no longer be possible. " + detail))
+
+
 def check_lateral_rocking(rows, out):
     """Feet alternately unloading while 'standing' is a rocking mode the static CoM
     model cannot see; recorded right before the lateral falls."""
@@ -767,6 +870,171 @@ def span(rows) -> float:
     return (t[-1] - t[0]) if len(t) > 1 else 0.0
 
 
+
+def check_gait_cycle(rows, out):
+    """Is the walk clip being CYCLED, or restarted for every stride?
+
+    This is the difference between walking and stepping, and it is directly
+    measurable. A working cyclic walk shows three things together: clip_cycles
+    climbing, clip_phase sawing between 0 and the period, and cycle_state
+    spending its time in "cycling"/"rewound". A walk that is not cycling shows
+    clip_cycles pinned at 0 while the robot still walks -- which means every
+    stride is paying the start/stop transient again, and that transient is 49%
+    of the short clip, with the closing settle actually travelling BACKWARD.
+
+    Also reports how it STOPPED. Leaving through the clip's own deceleration is
+    the designed path; stopping at a safe keyframe is the fallback for a clip
+    with no cycle; and a watchdog kill mid-stride is a bug.
+    """
+    if "clip_cycles" not in rows[0]:
+        return
+    cycles = [int(num(r, "clip_cycles") or 0) for r in rows]
+    walking = [r for r in rows if (r.get("leg_mode") or "").startswith("motion:")]
+    if not walking:
+        return
+    states: dict[str, int] = {}
+    for r in rows:
+        key = (r.get("cycle_state") or "").strip()
+        if key:
+            states[key] = states.get(key, 0) + 1
+    peak = max(cycles) if cycles else 0
+    # clip_cycles is cumulative over the session, so restarts show as plateaus.
+    forward = sum(1 for r in walking if "forward" in (r.get("leg_mode") or ""))
+    if not states and forward:
+        out.append(finding(
+            "WARN", "the walk clip is not being cycled",
+            f"{forward} frames of forward playback and no cycle_state at all. "
+            f"Either GAIT_CYCLE is off, no clip with a detectable gait cycle was "
+            f"found (check the startup line 'Walk clip: ...'), or NumPy is "
+            f"missing so the detector cannot run. Every stride is paying the "
+            f"clip's start/stop transient."))
+        return
+    if not states:
+        return
+    total_state = sum(states.values())
+    shown = ", ".join(f"{k} {v * 100.0 / total_state:.0f}%"
+                      for k, v in sorted(states.items(), key=lambda kv: -kv[1]))
+    if peak == 0:
+        out.append(finding(
+            "WARN", "the gait cycle never completed a stride",
+            f"cycle_state was seen ({shown}) but clip_cycles never left 0, so the "
+            f"playhead never reached the end of the loop window. Playback may be "
+            f"ending before the loop starts -- compare clip_time against the "
+            f"cycle's loop_start in the startup 'Clip ... is cyclic' line."))
+        return
+    phases = [num(r, "clip_phase") for r in rows]
+    phases = [p for p in phases if p is not None]
+    saw = (max(phases) - min(phases)) if phases else 0.0
+    out.append(finding(
+        "INFO", f"the walk cycled {peak} stride(s) without restarting",
+        f"cycle_state: {shown}. clip_phase spanned {saw:.2f}s, which should be "
+        f"about one period. Each stride here replaced a whole start-stop-prepare "
+        f"cycle."))
+    left = states.get("leaving", 0)
+    early = max(int(num(r, "early_exits") or 0) for r in rows)
+    if left == 0 and early > 0:
+        out.append(finding(
+            "INFO", "the walk stopped by freezing, not by decelerating",
+            f"{early} early exit(s) at a safe keyframe and no 'leaving' state. "
+            f"That is correct for a clip with no gait cycle, but for a cyclic "
+            f"clip it means the exit jump was never taken."))
+
+
+def check_walk_speed(rows, out):
+    """How fast did the robot ACTUALLY walk, from the supervisor's own CoM?
+
+    Every speed claim about a clip up to here is forward kinematics -- it counts
+    the ground the keyframes cover and knows nothing about slip, servo lag or
+    contact compliance. sv_com_x is the ground truth. Reference points: 0.036 m/s
+    measured before cycling, 0.089 m/s predicted by FK with it, and NAO's
+    documented ~0.10 m/s.
+    """
+    if "sv_com_x" not in rows[0] or "sv_com_y" not in rows[0]:
+        return
+    runs, current = [], []
+    for r in rows:
+        mode = r.get("leg_mode") or ""
+        x, y = num(r, "sv_com_x"), num(r, "sv_com_y")
+        t = num(r, "sim_time_s")
+        if mode.startswith("motion:") and None not in (x, y, t):
+            current.append((t, x, y))
+        else:
+            if len(current) > 5:
+                runs.append(current)
+            current = []
+    if len(current) > 5:
+        runs.append(current)
+    if not runs:
+        return
+    speeds, distances = [], []
+    for run in runs:
+        t0, x0, y0 = run[0]
+        t1, x1, y1 = run[-1]
+        span_s = t1 - t0
+        travelled = math.hypot(x1 - x0, y1 - y0)
+        if span_s > 0.4:
+            speeds.append(travelled / span_s)
+            distances.append(travelled)
+    if not speeds:
+        return
+    speeds.sort()
+    median = speeds[len(speeds) // 2]
+    best = max(speeds)
+    out.append(finding(
+        "INFO", f"measured walking speed {median:.3f} m/s (median of "
+                f"{len(speeds)} playback runs)",
+        f"best run {best:.3f} m/s, furthest {max(distances):.2f} m, total "
+        f"{sum(distances):.2f} m. For reference: 0.036 m/s was measured with "
+        f"one-shot clips, the gait cycle predicts 0.089 m/s by forward "
+        f"kinematics, and NAO's documented walk is about 0.10 m/s. A median far "
+        f"below the prediction with the cycle engaged means slip or servo lag, "
+        f"not a planning problem."))
+
+
+def check_abandoned_prepares(rows, out):
+    """Prepares that ramped the legs down and then never played anything.
+
+    Each one is a visible squat-and-stand-up that accomplishes nothing, and they
+    used to be common: 29 in one recorded session, 14 of them turn_right, caused
+    by a gate that admitted a turn request at 20 deg while the smallest clip on
+    disk did not become eligible until 26 deg. The robot announced a turn, spent
+    0.7 s crouching, found nothing fitted and stood back up.
+    """
+    modes = [r.get("leg_mode", "") or "" for r in rows]
+    if not any(m.startswith("prepare:") for m in modes):
+        return
+    abandoned: dict[str, int] = {}
+    played = 0
+    run_action = None
+    for index, mode in enumerate(modes):
+        if mode.startswith("prepare:"):
+            run_action = mode.split(":", 1)[1]
+            continue
+        if run_action is None:
+            continue
+        # The prepare run just ended: did it hand over to playback?
+        if mode.startswith("motion:"):
+            played += 1
+        else:
+            abandoned[run_action] = abandoned.get(run_action, 0) + 1
+        run_action = None
+    total = played + sum(abandoned.values())
+    if not abandoned or total == 0:
+        return
+    share = sum(abandoned.values()) * 100.0 / total
+    worst = ", ".join(f"{k} x{v}" for k, v in
+                      sorted(abandoned.items(), key=lambda kv: -kv[1])[:4])
+    sev = "WARNING" if share > 25.0 else "INFO"
+    out.append(finding(
+        sev, f"{sum(abandoned.values())} of {total} prepares ramped and never "
+             f"played ({share:.0f}%)",
+        f"by action: {worst}. Each is a squat and stand-up that achieves "
+        f"nothing. A turn action here points at the gate that admits a turn "
+        f"disagreeing with the test that picks a clip for it (see "
+        f"walk_motion._smallest_servable_turn); a forward action points at the "
+        f"prepare timeout or a leg joint fighting another layer."))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -806,7 +1074,9 @@ def main(argv=None) -> int:
     for check in (check_imu_zero, check_attitude_source, check_falls, check_tracking_live,
                   check_legs_move, check_support,
                   check_sole_contact, check_shifter_saturation, check_tilt_sign_consistency,
-                  check_lateral_rocking, check_episode_starts, check_leg_layer, check_tilt,
+                  check_lateral_rocking, check_episode_starts, check_locomotion_chain,
+                  check_gait_cycle, check_walk_speed, check_abandoned_prepares,
+                  check_leg_layer, check_tilt,
                   check_saturation, check_tracking, check_head, check_heading):
         try:
             check(rows, out)

@@ -77,6 +77,10 @@ def _deg(d: float) -> float:
     return math.radians(d)
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
 def get_default_motor_configs() -> dict[str, MotorConfig]:
     """Return mechanical configs for every NAO joint we care about.
 
@@ -406,6 +410,7 @@ class NaoPoseDriver:
         self.stats = DriverStats()
         self._last_command_time: float | None = None
         self._last_balance_time: float | None = None
+        self._last_leg_pose_time: float | None = None
 
         # Model-based CoM balance feedback (Option 2: FK + known link masses).
         # Imported lazily and guarded so the driver still runs if numpy/balance
@@ -711,6 +716,94 @@ class NaoPoseDriver:
             applied += 1
         return applied
 
+    # Rate-limited approach to a commanded leg posture (see approach_leg_pose).
+    # 1.5 rad/s is under the driver's own leg velocity ceiling (0.85 * 0.5 * 6.40
+    # = 2.7 rad/s on the knee) so the motors can actually follow it, and it takes
+    # the 0.84 rad knee travel from the standing crouch to a walk clip's opening
+    # stance in 0.56 s.
+    LEG_POSE_RATE = 1.5      # rad/s
+    LEG_POSE_TOL = 0.08      # rad; per-joint arrival tolerance on the MEASURED angle
+
+    def approach_leg_pose(self, pose: dict[str, float], now_s: float | None = None,
+                          rate: float | None = None,
+                          tol: float | None = None) -> bool:
+        """Drive the leg joints toward ``pose`` at a bounded rate. True once there.
+
+        This is a leg commander in its own right -- while it is running, no other
+        layer may command the legs -- and it exists for one job: getting the robot
+        into the posture a pre-balanced motion clip opens in, BEFORE handing the
+        clip the joints.
+
+        Cyberbotics' walk and turn clips all begin in a deep, sole-flat crouch
+        (knee 1.042 rad, about 0.51 rad of squat) while this controller stands at
+        0.10. Playback commands its first keyframe on its very first step, and
+        release_to_motion has by then lifted the velocity caps -- so handing over
+        from the standing crouch asks the knees for 0.84 rad in one 20 ms step and
+        the robot squats out from under itself. Arriving first turns the handover
+        into a continuation.
+
+        Arrival is judged on the MEASURED angles, not the commanded ones: the
+        point is where the legs physically are. The smoother is reseeded as we go
+        so its lag does not fight a deliberate ramp.
+        """
+        if self.suspended:
+            return False
+        rate = self.LEG_POSE_RATE if rate is None else rate
+        tol = self.LEG_POSE_TOL if tol is None else tol
+        dt = 0.02
+        if now_s is not None:
+            if self._last_leg_pose_time is not None:
+                dt = max(0.0, min(0.1, now_s - self._last_leg_pose_time))
+            self._last_leg_pose_time = now_s
+        # Every joint arrives TOGETHER, by scaling its rate to its share of the
+        # longest travel. A single flat rate is not a synchronised move: from the
+        # standing crouch to a walk clip's opening stance the knee travels 0.842
+        # rad while the hip travels 0.405 and the ankle 0.437, so at equal rates
+        # the knee is still going when the others have stopped -- and the sole's
+        # attitude is Hip + Knee + Ankle, which is what keeps the foot flat and
+        # the torso vertical. Simulated against the repo's own CoM model, a flat
+        # rate drives that sum to 0.405 rad (eight times the 0.05 sole-tilt
+        # budget) and the fore/aft support margin to -0.064 m: the ramp added to
+        # make the handover safe took the centre of mass off the feet on its own.
+        # Scaled by travel it holds the sum at 0.0000 rad and the margin at
+        # +0.0596 m, in the same 0.56 s.
+        travels = {}
+        for name, target in pose.items():
+            if name not in self.motors:
+                continue
+            current = self.base_targets.get(
+                name, self.measured.get(name, self.commanded.get(name, 0.0)))
+            travels[name] = abs(float(target) - current)
+        longest = max(travels.values(), default=0.0)
+
+        arrived = True
+        for name, target in pose.items():
+            if name not in self.motors:
+                continue
+            target = self.limiter.clamp_angle(name, float(target))
+            current = self.base_targets.get(
+                name, self.measured.get(name, self.commanded.get(name, 0.0)))
+            share = 1.0 if longest <= 1e-9 else travels.get(name, 0.0) / longest
+            step = max(0.0, rate * dt) * share
+            nxt = current + _clamp(target - current, -step, step)
+            self.base_targets[name] = nxt
+            self.smoother.reset(name, nxt)
+            self._set_motor(name, nxt, self._gait_velocity_for(name))
+            measured = self.measured.get(name)
+            if measured is None or abs(measured - target) > tol:
+                arrived = False
+        # NOT _last_command_time: that clock measures how long since the CAMERA
+        # last said anything, and this method is the robot commanding itself.
+        # Touching it here made the driver never go stale while preparing, so a
+        # human who walked out of frame never triggered the stand-down.
+        self.stats.frames_applied += 1
+        self.stats.joints_last_applied = sum(1 for n in pose if n in self.motors)
+        return arrived
+
+    def release_leg_pose(self) -> None:
+        """Forget the approach's clock (call when it is abandoned)."""
+        self._last_leg_pose_time = None
+
     def reset_balance(self) -> None:
         """Drop the balance loop's carried-over correction (see
         ``balance.BalanceController.reset``). Call after a fall recovery or a
@@ -826,9 +919,22 @@ class NaoPoseDriver:
         # A clip has moved the whole body; the balance correction that suited the
         # pre-clip posture is meaningless against the new one.
         self.reset_balance()
+        self.release_leg_pose()
         reclaimed = sorted(self._suspended)
         self._suspended = set()
         self.reseed_from_measured()
+        # Tell the lower body where the clip left the legs, so its own crouch
+        # ramps DOWN from there instead of snapping. A walk clip ends in the same
+        # 0.51 rad squat it started in, and the lower body's standing depth is
+        # 0.10: without this the first post-clip step commands a 0.41 rad knee
+        # jump, which is the handover jolt all over again, in reverse.
+        if self.lower_body is not None:
+            seed = getattr(self.lower_body, "seed_crouch_from", None)
+            if callable(seed):
+                try:
+                    seed(self.measured)
+                except Exception:  # noqa: BLE001 - never break the handover
+                    pass
         for name in reclaimed:
             self._set_motor(name, self.measured.get(name, self.commanded.get(name, 0.0)),
                             self._velocity_for(name))

@@ -119,6 +119,10 @@ class GaitCommand:
     ``yaw_conf``    : [0, 1] confidence in ``body_yaw_rad``. Independent of
                       ``conf``: the yaw only needs the shoulders and hips, so it
                       stays usable when the legs leave the frame.
+    ``cue_channel`` : which signal declared the march -- "knee" (marching on the
+                      spot) or "stride" (actually walking), or "none" when idle.
+                      Logged so a session can say WHY the robot did or did not
+                      walk. See _Channel.
     """
 
     state: str
@@ -130,6 +134,7 @@ class GaitCommand:
     conf: float
     body_yaw_rad: float = 0.0
     yaw_conf: float = 0.0
+    cue_channel: str = "none"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -142,6 +147,7 @@ class GaitCommand:
             "conf": round(self.conf, 3),
             "body_yaw_rad": round(self.body_yaw_rad, 4),
             "yaw_conf": round(self.yaw_conf, 3),
+            "cue_channel": self.cue_channel,
         }
 
 
@@ -208,6 +214,112 @@ class _PeakHold:
         return self.value
 
 
+class _Channel:
+    """One oscillating gait signal, with its own history, crossings and cadence.
+
+    There are two, because a human in front of this camera does two different
+    things and only one of them was ever measured:
+
+    * ``knee``   -- the left/right knee-height differential. This is a
+                    MARCH-IN-PLACE cue: it is large when someone lifts their
+                    knees alternately on the spot.
+    * ``stride`` -- the signed ankle separation along the body's forward axis.
+                    This is a WALKING cue, and it is the one that matters.
+                    Measured over a recorded session in which the subject
+                    translated 3.25 m (pelvis depth 2,509 -> 5,759 mm): the knee
+                    differential had a median of 8 mm (p95 47) while the ankle
+                    separation had a median of 102 mm (p95 338, max 521) -- 12
+                    times the signal, on landmarks visible in 97.0% of the frames
+                    where the hips and knees were.
+
+    The amplitude window and the CROSSING window are deliberately different.
+    Requiring two crossings inside the 1.3 s amplitude window imposes a cadence
+    floor of 1/(2*1.3) = 0.385 Hz -- 2.6 times plan_action's own
+    walk_cadence_min_hz of 0.15 -- and the recorded human sits right on it: the
+    histogram of crossings-per-window over amplitude-sufficient frames peaks at
+    exactly ONE (498 frames with 1, 47 with 2). That single gate, not the
+    amplitude and not the confidence, is what held "march" to 1.14% of frames.
+    """
+
+    def __init__(self, amp_window_s: float, cross_window_s: float,
+                 deadband: float = 0.02, deadband_frac: float = 0.20) -> None:
+        self.amp_window_s = float(amp_window_s)
+        self.cross_window_s = float(cross_window_s)
+        self.deadband = float(deadband)
+        self.deadband_frac = float(deadband_frac)
+        self.hist: deque[tuple[float, float]] = deque()
+        self.cross_times: deque[float] = deque(maxlen=12)
+        self.last_sign: int = 0
+        self.value: float = 0.0
+
+    def clear(self) -> None:
+        self.hist.clear()
+        self.cross_times.clear()
+        self.last_sign = 0
+        self.value = 0.0
+
+    def push(self, t: float, s: float) -> None:
+        self.value = s
+        self.hist.append((t, s))
+        cutoff = t - max(self.amp_window_s, self.cross_window_s)
+        while self.hist and self.hist[0][0] < cutoff:
+            self.hist.popleft()
+
+        # Crossings are counted against the signal's OWN running middle, not
+        # against zero, and with a deadband proportional to the amplitude. A
+        # walking human's stride signal is not centred on zero (stance width,
+        # camera obliquity and a limp all bias it), and a fixed 0.02 deadband is
+        # either noise-blind or signal-blind depending on how far away they are
+        # standing.
+        amp = self.amplitude()
+        ref = self.median()
+        dead = max(self.deadband, self.deadband_frac * amp)
+        centred = s - ref
+        sign = 1 if centred > dead else (-1 if centred < -dead else 0)
+        if sign != 0 and self.last_sign != 0 and sign != self.last_sign:
+            self.cross_times.append(t)
+        if sign != 0:
+            self.last_sign = sign
+        cutoff = t - self.cross_window_s
+        while self.cross_times and self.cross_times[0] < cutoff:
+            self.cross_times.popleft()
+
+    def _window(self, seconds: float) -> list[float]:
+        if not self.hist:
+            return []
+        newest = self.hist[-1][0]
+        return [v for ts, v in self.hist if ts >= newest - seconds]
+
+    def amplitude(self) -> float:
+        vals = self._window(self.amp_window_s)
+        if len(vals) < 3:
+            return 0.0
+        return max(vals) - min(vals)
+
+    def median(self) -> float:
+        vals = sorted(self._window(self.cross_window_s))
+        if not vals:
+            return 0.0
+        mid = len(vals) // 2
+        return vals[mid] if len(vals) % 2 else 0.5 * (vals[mid - 1] + vals[mid])
+
+    def crossings(self) -> int:
+        return len(self.cross_times)
+
+    def cadence_hz(self, cadence_max_hz: float) -> float:
+        """Full-cycle (L+R) frequency from the half-step crossing intervals."""
+        if len(self.cross_times) < 2:
+            return 0.0
+        times = list(self.cross_times)
+        intervals = [b - a for a, b in zip(times, times[1:], strict=False) if b > a]
+        if not intervals:
+            return 0.0
+        half_period = sum(intervals) / len(intervals)
+        if half_period <= 1e-3:
+            return 0.0
+        return _clamp(1.0 / (2.0 * half_period), 0.0, cadence_max_hz)
+
+
 class GaitCueExtractor:
     """Turn a stream of :class:`PoseFrame`s into a smoothed :class:`GaitCommand`.
 
@@ -235,6 +347,7 @@ class GaitCueExtractor:
         self,
         *,
         window_s: float = 1.3,
+        cross_window_s: float = 3.0,
         amp_start: float = 0.08,
         amp_stop: float = 0.05,
         conf_min: float = 0.6,
@@ -242,17 +355,21 @@ class GaitCueExtractor:
         start_cycles: int = 2,
     ) -> None:
         self.window_s = float(window_s)
+        self.cross_window_s = float(cross_window_s)
         self.amp_start = float(amp_start)
         self.amp_stop = float(amp_stop)
         self.conf_min = float(conf_min)
         self.cadence_max_hz = float(cadence_max_hz)
         self.start_cycles = int(start_cycles)
 
-        # (timestamp_s, normalized knee-differential signal s)
-        self._hist: deque[tuple[float, float]] = deque()
-        self._cross_times: deque[float] = deque(maxlen=6)
-        self._last_sign: int = 0
+        # One channel per thing a human might be doing: marching on the spot
+        # (knee-height differential) and actually walking (ankle separation along
+        # the body's forward axis). See _Channel.
+        self._knee = _Channel(self.window_s, self.cross_window_s)
+        self._stride = _Channel(self.window_s, self.cross_window_s)
+        self._channel: str = "none"       # which one declared the march
         self._scale_ema: float | None = None  # smoothed body width
+        self._leg_ema: float | None = None    # smoothed hip->ankle length
         self._yaw_ema: float = 0.0                # smoothed torso yaw (rad)
         self._yaw_seen: bool = False
         # Self-calibrated reference length of each yaw segment (shoulders, hips).
@@ -277,39 +394,65 @@ class GaitCueExtractor:
             self._decay_to_idle()
             return GaitCommand("idle", 0.0, 0.0, 0, 0.0, turn, conf, yaw, yaw_conf)
 
-        scale = self._body_scale(kps)
-        s = self._knee_diff_signal(kps, scale)
         t = pose.timestamp_s
-        self._push(t, s)
-        self._update_crossings(t, s)
+        scale = self._body_scale(kps)
+        self._knee.push(t, self._knee_diff_signal(kps, scale))
+        stride = self._stride_signal(kps)
+        if stride is not None:
+            self._stride.push(t, stride)
 
-        amp = self._amplitude()
-        cadence = self._cadence_hz()
-        # Hysteresis state machine (bias to stop).
+        # EITHER channel may declare the march, and the one that does supplies
+        # the phase and swing side. The knee channel is preferred when both
+        # qualify: its sign maps directly onto which knee is up, which is what
+        # the swing side means.
+        def qualifies(ch: _Channel) -> bool:
+            return (ch.amplitude() >= self.amp_start
+                    and ch.crossings() >= self.start_cycles
+                    and ch.cadence_hz(self.cadence_max_hz) > 0.0)
+
         if self._state == "march":
-            if amp < self.amp_stop or cadence <= 0.0:
-                self._state = "idle"
+            active = self._knee if self._channel == "knee" else self._stride
+            holding = (active.amplitude() >= self.amp_stop
+                       and active.cadence_hz(self.cadence_max_hz) > 0.0)
+            if not holding:
+                # The other channel may still be carrying it (a walk that turns
+                # into a march on the spot, say) -- do not stop if it is.
+                other = self._stride if active is self._knee else self._knee
+                if qualifies(other):
+                    self._channel = "stride" if other is self._stride else "knee"
+                else:
+                    self._state = "idle"
+                    self._channel = "none"
         else:
-            if amp >= self.amp_start and len(self._cross_times) >= self.start_cycles:
-                self._state = "march"
+            if qualifies(self._knee):
+                self._state, self._channel = "march", "knee"
+            elif qualifies(self._stride):
+                self._state, self._channel = "march", "stride"
 
         if self._state != "march":
-            return GaitCommand("idle", 0.0, 0.0, 0, 0.0, turn, conf, yaw, yaw_conf)
+            return GaitCommand("idle", 0.0, 0.0, 0, 0.0, turn, conf, yaw, yaw_conf,
+                               cue_channel="none")
 
+        ch = self._knee if self._channel == "knee" else self._stride
+        s = ch.value
+        amp = ch.amplitude()
+        cadence = ch.cadence_hz(self.cadence_max_hz)
         phase = self._phase(s, cadence)
         swing = 1 if s > 0.01 else (-1 if s < -0.01 else 0)
         # Map amplitude to a [0,1] intensity (amp_start..~3x amp_start -> 0..1).
         intensity = _clamp((amp - self.amp_stop) / (3.0 * self.amp_start), 0.0, 1.0)
         cadence = _clamp(cadence, 0.0, self.cadence_max_hz)
         return GaitCommand(
-            "march", cadence, phase, swing, intensity, turn, conf, yaw, yaw_conf
+            "march", cadence, phase, swing, intensity, turn, conf, yaw, yaw_conf,
+            cue_channel=self._channel,
         )
 
     def reset(self) -> None:
-        self._hist.clear()
-        self._cross_times.clear()
-        self._last_sign = 0
+        self._knee.clear()
+        self._stride.clear()
+        self._channel = "none"
         self._scale_ema = None
+        self._leg_ema = None
         self._yaw_ema = 0.0
         self._yaw_seen = False
         self._yaw_span = [_PeakHold() for _ in _YAW_PAIRS]
@@ -345,6 +488,45 @@ class GaitCueExtractor:
         left_h = hip_y - kps["left_knee"].y
         right_h = hip_y - kps["right_knee"].y
         return (left_h - right_h) / scale
+
+    def _leg_length(self, kps: dict[str, Keypoint]) -> float:
+        """Smoothed hip->ankle length, the natural normaliser for a stride."""
+        best = 0.0
+        for hip, ankle in (("left_hip", "left_ankle"), ("right_hip", "right_ankle")):
+            if hip in kps and ankle in kps:
+                best = max(best, math.dist(
+                    (kps[hip].x, kps[hip].y, kps[hip].z),
+                    (kps[ankle].x, kps[ankle].y, kps[ankle].z)))
+        if best > 1e-3:
+            self._leg_ema = best if self._leg_ema is None else (
+                self._leg_ema + 0.05 * (best - self._leg_ema))
+        return max(self._leg_ema or 0.0, 1e-3)
+
+    def _stride_signal(self, kps: dict[str, Keypoint]) -> float | None:
+        """Signed ankle separation along the body's FORWARD axis, in leg lengths.
+
+        This is the channel that sees actual walking. The forward axis is taken
+        from the shoulder line -- the same vector the yaw estimate already builds
+        -- rotated 90 degrees in the ground plane, so the measurement follows the
+        subject however they are facing rather than assuming they walk across the
+        image. Returns None when either ankle is not reliably visible, in which
+        case the knee channel carries the cue alone.
+        """
+        need = ("left_ankle", "right_ankle", "left_shoulder", "right_shoulder")
+        if any(n not in kps for n in need):
+            return None
+        if min(kps["left_ankle"].visibility, kps["right_ankle"].visibility) < 0.5:
+            return None
+        ux = kps["left_shoulder"].x - kps["right_shoulder"].x
+        uz = kps["left_shoulder"].z - kps["right_shoulder"].z
+        span = math.hypot(ux, uz)
+        if span < 1e-6:
+            return None
+        # Ground-plane normal to the shoulder line = the way the body faces.
+        nx, nz = uz / span, -ux / span
+        dx = kps["left_ankle"].x - kps["right_ankle"].x
+        dz = kps["left_ankle"].z - kps["right_ankle"].z
+        return (dx * nx + dz * nz) / self._leg_length(kps)
 
     def _update_yaw(self, kps: dict[str, Keypoint]) -> tuple[float, float]:
         """Smoothed torso yaw in radians (full circle) and its confidence.
@@ -414,55 +596,18 @@ class GaitCueExtractor:
         self._yaw_ema = _wrap_pi(self._yaw_ema + _YAW_EMA_ALPHA * delta)
         return self._yaw_ema, _clamp(best_conf, 0.0, 1.0)
 
-    def _push(self, t: float, s: float) -> None:
-        self._hist.append((t, s))
-        cutoff = t - self.window_s
-        while self._hist and self._hist[0][0] < cutoff:
-            self._hist.popleft()
-
-    def _update_crossings(self, t: float, s: float) -> None:
-        # Sign with a small deadband so noise near zero doesn't fake crossings.
-        sign = 1 if s > 0.02 else (-1 if s < -0.02 else 0)
-        if sign != 0 and self._last_sign != 0 and sign != self._last_sign:
-            self._cross_times.append(t)
-        if sign != 0:
-            self._last_sign = sign
-        # Drop crossings older than the window.
-        cutoff = t - self.window_s
-        while self._cross_times and self._cross_times[0] < cutoff:
-            self._cross_times.popleft()
-
-    def _amplitude(self) -> float:
-        if len(self._hist) < 3:
-            return 0.0
-        vals = [s for _, s in self._hist]
-        return max(vals) - min(vals)  # peak-to-peak
-
-    def _cadence_hz(self) -> float:
-        """Full-cycle (L+R) frequency from half-step zero-crossing intervals."""
-        if len(self._cross_times) < 2:
-            return 0.0
-        times = list(self._cross_times)
-        intervals = [b - a for a, b in zip(times, times[1:], strict=False) if b > a]
-        if not intervals:
-            return 0.0
-        half_period = sum(intervals) / len(intervals)  # time between crossings
-        if half_period <= 1e-3:
-            return 0.0
-        # One full gait cycle = two half-steps (two crossings).
-        return _clamp(1.0 / (2.0 * half_period), 0.0, self.cadence_max_hz)
-
     def _phase(self, s: float, cadence: float) -> float:
         """Gait phase in [0, 2*pi) from the signal and its derivative.
 
         For s = A*sin(phi), phi = atan2(s, s_dot/omega). We estimate s_dot from
-        the last two samples and omega from the cadence; the on-robot engine only
-        uses this to phase-lock its own integrated clock, so an approximate value
-        is fine.
+        the last two samples of whichever channel declared the march, and omega
+        from the cadence; the on-robot engine only uses this to phase-lock its own
+        integrated clock, so an approximate value is fine.
         """
-        if cadence <= 0.0 or len(self._hist) < 2:
+        hist = (self._knee if self._channel == "knee" else self._stride).hist
+        if cadence <= 0.0 or len(hist) < 2:
             return 0.0
-        (t0, s0), (t1, s1) = self._hist[-2], self._hist[-1]
+        (t0, s0), (t1, s1) = hist[-2], hist[-1]
         dt = max(t1 - t0, 1e-3)
         s_dot = (s1 - s0) / dt
         omega = TWO_PI * cadence
@@ -471,5 +616,8 @@ class GaitCueExtractor:
 
     def _decay_to_idle(self) -> None:
         self._state = "idle"
-        self._cross_times.clear()
-        self._last_sign = 0
+        self._channel = "none"
+        self._knee.cross_times.clear()
+        self._knee.last_sign = 0
+        self._stride.cross_times.clear()
+        self._stride.last_sign = 0

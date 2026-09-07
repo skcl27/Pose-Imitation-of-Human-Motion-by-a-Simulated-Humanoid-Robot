@@ -53,7 +53,7 @@ centre of mass, so it stays limited. Details and the maths:
 ```bash
 # 1. Activate the conda environment (create it first if needed):
 #    conda create -n y313 python=3.11 -y
-conda activate y313
+conda activate py313
 
 # 2. Clone or pull
 git clone https://github.com/tarikbilla/Pose-Imitation-of-Human-Motion-by-a-Simulated-Humanoid-Robot.git

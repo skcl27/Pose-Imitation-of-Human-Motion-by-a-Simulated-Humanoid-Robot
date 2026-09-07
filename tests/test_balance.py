@@ -12,8 +12,11 @@ from balance import (  # noqa: E402
     TILT_ROLL_SIGN,
     BalanceController,
     NaoCoMModel,
+    clip_torso_speeds,
     fibonacci_spiral,
+    safe_exit_times,
 )
+from conftest import cyclic_poses  # noqa: E402
 
 
 def test_total_mass_is_realistic() -> None:
@@ -532,3 +535,118 @@ def test_gyro_lead_makes_the_loop_act_early() -> None:
         no_lead.compute_correction(standing(), (0.0, 0.0),
                                    tilt_rate=(0.0, BACKWARD * 2.0), dt_s=0.02)
     assert abs(no_lead._state["pitch"]) < 1e-6
+
+
+def test_safe_exit_times_accepts_double_support_and_refuses_a_lifted_foot() -> None:
+    """What makes a moment safe to stop a clip at: both feet down, both soles
+    flat, the centre of mass inside the contact-filtered polygon, and nothing
+    about to move fast. A clip BOUNDARY has those properties, which is why clips
+    used to be played to completion -- but so do many of a walk clip's interior
+    keyframes, and that is what lets a long clip be stopped promptly.
+    """
+    from balance import safe_exit_times
+
+    u = 0.51                                    # the crouch every walk clip opens in
+    crouch = {"LHipPitch": -u, "RHipPitch": -u,
+              "LKneePitch": 2 * u, "RKneePitch": 2 * u,
+              "LAnklePitch": -u, "RAnklePitch": -u}
+    # A pose with the left foot clearly in the air.
+    lifted = dict(crouch)
+    lifted.update({"LHipPitch": -u - 0.5, "LKneePitch": 2 * u + 0.6})
+
+    # Held still, the crouch is a safe exit; the lifted foot never is.
+    assert safe_exit_times([(0.0, crouch), (0.04, crouch)]) == [0.0, 0.04]
+    assert safe_exit_times([(0.0, lifted), (0.04, lifted)]) == []
+
+    # A keyframe about to move fast is refused even in double support: stopping
+    # there would freeze the robot mid-lurch.
+    far = dict(crouch)
+    far["LKneePitch"] = 2 * u + 0.5             # 12.5 rad/s over one 40 ms frame
+    assert safe_exit_times([(0.0, crouch), (0.04, far)])[0:1] == []
+
+    # And the interior of a real sequence is found, not just its ends. Note the
+    # opening crouch is NOT offered here: the very next keyframe lifts a foot, so
+    # stopping at t=0 would freeze the robot on the way into a stride.
+    seq = [(0.0, crouch), (0.04, lifted), (0.08, crouch)]
+    assert safe_exit_times(seq) == [0.08]
+
+
+# ---------------------------------------------------------------------------
+# Clip odometry and safe exits
+# ---------------------------------------------------------------------------
+def test_clip_torso_speeds_tells_a_walk_from_a_march() -> None:
+    """The only measure available of how fast a clip's own kinematics travel.
+
+    There is no sensor for this -- the clip is a file, not a run -- but the
+    stance foot is on the floor, so the torso moves over it by exactly as much
+    as forward kinematics says the hip swings. Distinguishing a gait that goes
+    somewhere from one that marches in place is what stops a turn clip from being
+    looped, so it has to be right about the sign as well as the magnitude.
+    """
+    walking = clip_torso_speeds(cyclic_poses(translate=True))
+    marching = clip_torso_speeds(cyclic_poses(translate=False))
+    dt = 0.04
+    assert sum(walking) * dt > 0.20        # ~0.40 m over three strides
+    assert abs(sum(marching) * dt) < 0.02  # goes nowhere, both directions
+    # Note that the march is not STILL -- its torso rocks at up to 0.21 m/s
+    # instantaneously. Net travel is what separates a gait from a shuffle, and
+    # it is the net that decides whether a clip may be looped.
+    assert max(abs(v) for v in marching) > 0.10
+    # Inside the repeating stride the walk is always going forwards. The speed is
+    # not constant (stance and swing modulate it) but it never reverses, which is
+    # the difference between a cycle and the closing settle of a one-shot clip --
+    # that settle runs BACKWARD, and it is what makes chained clips lurch.
+    cycle = walking[8:34]
+    assert min(cycle) > 0.0
+    assert max(cycle) / min(cycle) < 12.0
+
+
+def test_safe_exit_times_refuses_a_pose_that_is_still_moving() -> None:
+    """Stopping the legs does not stop the ROBOT, and the static tests miss that.
+
+    A pose can be in double support, soles flat, CoM inside the polygon -- and
+    still be travelling at 0.18 m/s, because that is what walking is. Freeze the
+    legs there and the body keeps its momentum: the capture point sits v/omega
+    ahead of the CoM (omega = sqrt(g/h) ~= 5.9 rad/s at this crouch), so 0.18 m/s
+    is 30 mm of excursion against a margin budget of 40-60 mm. 13 of the 46 poses
+    that passed the static tests in the real short clip were like that. Handing
+    the body back at one of them means handing back a robot that then walks
+    itself over.
+    """
+    poses = cyclic_poses(translate=True)
+    speeds = clip_torso_speeds(poses)
+    times = [t for t, _ in poses]
+
+    permissive = safe_exit_times(poses, max_torso_speed=float("inf"))
+    gated = safe_exit_times(poses, max_torso_speed=0.05)
+    assert gated, "the gate must not reject every pose in a real walk"
+    assert set(gated) <= set(permissive), "the gate can only ever remove poses"
+    assert len(gated) < len(permissive), "this clip does travel; some must go"
+    # Every pose that survives is genuinely near rest.
+    for t in gated:
+        assert abs(speeds[times.index(t)]) <= 0.05
+    # ...and every pose that was dropped for momentum was moving.
+    for t in set(permissive) - set(gated):
+        assert abs(speeds[times.index(t)]) > 0.05
+
+
+def test_the_momentum_gate_only_ever_removes_and_removes_in_order() -> None:
+    """Two properties that keep the gate from being a trap of its own.
+
+    Monotone: a tighter threshold can only remove exits, never invent one. And
+    a pose genuinely at rest is never removed at any threshold, so a clip that
+    comes to a stop keeps somewhere to stop -- which is why the turn clips, which
+    settle repeatedly, keep prompt early exits (49 of TurnLeft40's 73 keyframes,
+    longest wait 0.52 s) while a continuous walk keeps very few.
+    """
+    poses = cyclic_poses(translate=True)
+    speeds = clip_torso_speeds(poses)
+    times = [t for t, _ in poses]
+    thresholds = [0.01, 0.05, 0.2, float("inf")]
+    sets = [set(safe_exit_times(poses, max_torso_speed=v)) for v in thresholds]
+    for tighter, looser in zip(sets, sets[1:]):
+        assert tighter <= looser
+
+    # Anything at rest survives the tightest threshold used here.
+    at_rest = {t for t, v in zip(times, speeds) if abs(v) < 0.005}
+    assert at_rest & sets[-1] <= sets[0]

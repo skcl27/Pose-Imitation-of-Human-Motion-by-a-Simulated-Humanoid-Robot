@@ -437,6 +437,120 @@ class NaoCoMModel:
         return min(fore_aft, lateral)
 
 
+def clip_torso_speeds(poses: Sequence[tuple[float, dict[str, float]]],
+                      model: "NaoCoMModel | None" = None) -> list[float]:
+    """Forward torso speed (m/s) the clip itself commands, per keyframe.
+
+    Odometry, not a sensor: the stance foot is on the floor, so the torso moves
+    backwards relative to it by exactly as much as forward kinematics says the
+    hip has swung over it. The stance foot is whichever sole is lower, and only
+    intervals with the SAME stance foot contribute -- across a stance exchange
+    the reference jumps and the difference is meaningless.
+    """
+    model = model or NaoCoMModel()
+    advance: list[float] = []
+    total = 0.0
+    previous: float | None = None
+    last_stance: str | None = None
+    for _t, angles in poses:
+        frames = model.frames(angles)
+        lows = {side: float(model.foot_corners(side, frames)[:, 2].min())
+                for side in ("L", "R")}
+        stance = "L" if lows["L"] <= lows["R"] else "R"
+        transform = frames[f"{stance}AnkleRoll"]
+        sole = transform[:3, :3] @ np.array([0.035, 0.0, -0.04519]) + transform[:3, 3]
+        if last_stance == stance and previous is not None:
+            total += -(float(sole[0]) - previous)
+        previous = float(sole[0])
+        last_stance = stance
+        advance.append(total)
+    speeds: list[float] = []
+    for index, (t, _a) in enumerate(poses):
+        lo = max(0, index - 1)
+        hi = min(len(poses) - 1, index + 1)
+        span = float(poses[hi][0]) - float(poses[lo][0])
+        speeds.append(0.0 if span <= 0.0
+                      else (advance[hi] - advance[lo]) / span)
+    return speeds
+
+
+def safe_exit_times(poses: Sequence[tuple[float, dict[str, float]]],
+                    max_joint_speed: float = 3.0,
+                    max_sole_spread: float = 0.004,
+                    max_torso_speed: float = 0.05,
+                    model: "NaoCoMModel | None" = None) -> list[float]:
+    """Times in a motion clip at which playback may be stopped safely.
+
+    A clip is normally played to completion because a clip BOUNDARY is a balanced
+    double-support pose -- but that makes the clip's length the latency of "stop
+    walking", which for Cyberbotics' 6.76 s continuous walk would be untenable.
+    The boundary is not actually special, though: any keyframe with the same
+    properties will do, and a walk clip passes through many of them. A pose
+    qualifies when
+
+      * both feet are on the floor (neither sole's lowest corner is more than
+        FOOT_LIFT_TOL above the other's),
+      * each sole is flat (its four corners within ``max_sole_spread``),
+      * the centre of mass projects inside the contact-filtered support polygon
+        on both axes, and
+      * the clip is not about to move fast (the commanded joint speed to the next
+        keyframe is under ``max_joint_speed`` rad/s), so stopping does not freeze
+        the robot mid-lurch, and
+      * the TORSO is not still travelling (``max_torso_speed``, m/s).
+
+    That last gate is the one a purely static test misses, and it matters. Freezing
+    the legs does not freeze the robot: the body keeps the momentum it had, and the
+    capture point sits v/omega ahead of the centre of mass (omega = sqrt(g/h) ~=
+    5.9 rad/s at this crouch). 13 of the 46 poses that pass the static tests in
+    Forwards.motion are moving at up to 0.179 m/s, which puts the capture point
+    30 mm beyond the CoM against a margin budget of only 40-60 mm -- so "stop
+    here" would be handing back a robot that then walks itself over. At 0.05 m/s
+    the excursion is 8.5 mm.
+
+    Measured over the clips Webots ships, the momentum gate costs about a third
+    of the candidates and most of the responsiveness: Forwards.motion keeps 33 of
+    its 66 keyframes with a longest wait of 1.04 s (was 46 and 0.32 s), the turn
+    clips keep 49/73 and 108/226 at 0.52 s, and Forwards50.motion keeps only
+    38/170 at 2.56 s -- because a continuous walk is, by design, almost never
+    standing still. That last number is why this is the FALLBACK path for the
+    walk clip rather than the main one: see :func:`walk_motion.gait_cycle`, which
+    leaves through the clip's own deceleration instead of freezing it mid-stride,
+    and bounds the stop latency at 2.48 s without ever stopping on momentum. The
+    turn clips, which do come to rest repeatedly, are served well by this path.
+
+    Returns the times in seconds, ascending. An empty list means "no early exit
+    is known" and the caller should play to completion, which is the old
+    behaviour.
+    """
+    model = model or NaoCoMModel()
+    torso = clip_torso_speeds(poses, model)
+    out: list[float] = []
+    for index, (t, angles) in enumerate(poses):
+        if abs(torso[index]) > max_torso_speed:
+            continue                                  # still carrying momentum
+        frames = model.frames(angles)
+        corners = {side: model.foot_corners(side, frames) for side in ("L", "R")}
+        lows = {side: float(c[:, 2].min()) for side, c in corners.items()}
+        floor = min(lows.values())
+        if any(low > floor + FOOT_LIFT_TOL for low in lows.values()):
+            continue                                  # a foot is in the air
+        if any(float(c[:, 2].max()) - float(c[:, 2].min()) > max_sole_spread
+               for c in corners.values()):
+            continue                                  # a sole is on its edge
+        speed = 0.0
+        if index + 1 < len(poses):
+            t2, nxt = poses[index + 1]
+            dt = max(t2 - t, 1e-3)
+            speed = max((abs(nxt.get(j, 0.0) - v) / dt for j, v in angles.items()),
+                        default=0.0)
+        if speed >= max_joint_speed:
+            continue                                  # about to move fast
+        if min(model.support_margins(angles, frames)) <= 0.0:
+            continue                                  # not statically holdable
+        out.append(float(t))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Fibonacci / golden-angle spiral sampling
 # ---------------------------------------------------------------------------

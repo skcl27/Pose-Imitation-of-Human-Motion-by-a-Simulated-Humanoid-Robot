@@ -158,6 +158,7 @@ class PoseImitationPipeline:
         walk_enabled = bool(cfg.get("walk.enabled", True))
         gait_extractor = GaitCueExtractor(
             window_s=float(cfg.get("walk.cue_window_s", 1.3)),
+            cross_window_s=float(cfg.get("walk.cross_window_s", 3.0)),
             amp_start=float(cfg.get("walk.amp_start", 0.08)),
             amp_stop=float(cfg.get("walk.amp_stop", 0.05)),
             conf_min=float(cfg.get("walk.cue_conf_min", 0.6)),

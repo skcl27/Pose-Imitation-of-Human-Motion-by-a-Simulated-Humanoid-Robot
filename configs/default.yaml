@@ -129,7 +129,15 @@ webots:
 # here: it is driven straight from the streamed landmarks by the controller.
 walk:
   enabled: true        # stream the gait + body-yaw command in the UDP packet
-  cue_window_s: 1.3    # history window for cadence/amplitude (s)
+  cue_window_s: 1.3    # history window for the signal AMPLITUDE (s)
+  # Separate, longer window for counting the signal's crossings. It has to be
+  # longer: requiring two crossings inside the 1.3 s amplitude window imposes a
+  # cadence floor of 1/(2*1.3) = 0.385 Hz, which is 2.6x the walk_cadence_min_hz
+  # the controller itself asks for -- and measured over a recorded session the
+  # histogram of crossings-per-window peaked at exactly ONE. That single gate,
+  # not the amplitude and not the confidence, held "march" to 1.1% of frames and
+  # made walking impossible to request. At 3.0 s the floor drops to 0.167 Hz.
+  cross_window_s: 3.0
   amp_start: 0.08      # normalized knee-swing amplitude to START marching
   amp_stop: 0.05       # below this -> STOP (hysteresis; bias to standing still)
   cue_conf_min: 0.6    # min visible lower-body fraction to trust a gait reading

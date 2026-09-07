@@ -73,8 +73,13 @@ from walk_motion import (  # noqa: E402
     YawServo,
     default_motion_search_dirs,
     find_motion_files,
+    gait_cycle,
+    motion_first_pose,
     motion_joints,
+    motion_pose_at,
+    motion_poses,
     plan_action,
+    select_walk_clip,
 )
 
 # ===========================================================================
@@ -93,13 +98,17 @@ SOCKET_RCVBUF = 1 << 16
 # "engine" march engine + pose imitation, never the motion clips (use this to
 #          keep the robot on the spot).
 # "off"    legs held in the standing posture; upper body only.
-# Default is "pose": the legs IMITATE, continuously and in real time, and balance
-# is handled by shifting the centre of mass to make the imitated pose holdable
-# rather than by attenuating it (see lower_body._shift_com). Locomotion clips are
-# a 2-3 second commitment during which the camera is ignored for the leg joints,
-# which is the opposite of real-time imitation -- set "auto" to re-enable them when
-# covering ground matters more than following the legs.
-LEG_CONTROL = "pose"
+# Default is "auto", the full stack. It was "pose" for a while, on the reasoning
+# that a clip is a 2-3 second commitment during which the camera is ignored for
+# the leg joints -- the opposite of real-time imitation. That reasoning is sound
+# and it cost the project walking and turning entirely, because the alternative it
+# left in place cannot do either: NAO has no torso-yaw joint, so a rotation can
+# only be imitated by physically stepping round, and translating a free-standing
+# NAO needs a balanced gait. The clips ARE the gait. The arms, head and torso keep
+# imitating throughout playback (a clip declares only the 12 leg joints), so what
+# is actually suspended for those 2-3 seconds is per-leg detail while the robot
+# does the thing the human is doing: walking.
+LEG_CONTROL = "auto"
 
 DRIVE_HEAD = True         # head yaw/pitch follow the human head
 SWAP_SIDES = False        # True = mirror-image mapping (robot's left <-> your right)
@@ -281,6 +290,43 @@ IMU_CALIBRATION_MIN_HEAD_M = 0.40
 # second or more). The gyro on this proto has both tilt axes enabled, so the
 # parts are there. Until that exists and has been shown to hold a robot up, the
 # InertialUnit -- with its pitch scaled, below -- is the honest choice.
+# The torso attitude, in order of preference. "supervisor" is the truth and it is
+# the default, because on this robot BOTH sensor channels are provably wrong and
+# the wrongness is what has been felling the robot:
+#
+#   * the InertialUnit's pitch is half-scale AND carries a body rotation
+#     one-for-one (yAxis FALSE; see below). Measured in log 1788768834, in an
+#     episode that ran 3,735 s: the robot stood with hip+knee+ankle = 0.0000 (so
+#     the soles were flat and the torso vertical), its head 0.439 m up, both feet
+#     carrying 25.258 N and the model's own fore/aft margin at +0.062 m -- while
+#     the InertialUnit reported -0.263 rad of pitch, with imu_yaw/imu_pitch_raw =
+#     1.073, the yaw-leak signature exactly. The robot had shuffled about 30 deg
+#     off its spawn heading and that heading was being read as a permanent
+#     phantom pitch. The balance loop then held +0.18 rad of pelvis correction for
+#     an hour against a tilt that did not exist, and _settled() -- which the clip
+#     layer needs -- passed in 0.015% of that episode against 71.2% elsewhere. So
+#     the phantom is not a small residual: it grows with however far the robot has
+#     turned, without bound.
+#   * the accelerometer measures gravity PLUS the robot's own acceleration, which
+#     in a position loop is a second derivative fed back as a position. Tried
+#     live: six falls in a row, ~2 s each. See ACC_SNAP_RAD.
+#
+# The Supervisor's node orientation is neither. It is the same call already made
+# for the heading, it needs no learned zero (the world spawns the robot level),
+# and it cannot be confused by a body rotation because it reports the rotation
+# separately. From the row-major world<-torso matrix, with the ZYX convention
+# Webots uses:
+#
+#     yaw   = atan2(R[3], R[0])
+#     pitch = -asin(R[6])          + = nose-down = FORWARD  (matches balance.py)
+#     roll  = atan2(R[7], R[8])    + = top toward -y = RIGHT (matches balance.py)
+#
+# A real NAO has no Supervisor, so both sensor paths stay in the code and in the
+# log as the documented fallbacks -- and the balance ALGORITHM is unchanged and
+# still model-based. What changes is only that it is now told the truth about
+# which way up the robot is.
+ATTITUDE_SOURCE = "supervisor"   # "supervisor" | "accel" | "imu"
+
 TILT_FROM_ACCELEROMETER = False
 ACC_TILT_TAU_S = 0.08          # low-pass time constant on the gravity angles
 # ...but a change this big in one control step is not what the filter is for. The
@@ -329,6 +375,32 @@ ACC_DISAGREE_S = 2.0           # ...held this long -> fall back to the IMU
 IMU_PITCH_SCALE = 1.0
 
 # --- Heading ---------------------------------------------------------------
+# Where the robot's own heading comes from. Turning NEEDS one: NAO has no
+# torso-yaw joint, so "the human turned round" can only be imitated by stepping
+# round, and stepping round without measuring the result is open-loop -- clip and
+# human turn by different amounts and the error accumulates.
+#
+#   "supervisor" -- the truth, from Supervisor.getSelf().getOrientation(). The
+#                   world already grants the Nao node `supervisor TRUE` (the
+#                   controller uses simulationReset to stand the robot back up),
+#                   so this costs one call per step and no setup. The robot's
+#                   forward axis is +x in its own frame, so its world direction is
+#                   the first column of the row-major orientation matrix and the
+#                   heading is atan2(m[3], m[0]), increasing counter-clockwise
+#                   about world +z, i.e. positive = toward the robot's own LEFT,
+#                   which is the sign YawServo and TURN_SIGN already expect.
+#   "imu"        -- NOT USABLE on this robot, and the reason is in the proto (see
+#                   TILT_FROM_ACCELEROMETER): yAxis FALSE makes the InertialUnit's
+#                   "yaw" a copy of its half-scale pitch. Kept only so the
+#                   degradation is explicit.
+#   "off"        -- no heading; turning is disabled and no hip-yaw bias is
+#                   commanded. What the robot had before this change.
+#
+# A real NAO would take the heading from its own odometry or an external
+# reference; this is the one place the project uses simulator ground truth, and
+# it is used for STEERING, not for balance -- the balance loop stays model-based
+# (see balance.py) precisely so it remains a real-robot algorithm.
+HEADING_SOURCE = "supervisor"
 # There is no heading measurement on this robot. The InertialUnit's yaw axis is
 # disabled in the proto (and what it returns instead is the pitch channel, see
 # above), and the Gyro's z axis is disabled too, so the yaw RATE is not available
@@ -346,7 +418,101 @@ IMU_PITCH_SCALE = 1.0
 # So the heading loop is off until there is something real to close it on (a
 # Supervisor read, or a proto with the yaw axes enabled). Turning is the one
 # feature this costs, and it did not work anyway.
-HEADING_FROM_IMU = False
+HEADING_FROM_IMU = False        # kept: the IMU's yaw is unusable, see HEADING_SOURCE
+
+# --- Preparing to walk -----------------------------------------------------
+# A pre-balanced clip opens in a deep, sole-flat crouch (Cyberbotics' walk and
+# turn clips all start at knee 1.042 rad, about 0.51 rad of squat) while this
+# controller stands at base_crouch_u 0.10 (knee 0.20). Playback commands its
+# first keyframe on its very first step, with the velocity caps already lifted,
+# so handing over from standing asks the knees for 0.84 rad in one 20 ms step.
+# Instead the legs are ramped to the clip's own opening stance first (a posture
+# from the statically-balanced crouch family, so the ramp itself is safe) and the
+# clip is played only once the MEASURED joints are there.
+#
+# 2.5 s is generous: the ramp is 0.56 s of travel at the driver's 1.5 rad/s. If
+# it has not arrived by then a joint is blocked or fighting something, and
+# locomotion counts a failure rather than stalling forever.
+CLIP_PREPARE_TIMEOUT_S = 2.5
+
+# --- Stopping a clip early -------------------------------------------------
+# A clip used to be played to completion, on the sound reasoning that a clip
+# BOUNDARY is a balanced double-support pose and therefore the only safe place to
+# hand control back. The cost is that the clip's length becomes the latency of
+# "stop walking" -- and that is what kept this controller on Cyberbotics' short
+# 2.60 s walk, which is a single stride bracketed by a start and a stop transient
+# and therefore both slow (0.036 m/s measured, against NAO's ~0.10) and visibly
+# jerky when chained.
+#
+# The boundary is not actually special. Any keyframe in double support with both
+# soles flat, the centre of mass inside the support polygon, nothing about to move
+# fast AND the torso not still travelling has the same property, and a clip passes
+# through many: 33 of Forwards.motion's 66 keyframes, 49 of TurnLeft40's 73 and
+# 108 of TurnLeft180's 226 (see balance.safe_exit_times). The last of those gates
+# is the one that matters and the one a static test misses -- freezing the legs
+# does not freeze the robot, and 13 of the poses that pass the static tests are
+# moving at up to 0.179 m/s, which throws the capture point 30 mm past the CoM
+# against a 40-60 mm margin.
+#
+# For the TURN clips, which come to rest repeatedly, this is a good deal: the
+# longest wait to a safe exit is 0.52 s. For a continuous WALK clip it is not --
+# Forwards50.motion keeps only 38 of 170 keyframes and can make you wait 2.56 s,
+# because a continuous walk is by design almost never standing still. The walk is
+# served by GAIT_CYCLE below instead, and this remains its fallback.
+CLIP_EXIT_TOLERANCE_S = 0.03    # how near a safe keyframe counts as being at one
+
+# --- Cyclic gait -----------------------------------------------------------
+# Play the walk clip as a GAIT GENERATOR rather than as a one-shot animation.
+#
+# Cyberbotics' clips are animations: squat, accelerate, stride, decelerate, stand.
+# The stride is fine -- 0.051 m per half-step, peaking at 0.18 m/s -- but the
+# transient around it is not: it is 49% of Forwards.motion's 2.60 s, and during
+# the settle the torso actually travels 17 mm BACKWARD. Chaining that clip means
+# paying the transient for every 0.095 m, which is why walking measured 0.036 m/s
+# against NAO's documented ~0.10, and why it looks like stepping rather than
+# walking.
+#
+# The middle of the long clip, though, is a true limit cycle, and exactly so:
+# max|q(2.84 s) - q(1.80 s)| = 0.0000 rad over all 12 leg joints, holding to that
+# precision from 1.80 s to 5.32 s. So the segment can be rewound with setTime()
+# without commanding any joint motion at the seam, and one clip becomes a walk of
+# unbounded length at 0.089 m/s by forward kinematics -- the speed the stride is
+# actually worth, and 2.4x the 0.036 m/s measured today. (FK, not a measurement:
+# it counts the ground the clip's own keyframes cover, so slip, servo lag and
+# contact compliance are all unmodelled. Validate it on sv_com_x in a live log.)
+# The
+# transient is paid once per WALK instead of once per stride: for a 10 s walk that
+# is 47 start/stop cycles reduced to 1.
+#
+# What makes this safe rather than clever is how it stops. Not by freezing
+# mid-stride (see above), but by jumping once, at the single phase of the cycle
+# where the jump is nearly free (0.0010 rad = 0.05 rad/s over one control step),
+# into the clip's own deceleration -- so the robot is brought to rest by
+# Cyberbotics' own balanced feet-together settle. Worst-case stop latency is one
+# period plus that tail: 1.04 + 1.44 = 2.48 s, which is less than the 2.60 s the
+# short clip commits to for one 0.095 m step.
+#
+# Set False to go back to one-shot playback of whichever clip is found; the
+# detection is per-clip and refuses anything that is not periodic to a microradian
+# and does not translate the robot, so of the clips Webots ships only the
+# continuous walk qualifies (see walk_motion.gait_cycle).
+GAIT_CYCLE = True
+
+# --- Holding the walk intent ----------------------------------------------
+# The cue flickers. Measured over the first session that ever walked
+# (log 1788776922): gait_state "march" runs had a MEDIAN of 1.32 s -- shorter than
+# one 2.60 s clip -- while the longest was 37.24 s, and 33 of the 65 idle runs
+# were 1.2 s or shorter, totalling 18.2 s. The human was walking continuously;
+# the cue was not. Each of those dropouts ended a walk and forced a fresh
+# 0.6-1.0 s prepare ramp, which is the stutter.
+#
+# So the walk request is LATCHED: once the cue says the human is walking, the
+# request survives this long after the cue drops. The cost is walking a little
+# further than asked -- at 0.069 m/s a 1.2 s latch is 8 cm of overshoot -- and it
+# is bounded, because the moment the latch expires the clip leaves the gait
+# cycle (or, for a non-cyclic clip, exits at its next safe keyframe) rather than
+# running to its end.
+WALK_LATCH_RELEASE_S = 1.2
 
 # --- Balance ---------------------------------------------------------------
 # Model-based CoM feedback recovers the depth/balance information a 2D camera
@@ -446,6 +612,11 @@ DIAGNOSTIC_COLUMNS = (
     # are logged so the InertialUnit's half-scale pitch stays visible instead of
     # being silently replaced (see TILT_FROM_ACCELEROMETER).
     "acc_roll", "acc_pitch", "tilt_source",
+    # The simulator's own answers, logged for comparison with the model that
+    # actually does the controlling (see _ground_truth): the true whole-body
+    # centre of mass, whether the real CoM projects inside the convex hull of the
+    # real contact points, and how many contact points there are.
+    "sv_com_x", "sv_com_y", "sv_com_z", "sv_balanced", "sv_contacts", "sv_heading",
     # ...and the tilt the controller ACTUALLY acted on this step, which is not the
     # same as either channel: the InertialUnit's pitch is doubled on the way in
     # (IMU_PITCH_SCALE), and the source can change mid-run. Logging only the
@@ -468,10 +639,17 @@ DIAGNOSTIC_COLUMNS = (
     # of the total load: the one direct measurement of where the weight really is.
     "cop_share_l",
     "support_margin_x", "support_margin_y", "head_height", "reloads",
-    "clip_planned", "clip_status", "clips_available", "yaw_stable",
+    "clip_planned", "clip_status", "clips_available", "clip_time", "walk_latched",
+    "early_exits", "yaw_stable",
+    # Cyclic gait (GAIT_CYCLE): how many strides this walk has repeated without
+    # restarting the clip, the phase within the cycle, and what cycle_tick did.
+    # A walk that is working shows clip_cycles climbing while clip_phase saws
+    # between 0 and the period -- if clip_cycles stays 0 while the robot walks,
+    # the loop is not engaging and every stride is paying the transient again.
+    "clip_cycles", "clip_phase", "cycle_state",
     "yaw_error", "yaw_latched",
     "fsr_l", "fsr_r",
-    "gait_state", "gait_cadence", "gait_conf", "body_yaw",
+    "gait_state", "gait_cadence", "gait_conf", "body_yaw", "gait_cue_channel",
 )
 
 logging.basicConfig(
@@ -494,12 +672,24 @@ class MotionPlayer:
     is what makes the robot *genuinely* move -- its world coordinates change --
     rather than marching on the spot.
 
-    Clips are played **to completion and then optionally replayed**, never looped
-    and never cut short. A clip boundary is a balanced double-support pose, so it
-    is the only place where handing control back is safe; that also makes clip
-    length the granularity of "stop walking", which is why the short
-    ``Forwards.motion`` is preferred over ``Forwards50.motion``. :meth:`abort`
-    exists for the one case worth breaking that rule: an incipient fall.
+    Playback comes in two flavours.
+
+    **One-shot** is the conservative one and still the default: play the clip from
+    end to end, because a clip boundary is a balanced double-support pose. A clip
+    may also be released early, but only at a keyframe that is both statically
+    holdable and not carrying momentum (``balance.safe_exit_times``), because
+    stopping the legs does not stop the robot.
+
+    **Cyclic** applies to a clip with a genuine limit cycle in it
+    (``walk_motion.gait_cycle`` -- of the clips Webots ships, only the continuous
+    walk). Playback starts past the opening squat, rewinds the periodic window
+    with ``setTime`` for as long as the walk is wanted, and leaves through the
+    clip's own deceleration. That turns one 6.76 s clip into a gait generator: the
+    robot walks continuously at the speed its stride is worth instead of paying
+    the start/stop transient for every 0.095 m.
+
+    :meth:`abort` breaks either of them for the one case that justifies it: an
+    incipient fall.
     """
 
     def __init__(self, files: dict[str, str],
@@ -507,9 +697,18 @@ class MotionPlayer:
         self._files = dict(files)
         self._cache: dict[str, object] = {}
         self._joints: dict[str, list[str]] = {}
+        self._first_pose: dict[str, dict[str, float]] = {}
+        self._safe_exits: dict[str, list[float]] = {}
+        self._cycles: dict[str, object] = {}
+        self._entry_pose: dict[str, dict[str, float]] = {}
         self._log = log or (lambda *_a, **_k: None)
         self.action: str | None = None
         self._motion: object | None = None
+        # Cyclic playback state, all reset by _clear().
+        self._cycle: object | None = None
+        self._leaving = False       # the stop jump has been taken
+        self._previous_time: float | None = None
+        self.cycles_done = 0
 
     @property
     def available(self) -> dict[str, str]:
@@ -520,45 +719,331 @@ class MotionPlayer:
         return self._motion is not None
 
     def _load(self, action: str) -> object | None:
+        """The Motion object for ``action``, or None (and the clip is dropped).
+
+        Validity is judged by PARSING THE FILE, not by ``Motion.isValid()``. That
+        method cannot answer the question: the R2025a Python binding implements it
+        as ``self._ref != ctypes.c_void_p(0)``, comparing two freshly constructed
+        ctypes pointers, which are never equal -- so it returns True even for a
+        file Webots failed to load. The clip's own header is the honest test, and
+        the NULL check below catches a load Webots refused.
+        """
         if action in self._cache:
             return self._cache[action]
         path = self._files.get(action)
         if path is None:
             return None
+        if not motion_joints(path):
+            self._log("Motion '%s' has no readable joint header (%s); dropping it",
+                      action, path)
+            self._files.pop(action, None)
+            return None
         try:
             motion = Motion(path)
-            if not motion.isValid():
-                raise RuntimeError("clip rejected by Webots")
         except Exception as exc:  # noqa: BLE001
             self._log("Motion '%s' unusable (%s); dropping it", action, exc)
+            self._files.pop(action, None)
+            return None
+        # wbu_motion_new returns NULL when it cannot load the file, which the
+        # binding stores as a c_void_p whose .value is None.
+        ref = getattr(motion, "_ref", None)
+        if ref is not None and getattr(ref, "value", 1) in (None, 0):
+            self._log("Motion '%s' was rejected by Webots' loader; dropping it",
+                      action)
             self._files.pop(action, None)
             return None
         self._cache[action] = motion
         return motion
 
-    def start(self, action: str) -> bool:
-        """Begin ``action``; returns False if its clip is missing or invalid."""
+    def start(self, action: str, at_s: float = 0.0) -> bool:
+        """Begin ``action``; returns False if the clip could not be started.
+
+        THE ONE LINE THAT KEPT THIS ROBOT FROM EVER WALKING. Webots' R2025a
+        Python binding is::
+
+            def play(self):
+                wb.wbu_motion_play(self._ref)      # no return statement
+
+        so ``play()`` evaluates to None, and the old ``if not motion.play():
+        return False`` therefore returned False on every call ever made. The
+        locomotion layer never once became active -- ``leg_mode`` is "pose" in
+        100.0% of the frames of every recorded session -- and the controller
+        logged it as "start REFUSED by Webots", which read like a Webots problem
+        rather than an inverted truth test.
+
+        Worse than not walking: ``wbu_motion_play`` HAD started the clip, and the
+        Webots controller library applies a playing clip's keyframes on every
+        step. So the clip drove the 12 leg joints while this class believed
+        nothing was playing, per-joint commanding was never suspended, and the two
+        fought -- and because the arbiter retries a planned clip every step, the
+        clip was stopped, rewound and replayed every 20 ms, pinning it to its
+        first keyframe. Measured in log 1788428293: 964 frames of "REFUSED" with
+        LKneePitch MEASURED at the clip's own first keyframe (1.042 rad) while the
+        controller commanded 0.20-0.52.
+
+        So playback is confirmed by asking the clip whether it is running, which
+        is a question the API does answer.
+
+        ``at_s`` starts playback part-way in, which is how a cyclic clip skips its
+        opening squat. The caller is responsible for having put the legs in the
+        pose at that offset first (``walk_motion.motion_pose_at``).
+        """
         motion = self._load(action)
         if motion is None:
             return False
+        cycle = self.cycle(action)
+        at_s = max(0.0, float(at_s))
         try:
             motion.setLoop(False)
             # A clip that already ran must be rewound, or play() resumes at its
-            # end and returns immediately. stop() + setTime(0) covers both the
+            # end and returns immediately. stop() + setTime() covers both the
             # "interrupted" and the "finished" case.
             motion.stop()
             try:
-                motion.setTime(0)
+                motion.setTime(int(round(at_s * 1000.0)))
             except Exception:  # noqa: BLE001 - older API without setTime
-                pass
-            if not motion.play():
+                if at_s > 0.0:
+                    self._log("Motion '%s': no setTime(), so it cannot be entered "
+                              "at %.2fs or cycled; playing it one-shot.",
+                              action, at_s)
+                    cycle = None
+            motion.play()               # returns None -- see the docstring
+            if bool(motion.isOver()):   # ...so THIS is the test that works
+                self._log("Motion '%s' reported itself finished the moment it was "
+                          "played; dropping it", action)
+                self._files.pop(action, None)
+                self._cache.pop(action, None)
                 return False
         except Exception as exc:  # noqa: BLE001
             self._log("Could not play motion '%s': %s", action, exc)
             return False
         self.action = action
         self._motion = motion
+        self._cycle = cycle
+        self._leaving = False
+        self._previous_time = None
+        self.cycles_done = 0
         return True
+
+    def time_s(self) -> float | None:
+        """How far into the clip playback is, in seconds, or None."""
+        if self._motion is None:
+            return None
+        try:
+            ms = float(self._motion.getTime())
+        except Exception:  # noqa: BLE001
+            return None
+        return ms / 1000.0 if math.isfinite(ms) else None
+
+    def safe_exits(self, action: str | None = None) -> list[float]:
+        """Times (s) at which this clip may be stopped safely; [] if unknown.
+
+        Computed once per clip from its own keyframes (see
+        ``balance.safe_exit_times``). Needs the CoM model, so without NumPy the
+        list is empty and the caller plays the clip to completion, which is the
+        behaviour this replaces.
+        """
+        target = action or self.action
+        if target is None:
+            return []
+        if target not in self._safe_exits:
+            times: list[float] = []
+            path = self._files.get(target)
+            if path is not None:
+                try:
+                    from balance import safe_exit_times
+
+                    times = safe_exit_times(motion_poses(path))
+                except Exception as exc:  # noqa: BLE001
+                    self._log("No early-exit points for '%s' (%s); it will be "
+                              "played to completion.", target, exc)
+                    times = []
+            self._safe_exits[target] = times
+        return self._safe_exits[target]
+
+    def at_safe_exit(self, tolerance: float = 0.03) -> bool:
+        """Is playback at (or just past) a keyframe it can be stopped at?"""
+        now = self.time_s()
+        exits = self.safe_exits()
+        if now is None or not exits:
+            return False
+        return any(abs(now - t) <= tolerance for t in exits)
+
+    def cycle(self, action: str | None = None):
+        """The :class:`walk_motion.GaitCycle` for ``action``, or None.
+
+        Cached per clip -- the detection walks every keyframe through forward
+        kinematics, which is far too slow to repeat per control step.
+        """
+        target = action or self.action
+        if target is None:
+            return None
+        if target not in self._cycles:
+            found = None
+            path = self._files.get(target)
+            if path is not None and GAIT_CYCLE:
+                try:
+                    found = gait_cycle(path)
+                except Exception as exc:  # noqa: BLE001
+                    self._log("No gait cycle for '%s' (%s); it will be played "
+                              "one-shot.", target, exc)
+                    found = None
+                if found is not None:
+                    self._log(
+                        "Clip '%s' is cyclic: enter at %.2fs, loop [%.2f, %.2f]s "
+                        "(%.2fs, %+.0f mm => %.3f m/s), leave %.2f->%.2fs at a "
+                        "cost of %.4f rad. Stop latency at most %.2fs.",
+                        target, found.enter_s, found.loop_start_s, found.loop_end_s,
+                        found.period_s, found.advance_m * 1000.0, found.speed_mps,
+                        found.exit_from_s, found.exit_to_s, found.exit_cost_rad,
+                        found.stop_latency_s)
+            self._cycles[target] = found
+        return self._cycles[target]
+
+    @property
+    def cyclic(self) -> bool:
+        """Is playback of this clip being run to a cycle schedule?
+
+        True from the moment a cyclic clip starts until it ends -- INCLUDING
+        while it rides its own deceleration out after taking the exit jump. That
+        tail is the schedule's last act and must be left alone: the whole reason
+        for jumping into it is that Cyberbotics' balanced feet-together settle is
+        what brings the robot to rest. Releasing the body part-way through it,
+        which the early-exit path would happily do, throws away the deceleration
+        that was just bought and hands back a robot mid-settle.
+        """
+        return self._motion is not None and self._cycle is not None
+
+    @property
+    def cycling(self) -> bool:
+        """Is a cyclic clip playing, and still free to repeat?"""
+        return self.cyclic and not self._leaving
+
+    @property
+    def leaving(self) -> bool:
+        """Has the exit jump been taken (so the tail is playing out)?"""
+        return self.cyclic and self._leaving
+
+    def entry_pose(self, action: str | None = None) -> dict[str, float]:
+        """The pose to ramp the legs to before playing ``action``.
+
+        The clip's first keyframe normally, but the pose at ``enter_s`` for a
+        cyclic clip, whose opening squat is skipped.
+        """
+        target = action or self.action
+        if target is None:
+            return {}
+        cycle = self.cycle(target)
+        if cycle is None or cycle.enter_s <= 0.0:
+            return self.first_pose(target)
+        if target not in self._entry_pose:
+            self._entry_pose[target] = motion_pose_at(
+                self._files.get(target), cycle.enter_s)
+        return dict(self._entry_pose[target])
+
+    def entry_time_s(self, action: str | None = None) -> float:
+        """Where playback of ``action`` should start, in seconds."""
+        cycle = self.cycle(action)
+        return 0.0 if cycle is None else float(cycle.enter_s)
+
+    def cycle_tick(self, hold: bool) -> str:
+        """Advance cyclic playback one control step. Returns a status word.
+
+        Called on every step a cyclic clip is playing. ``hold`` is whether the
+        walk is still wanted.
+
+        The stride repeats either way -- the difference between holding and not
+        is only whether the walk is looking for its exit. Waiting for the exit
+        phase is done by walking, not by standing still mid-stride.
+
+        * Holding, and the playhead has reached the end of the periodic window:
+          rewind by exactly one period. The joints at the two ends of that window
+          are identical to a microradian (``gait_cycle`` accepts nothing looser),
+          so the seam commands no motion and the stride simply repeats. The
+          overshoot within the step is carried across, which keeps the phase
+          continuous instead of quantising it to the control period.
+        * Not holding: wait until the playhead CROSSES the one phase of the cycle
+          from which the clip's own deceleration is reachable for free, then jump
+          there once. From that moment playback is ordinary one-shot: the tail
+          plays out and :meth:`poll` reports it over, with the robot standing
+          still and feet together, exactly as if the clip had been played end to
+          end.
+
+        Crossing, not "at or past". The cheap jump is cheap at ONE phase of the
+        stride -- that is the whole basis for it being safe -- and the playhead
+        spends the rest of the period past that phase, so a "past it" test fires
+        at whatever moment the human happened to stop and lands wherever the
+        joints happened to be. Measured on the test gait: the free exit costs
+        0.0000 rad taken on the phase and up to 0.4 rad taken off it, which is a
+        20 rad/s lurch. Crossings cannot be missed either, however the playhead
+        is stepped, which a tolerance window can.
+        """
+        if self._motion is None or self._cycle is None:
+            return "not cycling"
+        now = self.time_s()
+        if now is None:
+            return "no clock"
+        cycle = self._cycle
+        previous, self._previous_time = self._previous_time, now
+        if self._leaving:
+            return "leaving"
+        if not hold and self._crossed(cycle.exit_from_s, previous, now, cycle):
+            if self._set_time(cycle.exit_to_s):
+                self._leaving = True
+                self._log("Leaving the gait cycle after %d stride(s): "
+                          "%.2fs -> %.2fs, then %.2fs of the clip's own "
+                          "deceleration.", self.cycles_done,
+                          now, cycle.exit_to_s, cycle.tail_s)
+                return "leaving"
+            # setTime failed, so this clip cannot be cycled at all; _set_time has
+            # dropped the cycle and playback carries on as an ordinary one-shot.
+        # Keep striding -- INCLUDING while waiting to leave. A robot that stopped
+        # rewinding the moment it was asked to stop would run the playhead off the
+        # end of the loop window into whatever the clip does next, which is not
+        # the cycle and not the deceleration either. It would also never come back
+        # round to the exit phase, so it would never leave; the watchdog would
+        # eventually take the body back mid-stride and count a failure.
+        if now + 1e-9 >= cycle.loop_end_s:
+            if self._set_time(now - cycle.period_s):
+                self.cycles_done += 1
+                return "rewound" if hold else "stopping"
+        return "cycling" if hold else "stopping"
+
+    @staticmethod
+    def _crossed(phase: float, previous: float | None, now: float, cycle) -> bool:
+        """Did the playhead pass ``phase`` between ``previous`` and ``now``?
+
+        The interval is normally [previous, now], but a rewind happened if the
+        playhead went BACKWARD, and then the ground covered is [previous,
+        loop_end) followed by [loop_start, now] -- so both pieces are tested.
+        """
+        if previous is None:
+            return now + 1e-9 >= phase
+        if now + 1e-9 >= previous:
+            return previous < phase + 1e-9 <= now + 1e-9
+        return phase + 1e-9 > previous or phase - 1e-9 <= now
+
+    def _set_time(self, seconds: float) -> bool:
+        if self._motion is None:
+            return False
+        try:
+            self._motion.setTime(int(round(max(0.0, seconds) * 1000.0)))
+        except Exception as exc:  # noqa: BLE001
+            self._log("setTime(%.2fs) failed on '%s' (%s); this clip cannot be "
+                      "cycled.", seconds, self.action, exc)
+            self._cycle = None
+            return False
+        return True
+
+    def first_pose(self, action: str | None = None) -> dict[str, float]:
+        """The joint angles the clip for ``action`` opens on (see
+        ``walk_motion.motion_first_pose``). Cached; {} if unknowable."""
+        target = action or self.action
+        if target is None:
+            return {}
+        if target not in self._first_pose:
+            self._first_pose[target] = motion_first_pose(self._files.get(target))
+        return dict(self._first_pose[target])
 
     def poll(self) -> bool:
         """True while the clip is still running; clears itself when it is over."""
@@ -605,10 +1090,18 @@ class MotionPlayer:
             self._files.clear()
             self._cache.clear()
             self._joints.clear()
+            self._first_pose.clear()
+            self._safe_exits.clear()
+            self._cycles.clear()
+            self._entry_pose.clear()
         else:
             self._files.pop(target, None)
             self._cache.pop(target, None)
             self._joints.pop(target, None)
+            self._first_pose.pop(target, None)
+            self._safe_exits.pop(target, None)
+            self._cycles.pop(target, None)
+            self._entry_pose.pop(target, None)
 
     def abort(self) -> None:
         """Stop mid-clip. Only for a safety abort -- see the class docstring."""
@@ -623,6 +1116,9 @@ class MotionPlayer:
     def _clear(self) -> None:
         self.action = None
         self._motion = None
+        self._cycle = None
+        self._leaving = False
+        self._previous_time = None
 
 
 # ===========================================================================
@@ -669,6 +1165,7 @@ class PoseImitationController:
             logger=logger.info,
         )
         self._init_imu()
+        self._init_supervisor_sense()
         self._init_walk_sensors()
         self._init_locomotion()
         self._init_socket()
@@ -729,6 +1226,19 @@ class PoseImitationController:
         # from the joint angles.
         self._clip_planned = ""
         self._clip_status = "idle"
+        # Ramp-to-clip-stance state (see CLIP_PREPARE_TIMEOUT_S).
+        self._preparing: str | None = None
+        self._prepare_since: float | None = None
+        # Latched walk request (see WALK_LATCH_RELEASE_S): the last gait command
+        # that asked for locomotion, and when the latch on it expires.
+        self._walk_gait: dict | None = None
+        self._walk_latch_until: float | None = None
+        # How many clips were stopped early at a safe keyframe rather than played
+        # to their end. Counted because "the robot stops promptly now" is exactly
+        # the kind of claim that should be measurable after the fact.
+        self._early_exits = 0
+        self._cycles_walked = 0
+        self._cycle_state = ""
         self._report_startup()
 
     def _report_startup(self) -> None:
@@ -764,15 +1274,20 @@ class PoseImitationController:
                         ", ".join(clips) if clips
                         else "NONE FOUND  <-- will march in place, not walk")
         logger.info("  torso attitude    : %s",
-                    "GRAVITY (accelerometer) + InertialUnit roll cross-check"
+                    "SUPERVISOR node orientation (the truth; both sensor "
+                    "channels are provably wrong on this proto -- see "
+                    "ATTITUDE_SOURCE)"
+                    if (ATTITUDE_SOURCE == "supervisor" and self.self_node is not None)
+                    else "GRAVITY (accelerometer)"
                     if (TILT_FROM_ACCELEROMETER and self.accel is not None)
                     else f"InertialUnit, pitch x{IMU_PITCH_SCALE:.0f} (it reports "
-                         f"half-scale on this proto); gravity logged but not acted "
-                         f"on -- see TILT_FROM_ACCELEROMETER")
+                         f"half-scale on this proto)  <-- DEGRADED")
         logger.info("  heading feedback  : %s",
-                    "ON (InertialUnit)" if HEADING_FROM_IMU
-                    else "OFF  <-- this proto disables the IMU and gyro yaw axes, "
-                         "so there is no heading to servo on; turning is disabled")
+                    f"ON ({HEADING_SOURCE})" if self.heading_available
+                    else f"OFF (source={HEADING_SOURCE})  <-- no heading, so "
+                         f"turning is disabled. This proto's IMU and gyro yaw "
+                         f"axes are switched off; 'supervisor' needs "
+                         f"`supervisor TRUE` on the Nao node.")
         logger.info("  foot force sensors: %d",
                     len(self.fsr["L"]) + len(self.fsr["R"]))
         for reason in d.degraded:
@@ -806,6 +1321,100 @@ class PoseImitationController:
             logger.info("InertialUnit enabled (balance + heading feedback)")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not enable InertialUnit: %s", exc)
+
+    def _init_supervisor_sense(self) -> None:
+        """Grab our own scene-tree node, for the heading (see HEADING_SOURCE).
+
+        Also the gateway to real ground truth -- getCenterOfMass() aggregates the
+        descendant solids, getContactPoints(True) gives the actual sole/floor
+        contacts and getStaticBalance() tests the real centre of mass against the
+        convex hull of them -- which is logged for comparison with the model but
+        deliberately NOT used for control; see _ground_truth.
+        """
+        self.self_node = None
+        if HEADING_SOURCE != "supervisor" and ATTITUDE_SOURCE != "supervisor":
+            return
+        getter = getattr(self.robot, "getSelf", None)
+        if getter is None:
+            logger.warning(
+                "HEADING_SOURCE is 'supervisor' but this controller is not a "
+                "Supervisor, so there is no heading: turning will be disabled. "
+                "Add `supervisor TRUE` to the Nao node in the world file."
+            )
+            return
+        try:
+            node = getter()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Supervisor.getSelf() failed (%s); turning disabled", exc)
+            return
+        if node is None:
+            logger.warning("Supervisor.getSelf() returned nothing; turning disabled")
+            return
+        self.self_node = node
+        logger.info("Supervisor node acquired: attitude=%s, heading=%s",
+                    ATTITUDE_SOURCE, HEADING_SOURCE)
+
+    @property
+    def heading_available(self) -> bool:
+        """Is there a heading worth closing a loop on?"""
+        if HEADING_SOURCE == "supervisor":
+            return self.self_node is not None
+        return HEADING_SOURCE == "imu" and HEADING_FROM_IMU
+
+    def _heading(self, imu_yaw: float) -> float:
+        """The robot's heading in the world frame, rad, CCW-positive (= its left).
+
+        From the Supervisor's orientation matrix where available -- the robot's
+        forward axis is +x in its own frame, so its world direction is the first
+        COLUMN of the row-major 3x3, (m[0], m[3], m[6]). Falls back to the
+        InertialUnit's yaw only if HEADING_SOURCE says to, which it should not:
+        that channel is a copy of the half-scale pitch on this proto.
+        """
+        if HEADING_SOURCE == "supervisor" and self.self_node is not None:
+            try:
+                m = self.self_node.getOrientation()
+            except Exception:  # noqa: BLE001
+                return 0.0
+            if m is not None and len(m) >= 9:
+                try:
+                    return math.atan2(float(m[3]), float(m[0]))
+                except (TypeError, ValueError):
+                    return 0.0
+            return 0.0
+        return imu_yaw if HEADING_FROM_IMU else 0.0
+
+    def _ground_truth(self) -> dict[str, object]:
+        """The simulator's own answers, for the log only -- never for control.
+
+        The balance loop stays model-based (forward kinematics + link masses, see
+        balance.py) so that it remains an algorithm a real NAO could run. But the
+        simulator can be ASKED, and logging both is how the model gets validated
+        instead of trusted: getCenterOfMass() aggregates descendant solids into
+        the true whole-body CoM, getStaticBalance() projects it onto the convex
+        hull of the real contact points, and getContactPoints(True) says which
+        parts of the robot are actually touching the floor.
+        """
+        out: dict[str, object] = {}
+        node = self.self_node
+        if node is None:
+            return out
+        try:
+            com = node.getCenterOfMass()
+            if com is not None and len(com) >= 3 and math.isfinite(float(com[0])):
+                out["sv_com_x"], out["sv_com_y"] = float(com[0]), float(com[1])
+                out["sv_com_z"] = float(com[2])
+        except Exception:  # noqa: BLE001 - a diagnostic must never break control
+            pass
+        try:
+            out["sv_balanced"] = int(bool(node.getStaticBalance()))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            points = node.getContactPoints(True)
+            out["sv_contacts"] = 0 if points is None else len(points)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     def _imu_rpy(self) -> tuple:
         """(roll, pitch, yaw) of the torso in rad; (0, 0, 0) if unavailable."""
@@ -955,7 +1564,7 @@ class PoseImitationController:
         * the soles have carried almost nothing for seconds
           (``FALL_UNLOADED_N`` / ``FALL_UNLOADED_S``).
         """
-        if self._imu_zero is None:
+        if not self.attitude_ready:
             # Tilt is not yet meaningful, so neither is any test built on it.
             self._fall_since = self._stuck_since = self._unloaded_since = None
             return False
@@ -1066,6 +1675,8 @@ class PoseImitationController:
     def _reset_for_new_episode(self) -> None:
         """Drop all state that describes the old, fallen robot."""
         self.motion.abort()
+        self._abandon_prepare()
+        self._drop_walk_latch()
         self.driver.reclaim_from_motion()
         # Return the COMMANDED pose to neutral. The reset puts the robot back
         # upright, but the driver's base_targets still held the collapsed pose it
@@ -1107,6 +1718,24 @@ class PoseImitationController:
             return (0.0, 0.0)
         return (raw_roll - self._imu_zero[0], raw_pitch - self._imu_zero[1])
 
+    def _acc_tilt_raw_update(self, now: float) -> None:
+        """Advance the low-passed gravity attitude without acting on it, so
+        acc_roll/acc_pitch stay a live comparison in the log even when the
+        Supervisor is the control source."""
+        raw = self._acc_tilt_raw()
+        if raw is None:
+            return
+        dt = 0.0 if self._acc_last_update is None else max(0.0, now - self._acc_last_update)
+        self._acc_last_update = now
+        if self._acc_tilt is None or dt <= 0.0 or \
+                max(abs(n - p) for n, p in zip(raw, self._acc_tilt, strict=False)) > ACC_SNAP_RAD:
+            self._acc_tilt = raw
+        else:
+            a = 1.0 - math.exp(-dt / ACC_TILT_TAU_S)
+            self._acc_tilt = tuple(
+                prev + a * (new - prev) for prev, new in zip(self._acc_tilt, raw, strict=False)
+            )
+
     def _acc_tilt_raw(self) -> tuple | None:
         """(roll, pitch) of the torso from gravity, or None if unusable.
 
@@ -1139,6 +1768,41 @@ class PoseImitationController:
         roll = math.atan2(uy, uz)
         return (roll, pitch)
 
+    def _supervisor_tilt(self) -> tuple | None:
+        """(roll, pitch) of the torso from the scene tree, or None.
+
+        See ATTITUDE_SOURCE for the derivation and the sign conventions.
+        """
+        if self.self_node is None:
+            return None
+        try:
+            m = self.self_node.getOrientation()
+        except Exception:  # noqa: BLE001
+            return None
+        if m is None or len(m) < 9:
+            return None
+        try:
+            r20 = max(-1.0, min(1.0, float(m[6])))
+            pitch = -math.asin(r20)
+            roll = math.atan2(float(m[7]), float(m[8]))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(roll) and math.isfinite(pitch)):
+            return None
+        return (roll, pitch)
+
+    @property
+    def attitude_ready(self) -> bool:
+        """Is the tilt the controller acts on meaningful yet?
+
+        The Supervisor's is meaningful from the first step; the sensor paths have
+        to learn their zero first (see IMU_AUTO_ZERO), and until they have, tilt
+        is reported as level so nothing aborts on a reading we do not understand.
+        """
+        if ATTITUDE_SOURCE == "supervisor" and self.self_node is not None:
+            return True
+        return self._imu_zero is not None
+
     def _torso_tilt(self, now: float, imu_roll: float, imu_pitch: float,
                     fsr: dict[str, float] | None) -> tuple:
         """The (roll, pitch) the controller acts on, and the source it came from.
@@ -1148,6 +1812,16 @@ class PoseImitationController:
         agreement test is only meaningful on a robot standing on its feet, so it
         is only evaluated there.
         """
+        # The truth first, when the scene tree can be asked (see ATTITUDE_SOURCE).
+        if ATTITUDE_SOURCE == "supervisor":
+            supervised = self._supervisor_tilt()
+            if supervised is not None:
+                self._tilt_source = "supervisor"
+                # Gravity is still computed and low-passed so acc_* stays a live
+                # witness in the log, but it is not what we act on.
+                self._acc_tilt_raw_update(now)
+                return supervised
+
         self._tilt_source = "imu"
         imu_pitch *= IMU_PITCH_SCALE          # see IMU_PITCH_SCALE
         raw = self._acc_tilt_raw()
@@ -1269,9 +1943,15 @@ class PoseImitationController:
             return
         dirs = default_motion_search_dirs(extra=MOTION_SEARCH_DIRS_EXTRA)
         files = find_motion_files(dirs)
+        if GAIT_CYCLE:
+            files, note = select_walk_clip(files)
+        else:
+            files.pop("forward_continuous", None)
+            note = "GAIT_CYCLE is off; one-shot playback of the short clip"
         self.motion = MotionPlayer(files, log=logger.warning)
         if files:
             logger.info("Locomotion clips found: %s", ", ".join(sorted(files)))
+            logger.info("Walk clip: %s", note)
         else:
             logger.warning(
                 "No NAO .motion files found (searched %d dirs, e.g. %s). The robot "
@@ -1357,6 +2037,31 @@ class PoseImitationController:
         alpha = 1.0 - math.exp(-dt / TILT_RISK_TAU_S) if dt > 0 else 1.0
         self._tilt_risk += alpha * (mag - self._tilt_risk)
 
+    def _latched_gait(self, now: float) -> dict | None:
+        """The gait command the locomotion layer should act on.
+
+        The live one while it asks for locomotion; the last one that did for
+        WALK_LATCH_RELEASE_S after it stops asking. The cue flickers -- median
+        "march" run 1.32 s against 33 sub-1.2 s dropouts in the first session that
+        walked -- and without this every flicker ended a walk and paid for a fresh
+        prepare ramp.
+        """
+        live = self.gait_cmd or {}
+        if str(live.get("state", "idle")) == "march":
+            self._walk_gait = dict(live)
+            self._walk_latch_until = now + WALK_LATCH_RELEASE_S
+            return self._walk_gait
+        if self._walk_latch_until is not None and now < self._walk_latch_until:
+            return self._walk_gait
+        self._walk_gait = None
+        self._walk_latch_until = None
+        return live or None
+
+    def _drop_walk_latch(self) -> None:
+        """Forget the latched walk request (the robot must not resume on it)."""
+        self._walk_gait = None
+        self._walk_latch_until = None
+
     def _marching(self) -> bool:
         gait = self.gait_cmd or {}
         return (
@@ -1378,8 +2083,15 @@ class PoseImitationController:
             fsr = self._read_fsr()
         falling = self._falling(roll, pitch)
 
-        # (1) A clip is playing: it owns the whole body until it ends, unless the
-        #     robot is about to go over or the watchdog fires.
+        # What the locomotion layer is being asked for this step, with the walk
+        # request latched across the cue's dropouts (see WALK_LATCH_RELEASE_S).
+        locomotion_gait = self._latched_gait(now)
+
+        # (1) A clip is playing. It owns the 12 leg joints -- but not
+        #     unconditionally to the end of the clip. If nothing wants locomotion
+        #     any more then a CYCLIC clip leaves its loop through the clip's own
+        #     deceleration (see GAIT_CYCLE), and any other clip stops at the next
+        #     keyframe it is safe to stop at (see CLIP_EXIT_TOLERANCE_S).
         if self.motion.active:
             action = self.motion.action
             if falling:
@@ -1397,8 +2109,47 @@ class PoseImitationController:
                 self.motion.drop(action)
                 self._end_motion(action, ok=False, reason="watchdog")
             elif self.motion.poll():
-                self.leg_mode = f"motion:{action}"
-                return
+                # What the planner wants THIS step, recorded even though branch 2
+                # is not running: clip_planned used to freeze at whatever was
+                # planned when the clip started, which made it look as though the
+                # planner still wanted a forward walk for the whole run. It was
+                # stale, not agreeing -- and a stale diagnostic is worse than a
+                # missing one, because it argues against the true explanation.
+                self._clip_planned = self._wanted_action(locomotion_gait, yaw) or ""
+                wanted = not self._clip_unwanted(locomotion_gait, roll, pitch, yaw)
+                if self.motion.cyclic:
+                    # A gait generator: repeat the stride while the walk is
+                    # wanted, and when it is not, leave through the clip's own
+                    # deceleration rather than freezing mid-stride. Either way
+                    # the clip keeps the legs this step, right through the
+                    # deceleration -- the early-exit path below must not get a
+                    # look at it, or it would release the body mid-settle.
+                    strides = self.motion.cycles_done
+                    self._cycle_state = self.motion.cycle_tick(wanted)
+                    if self.motion.cycles_done > strides:
+                        self._cycles_walked += 1
+                        # The clip cannot end while it is being rewound, so the
+                        # watchdog has to be told that progress is being made or
+                        # it would kill a perfectly healthy walk. Counted from
+                        # the player's own tally rather than the status word,
+                        # because a stride completed while the walk is looking
+                        # for its exit is still a stride and still proof of life.
+                        self._extend_motion_deadline(now)
+                    self._clip_status = f"cycling ({self._cycle_state})"
+                    self.leg_mode = f"motion:{action}"
+                    return
+                if not wanted and self.motion.at_safe_exit(CLIP_EXIT_TOLERANCE_S):
+                    logger.info(
+                        "Nothing wants locomotion any more: stopping '%s' at a "
+                        "safe keyframe (%.2fs of %.2fs).", action,
+                        self.motion.time_s() or 0.0,
+                        self.motion.duration_s() or 0.0)
+                    self._early_exits += 1
+                    self._end_motion(action, ok=True, reason="stopped early, safely")
+                    self._clip_status = "stopped at a safe keyframe"
+                else:
+                    self.leg_mode = f"motion:{action}"
+                    return
             else:
                 # Finished normally -- but only counts as a success if the robot
                 # is still upright, otherwise we are walking ourselves over.
@@ -1423,27 +2174,44 @@ class PoseImitationController:
         if self.leg_control == "auto" and not falling:
             # Without a heading the turn half of the planner is starved on purpose
             # (error 0, never trustworthy) while forward walking is untouched --
-            # walking needs no heading. See HEADING_FROM_IMU.
+            # walking needs no heading. See HEADING_SOURCE.
+            has_heading = self.heading_available
             plan = plan_action(
-                yaw_error_rad=self.yaw_servo.error(yaw) if HEADING_FROM_IMU else 0.0,
-                gait=self.gait_cmd,
+                yaw_error_rad=self.yaw_servo.error(yaw) if has_heading else 0.0,
+                gait=locomotion_gait,
                 available=self.motion.available,
                 params=LOCOMOTION,
                 turning=self._turning,
-                yaw_trustworthy=HEADING_FROM_IMU and self.yaw_servo.stable(),
+                yaw_trustworthy=has_heading and self.yaw_servo.stable(),
             )
             self._clip_planned = plan.action or ""
             if plan.action is None:
                 # Nothing left to correct: the rotation (if any) has converged.
                 self._turning = False
                 self._clip_status = "nothing planned"
+                self._abandon_prepare()
             elif not self._settled(roll, pitch):
                 # Starting a clip mid-wobble is how a walk becomes a fall; wait,
                 # but let branch 3 keep the legs moving while we wait.
                 clip_declined = True
                 self._clip_status = "declined: not settled"
-            elif self.motion.start(plan.action):
-                logger.info("Locomotion: %s (%s)", plan.action, plan.reason)
+                self._abandon_prepare()
+            elif not self._ready_to_play(now, plan.action):
+                # Ramping the legs into the stance the clip opens in. THIS layer
+                # is the leg commander while that happens -- see
+                # CLIP_PREPARE_TIMEOUT_S and NaoPoseDriver.approach_leg_pose.
+                self.leg_mode = f"prepare:{plan.action}"
+                return
+            elif self.motion.start(plan.action,
+                                   self.motion.entry_time_s(plan.action)):
+                cycle = self.motion.cycle(plan.action)
+                if cycle is None:
+                    logger.info("Locomotion: %s (%s)", plan.action, plan.reason)
+                else:
+                    logger.info(
+                        "Locomotion: %s (%s) as a continuous gait -- %.3f m/s "
+                        "for as long as you keep walking.",
+                        plan.action, plan.reason, cycle.speed_mps)
                 self._turning = plan.is_turn
                 self._begin_motion(now)
                 # Hand the clip only the joints it declares. Webots' walk clips
@@ -1452,6 +2220,8 @@ class PoseImitationController:
                 self.driver.release_to_motion(self.motion.joints(plan.action))
                 self.leg_mode = f"motion:{plan.action}"
                 self._clip_status = "started"
+                self._preparing = None
+                self._prepare_since = None
                 return
             else:
                 # The clip was planned but Webots would not play it. Silence here
@@ -1497,15 +2267,114 @@ class PoseImitationController:
             self.leg_mode = "pose"
             self.driver.lower_body_tick(
                 now, torso_rp, fsr=fsr, tilt_rate=tilt_rate,
-                # No heading, no bias: see HEADING_FROM_IMU. A bias derived from
-                # the pitch channel yaws the legs for no reason, and because the
-                # HipYawPitch axis is canted it tips both soles while doing it.
-                yaw_bias=self.yaw_servo.error(yaw) if HEADING_FROM_IMU else 0.0,
+                # No heading, no bias: a bias derived from the pitch channel yaws
+                # the legs for no reason, and because the HipYawPitch axis is
+                # canted it tips both soles while doing it. See HEADING_SOURCE.
+                yaw_bias=self.yaw_servo.error(yaw) if self.heading_available else 0.0,
             )
             return
 
         self.leg_mode = "stand"
         self.driver.balance_tick(torso_rp, tilt_rate=tilt_rate, now_s=now)
+
+    def _wanted_action(self, gait: dict | None, yaw: float) -> str | None:
+        """What the locomotion layer would ask for right now, or None to stand.
+
+        The planner's own answer, so there is exactly one place that decides what
+        the robot should be doing -- whether or not a clip happens to be playing.
+        """
+        return plan_action(
+            yaw_error_rad=self.yaw_servo.error(yaw) if self.heading_available else 0.0,
+            gait=gait,
+            available=self.motion.available,
+            params=LOCOMOTION,
+            turning=self._turning,
+            yaw_trustworthy=self.heading_available and self.yaw_servo.stable(),
+        ).action
+
+    def _clip_unwanted(self, gait: dict | None, roll: float, pitch: float,
+                       yaw: float) -> bool:
+        """Is the clip that is PLAYING no longer the one the planner wants?
+
+        Asked every step while a clip plays, so a walk can end when the human
+        stops rather than when the keyframes run out.
+
+        The comparison has to be against the playing action, not against None.
+        Asking only "does the planner want ANY clip?" conflated two different
+        answers, and the difference is a robot that will not stop: plan_action
+        considers turns FIRST and returns a turn action whenever the heading error
+        clears the gate, so a pending turn kept reporting "yes, a clip is wanted"
+        while the FORWARD clip was the one actually playing. Walking forward does
+        not reduce a heading error, so the condition never cleared and the walk
+        ran on until something else ended it.
+
+        Measured in log 1788784412/1788784096 (the session the user reported):
+        after the cue went idle and the walk latch expired, the forward clip kept
+        cycling for a further 4.16 s -- four more strides, 0.37 m -- and replaying
+        the real plan_action over the logged yaw_error for that window returns
+        "turn_right" in 207 of its 422 frames. Trailing walk after the human
+        stopped, across the four runs in that session: 3.36, 7.68, 4.40, 3.08 s.
+
+        Returning True when a DIFFERENT clip is wanted is also what lets a turn
+        interrupt a walk at all: the walk is released here, and branch 2 then
+        plans and starts the turn on the next step.
+        """
+        if self.leg_control != "auto":
+            return False
+        return self._wanted_action(gait, yaw) != self.motion.action
+
+    def _ready_to_play(self, now: float, action: str) -> bool:
+        """Are the legs in the posture playback of ``action`` will start in?
+
+        Ramps them there if not (see CLIP_PREPARE_TIMEOUT_S). Returns True when
+        the clip may be played -- immediately, if the clip does not tell us what
+        it opens in, because refusing to walk at all is worse than a jerky start.
+
+        For a cyclic clip the target is the pose at ``enter_s`` rather than the
+        first keyframe: this ramp IS the clip's opening squat, done better, so
+        playback skips it. It is also a shallower crouch than the clip's own
+        opening (knee 1.036 against 1.222 rad), so the handover is gentler than
+        it was for one-shot playback, not harsher.
+        """
+        pose = self.motion.entry_pose(action)
+        if not pose:
+            return True
+        if self._preparing != action:
+            self._preparing = action
+            self._prepare_since = now
+            self.driver.release_leg_pose()
+            logger.info("Preparing to %s: ramping the legs into the stance the "
+                        "clip is entered in (knee %.2f rad, at %.2fs into the "
+                        "clip).", action, pose.get("LKneePitch", float("nan")),
+                        self.motion.entry_time_s(action))
+        if self.driver.approach_leg_pose(pose, now):
+            self._clip_status = "ready (in the clip's stance)"
+            return True
+        waited = now - (self._prepare_since or now)
+        if waited >= CLIP_PREPARE_TIMEOUT_S:
+            logger.warning(
+                "Could not reach %s's opening stance in %.1fs; a leg joint is "
+                "blocked or fighting another layer. Abandoning this clip.",
+                action, waited)
+            self._abandon_prepare()
+            self._end_motion(action, ok=False, reason="could not reach the stance")
+            return False
+        self._clip_status = f"preparing ({waited:.1f}s)"
+        return False
+
+    def _abandon_prepare(self) -> None:
+        """Stop ramping toward a clip stance (nothing is being played)."""
+        if self._preparing is None:
+            return
+        self._preparing = None
+        self._prepare_since = None
+        self.driver.release_leg_pose()
+        if self.driver.lower_body is not None:
+            # The legs are wherever the ramp left them; let the crouch come back
+            # down from there rather than snapping.
+            seed = getattr(self.driver.lower_body, "seed_crouch_from", None)
+            if callable(seed):
+                seed(self.driver.measured)
 
     def _settled(self, roll: float, pitch: float) -> bool:
         """Is the robot upright and calm enough to hand over to a clip?
@@ -1530,10 +2399,44 @@ class PoseImitationController:
         self._motion_started_at = now
         # Prefer the clip's own length (plus slack for Webots' interpolation);
         # fall back to the hard cap when the API will not tell us.
+        # The clip's OWN length decides the budget when it is knowable, with no
+        # ceiling: TurnLeft180 runs 9.0 s, and capping the budget at
+        # MOTION_WATCHDOG_S guaranteed it overran, was dropped as broken and
+        # counted a failure -- so the one clip that can turn the robot right
+        # round in a single action could never be used. The fixed cap is for
+        # clips whose duration Webots will not report.
         duration = self.motion.duration_s()
-        budget = min(duration * 1.5 + 1.0, MOTION_WATCHDOG_S) if duration else \
-            MOTION_WATCHDOG_S
+        budget = (duration * 1.5 + 1.0) if duration else MOTION_WATCHDOG_S
         self._motion_deadline = now + budget
+
+    def _clip_phase(self) -> float | None:
+        """How far into the current gait cycle playback is, in seconds."""
+        cycle = self.motion.cycle()
+        now = self.motion.time_s()
+        if cycle is None or now is None:
+            return None
+        return max(0.0, now - cycle.loop_start_s)
+
+    def _extend_motion_deadline(self, now: float) -> None:
+        """Credit a cycling clip with another period's worth of watchdog.
+
+        The watchdog exists to catch a clip that never reports itself over, which
+        would leave the whole lower body suspended forever. A cyclic clip is in
+        exactly that state BY DESIGN -- it is rewound before it can end -- so
+        without this it would be killed mid-walk after its own length. Each
+        completed stride is proof of life, and buys one more stride plus the
+        deceleration tail; if rewinding ever stops happening, the deadline
+        arrives as it always did.
+        """
+        if self._motion_deadline is None:
+            return
+        cycle = self.motion.cycle()
+        if cycle is None:
+            return
+        self._motion_deadline = max(
+            self._motion_deadline,
+            now + cycle.period_s * 1.5 + cycle.tail_s + 1.0,
+        )
 
     def _motion_overran(self, now: float) -> bool:
         return self._motion_deadline is not None and now > self._motion_deadline
@@ -1543,6 +2446,12 @@ class PoseImitationController:
         self.motion.abort()
         self._motion_started_at = None
         self._motion_deadline = None
+        # The cycle status belongs to a clip that is no longer playing. Leaving it
+        # set made cycle_state read "leaving" in 92% of the frames of log
+        # 1788784412 while a clip was playing in only 8% of them, which is a
+        # diagnostic that actively misleads -- and analyze_run.py's own
+        # check_gait_cycle reads this column.
+        self._cycle_state = ""
         self._reclaim()
         if ok:
             self._motion_failures = 0
@@ -1565,6 +2474,13 @@ class PoseImitationController:
         self.driver.reclaim_from_motion()
         if self.driver.lower_body is not None:
             self.driver.lower_body.reset()
+            # AFTER the reset, which clears the crouch limiter: the clip left the
+            # legs in its own ~0.51 rad squat and the standing depth is 0.10, so a
+            # cleared limiter would snap the whole 0.41 rad of knee travel on the
+            # first post-clip step. Seeding it makes that a ramp.
+            seed = getattr(self.driver.lower_body, "seed_crouch_from", None)
+            if callable(seed):
+                seed(self.driver.measured)
 
     # ---------------------------------------------------------------- logging
     def _diagnostics(self, ctl_roll: float, ctl_pitch: float, yaw: float) -> dict[str, object]:
@@ -1626,8 +2542,15 @@ class PoseImitationController:
             "head_height": self._head_height,
             "reloads": self._reloads,
             "clip_planned": self._clip_planned,
+            "sv_heading": self._heading(yaw),
             "clip_status": ("playing" if self.motion.active else self._clip_status),
             "clips_available": len(self.motion.available),
+            "clip_time": self.motion.time_s(),
+            "walk_latched": int(self._walk_latch_until is not None),
+            "early_exits": self._early_exits,
+            "clip_cycles": self._cycles_walked,
+            "clip_phase": self._clip_phase(),
+            "cycle_state": self._cycle_state,
             "yaw_stable": int(bool(self.yaw_servo.stable())),
             "yaw_error": self.yaw_servo.error(yaw),
             "yaw_latched": int(bool(self.yaw_servo.latched)),
@@ -1636,7 +2559,12 @@ class PoseImitationController:
             "gait_cadence": gait.get("cadence_hz"),
             "gait_conf": gait.get("conf"),
             "body_yaw": gait.get("body_yaw_rad"),
+            # Which cue declared the walk: "knee" (marching on the spot) or
+            # "stride" (actually walking). Without it, "the robot did not walk"
+            # cannot be told from "the human was not seen to walk".
+            "gait_cue_channel": gait.get("cue_channel"),
         }
+        out.update(self._ground_truth())
         balance = self.driver.balance
         if balance is not None:
             try:
@@ -1760,6 +2688,9 @@ class PoseImitationController:
             # The arms and head need telling too, or they hold the departed
             # human's last pose indefinitely (see upper_body_stand_down).
             self.driver.upper_body_stand_down()
+            # A human who has walked out of frame is not walking, whatever the
+            # last cue said. Without this the latch would keep the robot going.
+            self._drop_walk_latch()
 
         self.driver.read_feedback()
         raw_roll, raw_pitch, yaw = self._imu_rpy()
@@ -1771,9 +2702,10 @@ class PoseImitationController:
         self._update_tilt_risk(now, roll, pitch)
         if self.driver.balance is not None:
             self.driver.balance.note_tilt(now, roll, pitch)
-        if HEADING_FROM_IMU:
-            self._update_yaw_servo(now, yaw)
-        self._drive_legs(now, roll, pitch, yaw, fsr=fsr)
+        heading = self._heading(yaw)
+        if self.heading_available:
+            self._update_yaw_servo(now, heading)
+        self._drive_legs(now, roll, pitch, heading, fsr=fsr)
 
         if self.trajectory_log is not None:
             self.trajectory_log.record(

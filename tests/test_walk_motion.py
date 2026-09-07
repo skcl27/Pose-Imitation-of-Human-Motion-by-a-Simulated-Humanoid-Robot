@@ -14,15 +14,21 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
 
+from balance import clip_torso_speeds  # noqa: E402
+from conftest import cyclic_poses, write_clip, write_cyclic_clip  # noqa: E402
 from walk_motion import (  # noqa: E402
     STAND,
     LocomotionParams,
     YawServo,
     default_motion_search_dirs,
     find_motion_files,
+    gait_cycle,
     motion_joints,
     motion_nominal_yaw,
+    motion_pose_at,
+    motion_poses,
     plan_action,
+    select_walk_clip,
     wrap_pi,
 )
 
@@ -416,3 +422,310 @@ def test_motion_joints_returns_empty_for_anything_it_cannot_read(tmp_path) -> No
     bare = tmp_path / "bare.motion"
     bare.write_text("#WEBOTS_MOTION,V1.0\n", encoding="utf-8")
     assert motion_joints(str(bare)) == []
+
+
+# ---------------------------------------------------------------------------
+# Cyclic gait detection
+# ---------------------------------------------------------------------------
+def test_gait_cycle_finds_the_limit_cycle_in_a_walk_clip(tmp_path) -> None:
+    """The whole point: a one-shot animation contains a repeatable stride.
+
+    Cyberbotics' walk clips are authored as animations -- squat, accelerate,
+    stride, decelerate, stand -- and played that way the transient dominates:
+    it is 49% of the short clip's 2.60 s, and during the closing settle the torso
+    travels BACKWARD. But the middle is a true limit cycle, so it can be rewound
+    and the robot walks for as long as it is asked to, at the speed the stride is
+    worth rather than the speed the transient averages down to.
+    """
+    clip = write_cyclic_clip(tmp_path / "Walk.motion", period=26, cycles=3,
+                             lead=8, tail=10)
+    cycle = gait_cycle(clip)
+    assert cycle is not None
+    # The detector must find the period the fixture was built with, not a
+    # multiple of it: a tighter loop means finer control over when to leave.
+    assert cycle.period_s == pytest.approx(26 * 0.04)
+    assert cycle.loop_start_s == pytest.approx(8 * 0.04)
+    assert cycle.loop_end_s == pytest.approx((8 + 26) * 0.04)
+    # And it must be a cycle that goes somewhere.
+    assert cycle.advance_m > 0.02
+    assert cycle.speed_mps == pytest.approx(cycle.advance_m / cycle.period_s)
+
+
+def test_gait_cycle_demands_a_seam_that_commands_no_motion(tmp_path) -> None:
+    """A loop seam is a teleport executed in one 20 ms step with the velocity
+    caps lifted, so the only acceptable seam is one where no joint moves.
+
+    This is why the real short clip cannot be cycled: its best available seam is
+    0.107 rad, which would be a 5.35 rad/s jolt once per stride. A drift of a
+    thousandth of a radian per keyframe -- a gait that creeps rather than
+    repeating, which is what most authored clips are -- is enough to disqualify
+    one here, and that strictness is the safety property, not pedantry.
+
+    Note what is NOT required: that the whole clip be uniformly periodic. Only
+    the two ends of the loop window have to agree. Anything in between is simply
+    part of the stride and gets replayed with it.
+    """
+    poses = cyclic_poses(period=26, cycles=3, lead=8, tail=10)
+    assert gait_cycle(write_clip(tmp_path / "ok.motion", poses)) is not None
+
+    # A single nudged keyframe does NOT disqualify the clip, and should not: it
+    # is inside the window, so it repeats along with everything else and the seam
+    # is untouched.
+    poses[20][1]["LKneePitch"] += 0.001
+    nudged = gait_cycle(write_clip(tmp_path / "nudged.motion", poses))
+    assert nudged is not None
+    assert nudged.period_s == pytest.approx(26 * 0.04)
+
+    # A clip that creeps has no exact seam anywhere, and is refused.
+    drifting = cyclic_poses(period=26, cycles=3, lead=8, tail=10)
+    for index, (_t, angles) in enumerate(drifting):
+        angles["LKneePitch"] += 0.001 * index
+    assert gait_cycle(write_clip(tmp_path / "drift.motion", drifting)) is None
+
+
+def test_gait_cycle_refuses_a_cycle_that_does_not_translate(tmp_path) -> None:
+    """Periodicity alone is not a gait. Every clip has some -- a turn rotates
+    through repeated steps, a side-step shuffles -- and looping those would spin
+    or drift the robot forever with no way to reason about where it ends up.
+    Turning is closed-loop on the heading and needs discrete, countable clips.
+    """
+    marching = write_cyclic_clip(tmp_path / "March.motion", translate=False)
+    assert gait_cycle(marching) is None
+
+
+def test_gait_cycle_skips_only_the_part_of_the_clip_that_goes_nowhere(tmp_path) -> None:
+    """Playback starts at ``enter_s``, and the prepare-ramp does that prefix
+    instead -- rate-limited and under balance supervision, which is strictly
+    better than a clip commanding it with the caps lifted. So the prefix skipped
+    must be one that translates the robot by essentially nothing; skipping real
+    strides would enter a moving gait from a standstill, with no momentum where
+    the clip assumes some.
+    """
+    clip = write_cyclic_clip(tmp_path / "Walk.motion", lead=8)
+    cycle = gait_cycle(clip)
+    assert cycle is not None
+    assert 0.0 <= cycle.enter_s <= cycle.loop_start_s
+    speeds = clip_torso_speeds(motion_poses(clip))
+    skipped = sum(speeds[:int(round(cycle.enter_s / 0.04))]) * 0.04
+    assert abs(skipped) < 0.002
+
+
+def test_gait_cycle_leaves_through_the_clips_own_deceleration(tmp_path) -> None:
+    """How it stops is what makes it safe rather than clever.
+
+    Not by freezing mid-stride -- the legs stop and the body keeps its momentum,
+    which walks the robot over. By jumping once, at the phase of the cycle where
+    the jump costs nothing, into the clip's own closing deceleration, so
+    Cyberbotics' own balanced feet-together settle brings the robot to rest.
+    """
+    clip = write_cyclic_clip(tmp_path / "Walk.motion", period=26, cycles=3,
+                             lead=8, tail=10)
+    cycle = gait_cycle(clip)
+    assert cycle is not None
+    # The jump is taken from inside the FIRST period, so its phase comes round
+    # once per stride however long the robot has been walking.
+    assert cycle.loop_start_s <= cycle.exit_from_s < cycle.loop_end_s
+    # ...to a pose past the last full cycle, i.e. into the deceleration.
+    assert cycle.exit_to_s >= cycle.loop_end_s
+    assert cycle.tail_s > 0.0
+    # ...and it commands no meaningful motion: one control step at 20 ms.
+    assert cycle.exit_cost_rad / 0.02 < 1.0
+    # Worst case: wait for the phase, then ride the tail out.
+    assert cycle.stop_latency_s == pytest.approx(cycle.period_s + cycle.tail_s)
+
+
+def test_gait_cycle_returns_none_for_clips_it_cannot_loop(tmp_path) -> None:
+    """A clip that is not cyclic must be DETECTED as not cyclic, not looped on
+    faith -- the fallback (one-shot playback) is always correct, so there is
+    never a reason to guess."""
+    assert gait_cycle(None) is None
+    assert gait_cycle(str(tmp_path / "missing.motion")) is None
+    short = write_clip(tmp_path / "short.motion", cyclic_poses(period=26, cycles=1,
+                                                               lead=0, tail=0)[:6])
+    assert gait_cycle(short) is None
+
+
+def test_motion_pose_at_returns_the_keyframe_in_force_at_that_time(tmp_path) -> None:
+    """The ramp target for a clip entered part-way in. It has to be the keyframe
+    at or BEFORE the offset -- playback holds each keyframe until the next one,
+    so that is the pose playback will actually start from."""
+    poses = cyclic_poses(period=26, cycles=2, lead=4, tail=4)
+    clip = write_clip(tmp_path / "Walk.motion", poses)
+    assert motion_pose_at(clip, 0.0) == pytest.approx(poses[0][1])
+    # Between keyframes: the earlier one is still in force.
+    assert motion_pose_at(clip, 0.06) == pytest.approx(poses[1][1])
+    assert motion_pose_at(clip, 0.08) == pytest.approx(poses[2][1])
+    # Before the start and past the end, clamp rather than fail.
+    assert motion_pose_at(clip, -1.0) == pytest.approx(poses[0][1])
+    assert motion_pose_at(clip, 999.0) == pytest.approx(poses[-1][1])
+    assert motion_pose_at(None, 0.5) == {}
+
+
+# ---------------------------------------------------------------------------
+# Walk clip selection
+# ---------------------------------------------------------------------------
+def test_the_long_clip_is_chosen_only_when_it_can_actually_be_cycled(tmp_path) -> None:
+    """The trade is entirely conditional on cycling working.
+
+    Played one-shot the long clip is strictly WORSE: it commits the robot to
+    6.76 s and 0.46 m before it can be asked to stop. Cycled it is strictly
+    better: the same stride without the transient between repetitions, and a stop
+    latency shorter than the short clip's own length. So the choice is made by
+    asking whether a cycle is really there.
+    """
+    short = write_clip(tmp_path / "Forwards.motion",
+                       cyclic_poses(period=26, cycles=1, lead=8, tail=10,
+                                    translate=False))
+    cyclic = write_cyclic_clip(tmp_path / "Forwards50.motion")
+    files, note = select_walk_clip({"forward": short, "forward_continuous": cyclic})
+    assert files["forward"] == cyclic
+    assert "continuous gait" in note
+
+    # Same call, but the long clip marches in place instead of walking.
+    dud = write_cyclic_clip(tmp_path / "Dud.motion", translate=False)
+    files, note = select_walk_clip({"forward": short, "forward_continuous": dud})
+    assert files["forward"] == short
+    assert "no detectable gait cycle" in note
+
+
+def test_walk_clip_selection_never_leaks_its_own_bookkeeping_key(tmp_path) -> None:
+    """``forward_continuous`` exists only so both candidates get DISCOVERED. If
+    it reached plan_action it would be a second, unplannable forward action."""
+    cyclic = write_cyclic_clip(tmp_path / "Forwards50.motion")
+    for available in ({"forward_continuous": cyclic},
+                      {"forward": cyclic, "forward_continuous": cyclic},
+                      {}):
+        files, _note = select_walk_clip(available)
+        assert "forward_continuous" not in files
+
+
+def test_selection_falls_back_cleanly_with_no_continuous_clip(tmp_path) -> None:
+    short = write_clip(tmp_path / "Forwards.motion", cyclic_poses(translate=False))
+    files, note = select_walk_clip({"forward": short})
+    assert files == {"forward": short}
+    assert "no continuous walk clip" in note
+
+
+# ---------------------------------------------------------------------------
+# The turn gate
+# ---------------------------------------------------------------------------
+def test_a_turn_is_never_requested_that_no_clip_can_serve() -> None:
+    """The gate that admits a turn and the test that picks a clip have to agree.
+
+    They were allowed to disagree, and the gap between them was a trap:
+    ``turn_start_rad`` 0.35 admits the request at 20 deg, but with
+    ``overshoot_frac`` 0.65 the smallest clip on disk (40 deg = 0.698 rad) does
+    not fit until 0.454 rad = 26 deg. In that band the controller announced a
+    turn, spent 0.7 s ramping the legs down into the clip's opening crouch, then
+    found nothing fitted and stood back up again. 29 prepares in the recorded
+    session ramped and never played, 14 of them turn_right, with 13.8% of walking
+    frames sitting in the band. It reads exactly like "it tries to step and
+    falls".
+    """
+    available = {"turn_left": "/w/TurnLeft40.motion",
+                 "turn_right": "/w/TurnRight40.motion"}
+    params = LocomotionParams()
+    for millideg in range(0, 90_000, 500):
+        error = math.radians(millideg / 1000.0)
+        for sign in (+1.0, -1.0):
+            for turning in (False, True):
+                plan = plan_action(yaw_error_rad=sign * error, available=available,
+                                   params=params, turning=turning,
+                                   yaw_trustworthy=True)
+                if plan.action is None:
+                    continue
+                # Whatever was planned must be a clip that CONVERGES: firing a
+                # clip of nominal N at error e leaves |e - N|, which is only an
+                # improvement when e > N/2.
+                nominal = abs(motion_nominal_yaw(available[plan.action]))
+                assert error > nominal / 2.0, (
+                    f"{plan.action} planned at {math.degrees(error):.1f} deg "
+                    f"against a {math.degrees(nominal):.0f} deg clip: the turn "
+                    f"would oscillate instead of converging")
+
+
+def test_the_turn_gate_still_turns_once_a_clip_does_fit() -> None:
+    """Closing the deadband must not close the door on turning altogether."""
+    available = {"turn_left": "/w/TurnLeft40.motion",
+                 "turn_right": "/w/TurnRight40.motion"}
+    params = LocomotionParams()
+    fits_at = params.overshoot_frac * math.radians(40.0)
+    assert plan_action(yaw_error_rad=fits_at + 0.01, available=available,
+                       params=params).action == "turn_left"
+    assert plan_action(yaw_error_rad=-(fits_at + 0.01), available=available,
+                       params=params).action == "turn_right"
+    # And a coarse clip still wins when the error is big enough for it.
+    available["turn_left_coarse"] = "/w/TurnLeft180.motion"
+    assert plan_action(yaw_error_rad=math.radians(150.0), available=available,
+                       params=params).action == "turn_left_coarse"
+
+
+# ---------------------------------------------------------------------------
+# What a cyclic clip asks of the hardware
+# ---------------------------------------------------------------------------
+def test_a_loop_seam_commands_less_motion_than_a_normal_keyframe(tmp_path) -> None:
+    """The seam must be the QUIETEST moment in the stride, not just a quiet one.
+
+    Rewinding is a teleport, executed in a single control step with the velocity
+    caps already lifted, so if the seam commanded more motion than the clip's own
+    keyframes do the loop would inject a jolt once per stride -- and a jolt once
+    per stride is the "stepping, not walking" the whole change exists to remove.
+    """
+    poses = cyclic_poses(period=26, cycles=3, lead=8, tail=10)
+    clip = write_clip(tmp_path / "Walk.motion", poses)
+    cycle = gait_cycle(clip)
+    assert cycle is not None
+    lookup = {round(t, 3): angles for t, angles in poses}
+    start = lookup[round(cycle.loop_start_s, 3)]
+    end = lookup[round(cycle.loop_end_s, 3)]
+    seam = max(abs(end[j] - start[j]) for j in start)
+    # The largest step the clip itself takes between adjacent keyframes.
+    normal = max(max(abs(b[j] - a[j]) for j in a)
+                 for (_t1, a), (_t2, b) in zip(poses, poses[1:]))
+    assert seam < normal / 100.0, (
+        f"the seam moves {seam:.4f} rad against a normal keyframe step of "
+        f"{normal:.4f} rad")
+
+
+def test_the_cycled_window_stays_within_the_motors_declared_speed() -> None:
+    """The clip is Cyberbotics', not ours, so what it demands is worth checking.
+
+    Forwards50.motion asks for more than the declared 6.40 rad/s knee ceiling in
+    5 of its 2028 joint-intervals, all at stance exchange, peaking at 6.55 rad/s
+    (102.3%). Cycling does not inherit all of those: entering at 0.72 s and
+    looping [1.80, 2.84] s plays exactly ONE of them per stride, at 6.425 rad/s
+    = 100.4%, so the motor arrives 0.001 rad late once every 1.04 s. That is
+    bounded and invisible, and it is strictly less than one-shot playback of the
+    same clip would ask for -- but it is a real exceedance and it should be
+    recorded rather than discovered later.
+
+    Skipped where Webots is not installed; the shipped clips are the subject.
+    """
+    clips = os.path.join(
+        "/snap/webots/current/usr/share/webots/projects/robots/softbank/nao/motions")
+    path = os.path.join(clips, "Forwards50.motion")
+    if not os.path.isfile(path):
+        pytest.skip("Webots' NAO motion clips are not installed")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "main", "libraries"))
+    from pose_control_utils import get_default_motor_configs
+
+    caps = {name: cfg.max_velocity
+            for name, cfg in get_default_motor_configs().items()}
+    cycle = gait_cycle(path)
+    assert cycle is not None
+    window = [(t, a) for t, a in motion_poses(path)
+              if cycle.loop_start_s - 1e-9 <= t <= cycle.loop_end_s + 1e-9]
+    over = []
+    for (t1, a), (t2, b) in zip(window, window[1:]):
+        for joint, value in a.items():
+            cap = caps.get(joint)
+            if cap is None:
+                continue
+            speed = abs(b[joint] - value) / (t2 - t1)
+            if speed > cap:
+                over.append((speed, cap, joint, t2))
+    # Exactly one, and only just over: a lag of a milliradian per stride.
+    assert len(over) == 1, f"the loop window's demands changed: {over}"
+    speed, cap, _joint, _t = over[0]
+    assert speed / cap < 1.01
+    assert (speed - cap) * 0.04 < 0.002
