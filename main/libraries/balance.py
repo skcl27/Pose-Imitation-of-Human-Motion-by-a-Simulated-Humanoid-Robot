@@ -567,6 +567,29 @@ class BalanceController:
         "LHipPitch", "RHipPitch", "LHipRoll", "RHipRoll",
     )
 
+    def reset(self) -> None:
+        """Forget the correction and the tilt history.
+
+        Call this whenever the robot is no longer the robot this state describes --
+        after a fall recovery, or when a motion clip has moved the whole body. The
+        correction is an integrator: it holds the last pelvis shift so the next
+        cycle can search around it, which is right within an episode and wrong
+        across one.
+
+        Missing this was a fall in its own right. ``simulationReset`` drops the
+        robot upright, but the loop kept whatever correction it had ended the
+        previous episode with -- which, on a robot that had just fallen, was its
+        clamp. Recorded on 2026-09-04 (log 1788521290): the first control step of
+        a new episode commanded HipPitch -0.345 / AnklePitch +0.145, a pelvis
+        already shifted 0.25 rad with the centre of mass 40 mm off centre, before
+        the robot had taken a single step. Six of the ten episodes in that session
+        began that way and none of them lasted three seconds.
+        """
+        for key in self._state:
+            self._state[key] = 0.0
+        self._tilt_history.clear()
+        self._divergence = ""
+
     def _apply_corr(self, angles: dict[str, float], c: dict[str, float]) -> dict[str, float]:
         """A copy of ``angles`` with the correction applied, soles kept FLAT.
 

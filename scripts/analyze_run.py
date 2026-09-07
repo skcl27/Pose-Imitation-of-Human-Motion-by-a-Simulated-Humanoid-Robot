@@ -565,6 +565,161 @@ def check_tilt_sign_consistency(rows, out):
             ))
 
 
+def _corr_slope(a, b):
+    """(pearson r, slope of b on a) or (None, None) if there is not enough data."""
+    n = len(a)
+    if n < 50:
+        return None, None
+    ma, mb = sum(a) / n, sum(b) / n
+    saa = sum((x - ma) ** 2 for x in a)
+    sbb = sum((y - mb) ** 2 for y in b)
+    sab = sum((x - ma) * (y - mb) for x, y in zip(a, b, strict=False))
+    if saa <= 0 or sbb <= 0:
+        return None, None
+    return sab / math.sqrt(saa * sbb), sab / saa
+
+
+def check_attitude_source(rows, out):
+    """Is the tilt the controller acted on actually the robot's tilt?
+
+    Two defects this catches, both found the expensive way on 2026-09-03:
+
+    * The InertialUnit in Webots' Nao.proto is mounted rolled 90 deg AND has
+      ``yAxis FALSE``. Webots implements that mask by zeroing part of the
+      attitude's axis-angle axis, which on a rotated sensor corrupts the axes it
+      was not asked to touch: the reported pitch comes out HALF the real pitch,
+      and a body rotation reports as pitch too -- so "yaw" is a copy of the pitch
+      channel. A heading servo closing its loop on that steers on the pitch
+      signal. The test is simply whether imu_yaw and imu_pitch_raw are the same
+      number; on a healthy robot they are unrelated.
+    * Once the controller takes its attitude from gravity instead, the two
+      channels must agree in sign and the accelerometer must not have been
+      silently dropped mid-run.
+    """
+    # Measured on STANDING frames only. The identity is exact for a pure pitch and
+    # smears once the robot is also rolled, so a tumbling robot's frames only add
+    # noise -- and they are not the frames anyone controls from.
+    pitch_raw, yaw = [], []
+    for row in rows:
+        a, b = num(row, "imu_pitch_raw"), num(row, "imu_yaw")
+        head, left, right = (num(row, "head_height"), num(row, "fsr_l"),
+                             num(row, "fsr_r"))
+        if a is None or b is None or abs(a) > 0.4:
+            continue
+        if (head or 0.0) < 0.42 or (left or 0.0) + (right or 0.0) < 35.0:
+            continue
+        pitch_raw.append(a)
+        yaw.append(b)
+    r, slope = _corr_slope(pitch_raw, yaw)
+    if r is not None and r > 0.9 and 0.8 < slope < 1.3:
+        out.append(finding(
+                "CRITICAL", "the InertialUnit's yaw is a copy of its pitch",
+                f"over {len(yaw)} standing frames imu_yaw tracks imu_pitch_raw at "
+                f"r = {r:+.4f}, slope {slope:+.3f} -- they are the same signal "
+                f"(measured on all 41 recorded sessions: r >= 0.994 in every one). "
+                f"That is what "
+                f"``yAxis FALSE`` plus a 90 deg mount does to this device: the "
+                f"reported pitch is HALF the real pitch and the heading is not "
+                f"measured at all. Anything servoing on that yaw is steering on the "
+                f"pitch channel. The controller answers it by doubling the pitch "
+                f"(IMU_PITCH_SCALE) and leaving the heading loop off; gravity is "
+                f"logged alongside as a witness but is not a safe control source on "
+                f"its own (see TILT_FROM_ACCELEROMETER).",
+            ))
+
+    source = [r.get("tilt_source") for r in rows if r.get("tilt_source")]
+    if source:
+        accel = sum(1 for v in source if v == "accel")
+        share = pct(accel, len(source))
+        switched = any(a != b for a, b in zip(source, source[1:], strict=False))
+        if switched and 0.0 < share < 100.0:
+            out.append(finding(
+                "CRITICAL", "the attitude source changed mid-run",
+                f"{share:.1f}% of frames were controlled from gravity and the rest "
+                f"from the InertialUnit. The controller only switches one way -- the "
+                f"cross-check against the InertialUnit's ROLL disagreed for longer "
+                f"than ACC_DISAGREE_S and abandoned the gravity path. Read the "
+                f"controller log for the disagreement it printed, and treat every "
+                f"frame before the switch as controlled from a suspect attitude.",
+            ))
+        elif share > 99.0:
+            out.append(finding(
+                "WARNING", "the whole run was controlled from gravity",
+                "An accelerometer measures gravity plus the robot's own "
+                "acceleration, so inside a position loop it feeds a second "
+                "derivative back as a position. On 2026-09-04 that configuration "
+                "put the robot on the floor six times in ~2 s each while it was "
+                "merely standing; the same controller on the InertialUnit stood for "
+                "298 s. See TILT_FROM_ACCELEROMETER.",
+            ))
+        elif share < 1.0:
+            out.append(finding(
+                "INFO", "attitude source",
+                f"the InertialUnit throughout ({len(source)} frames), with its "
+                f"pitch doubled to undo the half-scale reading and gravity logged "
+                f"alongside for comparison. That is the intended configuration.",
+            ))
+    acc_p, imu_p = [], []
+    for row in rows:
+        a, b = num(row, "acc_pitch"), num(row, "imu_pitch")
+        if a is None or b is None:
+            continue
+        acc_p.append(a)
+        imu_p.append(b)
+    if acc_p:
+        r, slope = _corr_slope(imu_p, acc_p)
+        if r is not None and r > 0.5:
+            out.append(finding(
+                "INFO", "gravity vs the InertialUnit, on pitch",
+                f"acc_pitch regressed on imu_pitch: slope {slope:+.2f} "
+                f"(r {r:+.3f}). About +2 is the expected reading on this proto -- "
+                f"the InertialUnit halves the pitch -- and a slope near +1 would "
+                f"mean the axis mask has been fixed (or the world file changed). "
+                f"Judge it only on QUIET frames: while the robot is moving the "
+                f"accelerometer is measuring its acceleration as much as gravity, "
+                f"which is exactly why it is not the control source.",
+            ))
+
+
+def check_episode_starts(rows, out):
+    """Does each episode begin with the pelvis already shifted?
+
+    ``simulationReset`` rewinds sim_time and drops the robot upright, so each
+    rewind starts an episode. Every layer is supposed to be handed a clean slate
+    there. The balance feedback was not: it is an integrator, and the robot came
+    back standing while the loop still held the correction the OLD, fallen robot
+    had needed -- measured at HipPitch -0.345 on the first control step, a centre
+    of mass 40 mm off centre before anything had happened, in six episodes of one
+    session that each lasted under three seconds.
+    """
+    starts = [0]
+    for i in range(1, len(rows)):
+        a, b = num(rows[i - 1], "sim_time_s"), num(rows[i], "sim_time_s")
+        if a is not None and b is not None and b < a:
+            starts.append(i)
+    if len(starts) < 2:
+        return
+    bad = []
+    for i in starts:
+        # First few steps of the episode, before anything could have moved.
+        window = rows[i:i + 3]
+        shift_p, shift_r = _pelvis_shift(window)
+        worst = max([abs(v) for v in shift_p] + [abs(v) for v in shift_r] or [0.0])
+        if worst > 0.10:
+            bad.append((num(rows[i], "wall_time_s"), worst))
+    if bad:
+        out.append(finding(
+            "CRITICAL", "an episode began with the pelvis already shifted",
+            f"{len(bad)} of {len(starts)} episodes started with a pelvis shift over "
+            f"0.10 rad already commanded (worst {max(b for _, b in bad):.3f} rad, "
+            f"about {16 * max(b for _, b in bad) / 0.1:.0f} mm of centre-of-mass "
+            f"offset) in the first three control steps. Some layer is carrying "
+            f"state across the reset: the balance feedback loop is an integrator "
+            f"and must be reset with everything else "
+            f"(NaoPoseDriver.reset_balance).",
+        ))
+
+
 def check_lateral_rocking(rows, out):
     """Feet alternately unloading while 'standing' is a rocking mode the static CoM
     model cannot see; recorded right before the lateral falls."""
@@ -648,9 +803,10 @@ def main(argv=None) -> int:
     print("=" * 74)
 
     out: list[tuple[int, str, str, str]] = []
-    for check in (check_imu_zero, check_falls, check_tracking_live, check_legs_move, check_support,
+    for check in (check_imu_zero, check_attitude_source, check_falls, check_tracking_live,
+                  check_legs_move, check_support,
                   check_sole_contact, check_shifter_saturation, check_tilt_sign_consistency,
-                  check_lateral_rocking, check_leg_layer, check_tilt,
+                  check_lateral_rocking, check_episode_starts, check_leg_layer, check_tilt,
                   check_saturation, check_tracking, check_head, check_heading):
         try:
             check(rows, out)

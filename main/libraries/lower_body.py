@@ -123,6 +123,11 @@ MODE_DOUBLE = "double"
 MODE_LOAD = "load"
 MODE_SINGLE = "single"
 
+# NAO's HipYawPitch axis is canted 45 deg (Nao.urdf: (0, 0.707, -0.707) on the
+# left), so commanding it b radians yaws the leg by 0.707*b AND pitches it by
+# 0.707*b. The pitch has to be levelled at the ankle or the sole tips forward.
+HIP_YAW_PITCH_COMPONENT = 0.707107
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
@@ -204,6 +209,20 @@ class LowerBodyParams:
     # foot until the next human movement tipped it.
     com_shift_max_step: float = 0.02    # rad; largest change per tick, per axis
     com_shift_slew: float = 0.5         # blend toward the computed step
+    # How much each axis is PREFERRED when they buy comparable margin. The search
+    # picks the axis with the best margin-per-radian, and on a lean that is always
+    # the pelvis roll -- it moves the centre of mass directly. But the two are not
+    # equally cheap: a pelvis roll and a lean are the same degree of freedom, so
+    # every radian of it is subtracted from the lean being imitated AND spent out
+    # of the ankle's range for keeping the sole flat, while widening the stance is
+    # mirror-symmetric -- it enlarges the polygon, moves the CoM not at all, and
+    # costs the imitation nothing. Measured holding a 0.60 rad lean: roll -0.20
+    # buys +0.025 m and loses 0.20 of lean; width +0.20 buys +0.031 m and loses
+    # none. Without this weighting a one-sided 0.35 rad roll was answered with
+    # +0.238 rad of pelvis roll, which ran the ankle out of range and left the
+    # sole-tilt limiter to take 0.14 rad back off the hip -- the imitation paying
+    # twice for balance that stance width would have given away free.
+    com_shift_preference: tuple = (("width", 1.8), ("roll", 1.0), ("pitch", 1.0))
     com_margin_target: float = 0.020    # m
     # How long the compensation is allowed to keep trying before the pose itself is
     # scaled back. Without this the fallback fired on the very first tick -- the
@@ -448,7 +467,6 @@ class LowerBodyController:
         st.last_now = now_s
         self._dt = dt
         self._feedback = (float(feedback[0]), float(feedback[1]))
-        self._contact = contact_from_fsr(fsr)
 
         roll, pitch = torso_rp
         tilt_ok = abs(roll) < p.tilt_abort_rad and abs(pitch) < p.tilt_abort_rad
@@ -483,6 +501,18 @@ class LowerBodyController:
             MODE_SINGLE if st.lift > 0.05
             else (MODE_LOAD if st.shift > 0.05 else MODE_DOUBLE)
         )
+
+        # Which feet the force sensors say are carrying the robot. Used only in
+        # DOUBLE support, where "both feet should be loaded" is the intent and a
+        # sensor disagreeing with the commanded geometry means the robot is
+        # standing on one sole (or one edge) whatever the kinematics say.
+        #
+        # It must NOT be used during a weight transfer: there the load is still on
+        # the foot we are moving OFF, so masking the polygon to the loaded foot
+        # would have the compensation chase the CoM back where it came from and
+        # fight the transfer. That phase is judged by the stance foot alone
+        # (_lift_gate's stance_margin), which is the right test for it.
+        self._contact = contact_from_fsr(fsr) if mode == MODE_DOUBLE else None
 
         # Keep the lean sign fresh for whichever foot is currently the stance
         # foot (cheap: cached for ``probe_refresh_s``).
@@ -816,8 +846,24 @@ class LowerBodyController:
 
         if abs(yaw_bias) > 1e-4:
             bias = _clamp(yaw_bias, -p.max_yaw_bias, p.max_yaw_bias)
-            targets["LHipYawPitch"] = targets.get("LHipYawPitch", 0.0) + bias
-            targets["RHipYawPitch"] = targets.get("RHipYawPitch", 0.0) + bias
+            for side in ("L", "R"):
+                targets[f"{side}HipYawPitch"] = \
+                    targets.get(f"{side}HipYawPitch", 0.0) + bias
+                # ...and level the sole against it. The axis is canted 45 deg, so
+                # this yaw also pitches each leg by 0.707*bias, which tips both
+                # soles onto their toes: at the 0.112 rad bias recorded during a
+                # standing turn the front corners sat 10.5 mm below the back ones.
+                # Nothing noticed at the time, but the support polygon is measured
+                # from the corners in CONTACT, so it collapsed to the toe line and
+                # the model reported the CoM 63 mm OUTSIDE a balanced crouch. The
+                # feed-forward shift then answered that phantom by driving the
+                # pelvis to its 0.30 rad forward clamp in three tenths of a second,
+                # with the IMU still reading dead level -- the first fall of
+                # log 1788440221 (sim 0.8-1.4 s) starts exactly there.
+                targets[f"{side}AnklePitch"] = (
+                    targets.get(f"{side}AnklePitch", 0.0)
+                    - HIP_YAW_PITCH_COMPONENT * bias
+                )
         return targets
 
     # NAO's left/right sign conventions differ per axis: the ROLL channels are
@@ -1017,6 +1063,7 @@ class LowerBodyController:
             deficit = p.com_margin_target - base
             # Local sensitivity of the margin to each parameter, measured rather
             # than assumed: three probes, one per axis.
+            prefer = dict(p.com_shift_preference)
             gradients = []
             for name in limits:
                 probe = dict(current)
@@ -1035,7 +1082,9 @@ class LowerBodyController:
             # give-backs in one recorded session, a 0.15 rad hip-pitch sawtooth at
             # ~10 Hz while the margin was still negative.
             committed = False
-            for name, gradient in sorted(gradients, key=lambda g: -abs(g[1])):
+            for name, gradient in sorted(
+                gradients, key=lambda g: -abs(g[1]) * prefer.get(g[0], 1.0)
+            ):
                 if abs(gradient) <= 1e-6:
                     continue
                 step = _clamp(deficit / gradient, -step_cap, step_cap)

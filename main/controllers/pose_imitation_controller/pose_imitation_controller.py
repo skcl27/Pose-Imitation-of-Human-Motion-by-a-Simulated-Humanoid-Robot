@@ -188,6 +188,166 @@ IMU_CALIBRATION_MIN_SOLE_LOAD_N = 10.0
 # calibration in the logs read 0.049-0.205 m.
 IMU_CALIBRATION_MIN_HEAD_M = 0.40
 
+# --- Where the torso attitude comes from -----------------------------------
+# NOT from the InertialUnit's pitch. That device is unusable for pitch on this
+# robot, and the reason is in the proto:
+#
+#     DEF INERTIAL_UNIT InertialUnit { rotation 1 0 0 1.5708   yAxis FALSE }
+#
+# The mount (+90 deg about x) is only an offset, which IMU_AUTO_ZERO below
+# handles. ``yAxis FALSE`` is the problem. It is meant to disable the yaw output,
+# and Webots implements it by converting the sensor's attitude to axis-angle,
+# ZEROING the world-z component of the axis, and re-deriving roll/pitch/yaw from
+# the result (WbInertialUnit::computeValue). On a sensor mounted upright that is
+# harmless. On one rolled 90 deg it mangles the very axes it is not supposed to
+# touch. Composing R_world_sensor = R_torso * Rx(pi/2) and running Webots' own
+# ENU formula through that zeroing gives, for a pure torso pitch b:
+#
+#     reported pitch = b / 2        reported yaw = b / 2
+#
+# and for a pure torso YAW psi, with no tilt at all:
+#
+#     reported pitch = psi / 2      reported yaw = psi / 2
+#
+# So the pitch channel reads HALF the real pitch and cannot be told apart from a
+# body rotation, and the yaw channel is not a heading at all -- it is a copy of
+# the same half-pitch. Both predictions are confirmed on the recorded sessions:
+# over 702,719 standing frames imu_yaw and imu_pitch_raw correlate at +0.998 with
+# slope +1.03 (they are the same number), and a regression of imu_pitch against
+# the torso pitch implied by the loaded foot's own forward kinematics has slope
+# +0.48. The roll channel is unaffected (slope +0.98).
+#
+# The consequences ran through everything that reads a tilt: the balance loop saw
+# half the pitch it was correcting, the fall test built a world vertical from it,
+# the tilt gates fired at twice their nominal angle -- and the heading servo,
+# closing its loop on "yaw", was steering on the pitch signal, which is what put
+# a phantom hip-yaw bias into the legs (see HEADING_FROM_IMU).
+#
+# The ACCELEROMETER has no such problem: all three axes are enabled, its mount is
+# a plain 180 deg about x, and gravity is an absolute reference that needs no
+# learned zero and cannot be confused with a heading. Webots documents the
+# convention exactly ("an Accelerometer at rest with earth's gravity will
+# indicate 1 g along the vertical axis"; the source computes -gravity), so for an
+# upright torso the device reads (0, 0, -9.81) through its mount. Undoing the
+# mount gives the world-up direction in torso coordinates,
+#
+#     u = (a_x, -a_y, -a_z) = (-sin(pitch), sin(roll)*cos(pitch), cos(roll)*cos(pitch))
+#     pitch = atan2(-u_x, hypot(u_y, u_z))        roll = atan2(u_y, u_z)
+#
+# with the same sign conventions the balance model uses (see balance.py:
+# +pitch = forward, +roll = right).
+#
+# Low-passed, because an accelerometer measures the robot's own acceleration as
+# well as gravity. The time constant is deliberately short: 0.08 s is four
+# control steps, enough to reject the spikes a weight shift puts on the sensor,
+# and it has to stay well under the 0.17 s time constant of the pendulum it is
+# helping to control. What lag remains is paid back by the gyro lead the balance
+# loop already applies (BalanceParams.tilt_lead_s, 0.12 s) -- together they are a
+# poor man's complementary filter: gravity for the slow truth, the rate gyro for
+# the fast term.
+#
+# The InertialUnit's ROLL is kept as an independent witness: it is trustworthy on
+# that axis, so it is compared against the gravity-derived roll every step, and a
+# sustained disagreement disables the accelerometer path and says so rather than
+# quietly trusting a reading nobody has checked.
+#
+# AND IT IS OFF, because the live session of 2026-09-04 says so. The derivation
+# above is right -- with the robot quiet, the gravity-derived roll matched the
+# InertialUnit's to four decimals -- but an accelerometer does not measure
+# attitude, it measures gravity PLUS the robot's own acceleration, and this loop
+# is what turns that into a fall:
+#
+#     the loop shifts the pelvis -> the torso accelerates sideways -> the
+#     accelerometer reports that acceleration as tilt -> the loop shifts further
+#
+# An accelerometer inside a position loop is a second derivative fed back as a
+# position, which is 180 degrees of phase error, and 0.08 s of low-pass is
+# nowhere near enough to suppress it (ACC_SNAP_RAD makes it worse: a transient
+# large enough to matter goes straight through). Measured, in log
+# webots_joint_trajectory_1788521290 -- ten episodes, nobody in front of the
+# camera in any of them, so the legs were not imitating anything:
+#
+#     episodes 0-6   attitude from gravity   fell within ~2 s, six times over,
+#                                            median head height 0.19 m
+#     episodes 7-9   attitude from the IMU    stood 40 s and 298 s, head 0.46 m
+#
+# The cross-check below is what ended that: the roll disagreement latched and the
+# path disabled itself, which is the only reason the session produced 298 seconds
+# of standing rather than a tenth reload.
+#
+# What it needs before it can be switched on is the standard fix, not a longer
+# filter: integrate the GYRO for the fast attitude and use gravity only to
+# correct its slow drift (a complementary filter with a time constant of half a
+# second or more). The gyro on this proto has both tilt axes enabled, so the
+# parts are there. Until that exists and has been shown to hold a robot up, the
+# InertialUnit -- with its pitch scaled, below -- is the honest choice.
+TILT_FROM_ACCELEROMETER = False
+ACC_TILT_TAU_S = 0.08          # low-pass time constant on the gravity angles
+# ...but a change this big in one control step is not what the filter is for. The
+# magnitude gate below has already thrown out any sample that is not gravity, so a
+# surviving jump of a tenth of a radian in 20 ms is a real, fast tilt -- exactly
+# the event a balance controller must not be told about three steps late. Filter
+# the ripple, follow the lurch.
+ACC_SNAP_RAD = 0.10
+ACC_MAX_G_ERROR = 3.0          # m/s2 away from 9.81 before a sample is dropped
+ACC_DISAGREE_RAD = 0.15        # roll disagreement with the InertialUnit...
+ACC_DISAGREE_S = 2.0           # ...held this long -> fall back to the IMU
+
+# The pitch the InertialUnit reports is half the real pitch (see above), so it is
+# doubled before anything acts on it. That is a derivation, not a fit: the axis
+# masking splits a torso pitch b into pitch b/2 and yaw b/2, exactly, for any b up
+# to about 0.5 rad. Independently measured at 0.48 by regressing imu_pitch against
+# the torso pitch implied by the loaded foot's own forward kinematics over 598,173
+# quasi-static frames.
+#
+# Uncorrected, the balance loop sees half of every fore/aft error and pushes back
+# less hard than it should. So the honest value is 2.0 -- and it ships at 1.0
+# anyway, deliberately, because the one experiment available says the loop is
+# closer to its stability limit than to its authority limit.
+#
+# The experiment: on 2026-09-04 the attitude came from gravity, which reports the
+# full pitch (the two channels agree when the robot is quiet). That is the same
+# doubling this constant would apply, and the fore/aft loop LIMIT CYCLED -- pitch
+# swinging +/-0.25 rad within the first second of each episode, the correction
+# pinned at its clamp, the robot down inside three seconds, six episodes in a row
+# (log 1788521290, episodes 0-6). On the half-scale reading the same controller
+# stood still for 900 seconds. Some of that was the reset bug fixed above and
+# some was the accelerometer's own acceleration, but the direction of the
+# evidence is unambiguous: more pitch sensitivity, less stability.
+#
+# Under-correcting is sluggish and stable; over-correcting is a fall. So the loop
+# stays conservative until a session with a human actually in frame shows the
+# fore/aft response is too slow -- and then this is the knob, with
+# analyze_run.py's acc_pitch-on-imu_pitch slope as the measurement that says how
+# far it can go (about +2). Raise it once, to 2.0, and watch the pitch trace.
+#
+# The caveat that comes with raising it: the same masking leaks a body rotation
+# into this channel one-for-one, so a heading change psi reads as psi/2 of pitch
+# and would be doubled back to psi. With the heading loop off the robot no longer
+# yaws itself and the measured residual is small (imu_yaw within +/-0.03 rad p95
+# while standing, so ~9 mm of modelled CoM error against a 25 mm deadband).
+IMU_PITCH_SCALE = 1.0
+
+# --- Heading ---------------------------------------------------------------
+# There is no heading measurement on this robot. The InertialUnit's yaw axis is
+# disabled in the proto (and what it returns instead is the pitch channel, see
+# above), and the Gyro's z axis is disabled too, so the yaw RATE is not available
+# either. Nothing else observes the robot's rotation without a Supervisor.
+#
+# Closing the standing-turn loop on that number did real damage. The servo tracked
+# the pitch signal, so simply standing still produced a heading "error" -- measured
+# at a median 21 deg, agreeing with the human's yaw within 3 deg in 11% of frames --
+# and the resulting hip-yaw bias tipped both soles (the axis is canted 45 deg, so
+# it pitches the legs as well as yawing them). At the 0.112 rad bias recorded in
+# one session that dropped the front sole corners 10.5 mm, the support polygon
+# collapsed to the toe line, and the CoM compensation answered the phantom by
+# driving the pelvis to its forward clamp with the robot standing dead level.
+#
+# So the heading loop is off until there is something real to close it on (a
+# Supervisor read, or a proto with the yaw axes enabled). Turning is the one
+# feature this costs, and it did not work anyway.
+HEADING_FROM_IMU = False
+
 # --- Balance ---------------------------------------------------------------
 # Model-based CoM feedback recovers the depth/balance information a 2D camera
 # cannot give: forward kinematics + NAO link masses estimate the centre of mass
@@ -282,6 +442,15 @@ STATUS_EVERY = 100  # frames
 DIAGNOSTIC_COLUMNS = (
     "imu_roll", "imu_pitch", "imu_yaw",
     "imu_roll_raw", "imu_pitch_raw", "imu_zero_roll", "imu_zero_pitch",
+    # The gravity-derived attitude and which source the controller acted on. Both
+    # are logged so the InertialUnit's half-scale pitch stays visible instead of
+    # being silently replaced (see TILT_FROM_ACCELEROMETER).
+    "acc_roll", "acc_pitch", "tilt_source",
+    # ...and the tilt the controller ACTUALLY acted on this step, which is not the
+    # same as either channel: the InertialUnit's pitch is doubled on the way in
+    # (IMU_PITCH_SCALE), and the source can change mid-run. Logging only the
+    # sensor channels made a session ambiguous to read after the fact.
+    "ctl_roll", "ctl_pitch",
     "gyro_roll_rate", "gyro_pitch_rate",
     "tilt_risk", "predicted_tilt",
     "leg_mode", "stale",
@@ -537,6 +706,15 @@ class PoseImitationController:
         self._imu_cal_started: float | None = None
         if not IMU_AUTO_ZERO:
             self._imu_zero = (0.0, 0.0)
+        # Gravity-derived attitude (see TILT_FROM_ACCELEROMETER): the low-passed
+        # (roll, pitch), its learned zero, which source the last step used, and
+        # since when it has disagreed with the InertialUnit's roll.
+        self._acc_tilt: tuple | None = None
+        self._acc_zero: tuple | None = None
+        self._acc_usable = TILT_FROM_ACCELEROMETER
+        self._acc_disagree_since: float | None = None
+        self._acc_last_update: float | None = None
+        self._tilt_source = "imu"
         # Fall detection / recovery state.
         self._fall_since: float | None = None
         self._stuck_since: float | None = None
@@ -585,9 +763,16 @@ class PoseImitationController:
             logger.info("  locomotion clips  : %s",
                         ", ".join(clips) if clips
                         else "NONE FOUND  <-- will march in place, not walk")
+        logger.info("  torso attitude    : %s",
+                    "GRAVITY (accelerometer) + InertialUnit roll cross-check"
+                    if (TILT_FROM_ACCELEROMETER and self.accel is not None)
+                    else f"InertialUnit, pitch x{IMU_PITCH_SCALE:.0f} (it reports "
+                         f"half-scale on this proto); gravity logged but not acted "
+                         f"on -- see TILT_FROM_ACCELEROMETER")
         logger.info("  heading feedback  : %s",
-                    "ON (InertialUnit)" if self.imu is not None
-                    else "OFF  <-- turning disabled")
+                    "ON (InertialUnit)" if HEADING_FROM_IMU
+                    else "OFF  <-- this proto disables the IMU and gyro yaw axes, "
+                         "so there is no heading to servo on; turning is disabled")
         logger.info("  foot force sensors: %d",
                     len(self.fsr["L"]) + len(self.fsr["R"]))
         for reason in d.degraded:
@@ -669,7 +854,10 @@ class PoseImitationController:
             return
         if self._imu_cal_started is None:
             self._imu_cal_started = now
-        self._imu_cal.append((raw_roll, raw_pitch))
+        acc = self._acc_tilt_raw()
+        self._imu_cal.append((raw_roll, raw_pitch,
+                              None if acc is None else acc[0],
+                              None if acc is None else acc[1]))
         if (now - self._imu_cal_started) < IMU_CALIBRATION_S:
             return
         if len(self._imu_cal) < IMU_CALIBRATION_MIN_SAMPLES:
@@ -679,6 +867,32 @@ class PoseImitationController:
         mid = len(rolls) // 2
         samples = len(self._imu_cal)
         self._imu_zero = (rolls[mid], pitches[mid])
+        # The gravity-derived attitude gets its own zero from the same standing
+        # samples. Physically it should be about (0, 0) -- gravity needs no
+        # calibration -- but taking it the same way absorbs a torso that does not
+        # stand exactly axis-aligned, and keeps the two channels comparable so the
+        # cross-check in _torso_tilt is meaningful.
+        acc_rolls = sorted(v[2] for v in self._imu_cal if v[2] is not None)
+        acc_pitches = sorted(v[3] for v in self._imu_cal if v[3] is not None)
+        if len(acc_rolls) >= IMU_CALIBRATION_MIN_SAMPLES // 2:
+            self._acc_zero = (acc_rolls[len(acc_rolls) // 2],
+                              acc_pitches[len(acc_pitches) // 2])
+            logger.info(
+                "Gravity zero learned from %d standing samples: roll %+.3f, "
+                "pitch %+.3f rad. %s",
+                len(acc_rolls), self._acc_zero[0], self._acc_zero[1],
+                "This is the control path; the InertialUnit's roll cross-checks it."
+                if TILT_FROM_ACCELEROMETER else
+                "Logged for comparison only -- the control path is the "
+                "InertialUnit with its pitch doubled (see "
+                "TILT_FROM_ACCELEROMETER for why gravity is not acted on).",
+            )
+        elif TILT_FROM_ACCELEROMETER:
+            logger.error(
+                "No usable accelerometer: tilt falls back to the InertialUnit, "
+                "whose PITCH reads half the real pitch on this proto (see "
+                "TILT_FROM_ACCELEROMETER). Fore/aft balance will be sluggish."
+            )
         self._imu_cal.clear()
         magnitude = max(abs(self._imu_zero[0]), abs(self._imu_zero[1]))
         emit = logger.warning if magnitude > 0.05 else logger.info
@@ -862,6 +1076,12 @@ class PoseImitationController:
         self.driver.lower_body_stand_down()
         if self.driver.lower_body is not None:
             self.driver.lower_body.reset()
+        # ...and the balance FEEDBACK loop, which is an integrator and was the one
+        # piece of state that survived a reset. The robot came back upright with
+        # the pelvis still shifted to the clamp the old, fallen robot had needed:
+        # measured on the first control step of a new episode, HipPitch -0.345 and
+        # the centre of mass 40 mm off centre before anything had happened.
+        self.driver.reset_balance()
         self.yaw_servo.reset()
         self._turning = False
         self._tilt_risk = 0.0
@@ -877,10 +1097,101 @@ class PoseImitationController:
         self._imu_cal_started = None
 
     def _corrected_tilt(self, raw_roll: float, raw_pitch: float) -> tuple:
-        """(roll, pitch) relative to the learned upright; (0, 0) until calibrated."""
+        """(roll, pitch) from the INERTIAL UNIT, relative to the learned upright.
+
+        (0, 0) until calibrated. Note the pitch here is half the real pitch on
+        this proto -- see TILT_FROM_ACCELEROMETER -- so the control path uses
+        :meth:`_torso_tilt`, and this stays the raw-sensor accessor.
+        """
         if self._imu_zero is None:
             return (0.0, 0.0)
         return (raw_roll - self._imu_zero[0], raw_pitch - self._imu_zero[1])
+
+    def _acc_tilt_raw(self) -> tuple | None:
+        """(roll, pitch) of the torso from gravity, or None if unusable.
+
+        Rejects samples while the robot is accelerating hard enough that the
+        measured vector is not gravity: the magnitude then departs from 9.81 and
+        the direction is not an attitude. See TILT_FROM_ACCELEROMETER for the
+        mounting and the formulae.
+        """
+        if self.accel is None:
+            return None
+        try:
+            values = self.accel.getValues()
+        except Exception:  # noqa: BLE001
+            return None
+        if values is None or len(values) < 3:
+            return None
+        try:
+            ax, ay, az = (float(v) for v in values[:3])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (ax, ay, az)):
+            return None
+        if abs(math.sqrt(ax * ax + ay * ay + az * az) - 9.81) > ACC_MAX_G_ERROR:
+            return None
+        # Undo the 180 deg mount: world-up in torso coordinates.
+        ux, uy, uz = ax, -ay, -az
+        if math.hypot(uy, uz) < 1e-6 and abs(ux) < 1e-6:
+            return None
+        pitch = math.atan2(-ux, math.hypot(uy, uz))
+        roll = math.atan2(uy, uz)
+        return (roll, pitch)
+
+    def _torso_tilt(self, now: float, imu_roll: float, imu_pitch: float,
+                    fsr: dict[str, float] | None) -> tuple:
+        """The (roll, pitch) the controller acts on, and the source it came from.
+
+        Gravity where it is available and agrees with the InertialUnit's roll (the
+        one axis that device reports honestly); the InertialUnit otherwise. The
+        agreement test is only meaningful on a robot standing on its feet, so it
+        is only evaluated there.
+        """
+        self._tilt_source = "imu"
+        imu_pitch *= IMU_PITCH_SCALE          # see IMU_PITCH_SCALE
+        raw = self._acc_tilt_raw()
+        if raw is None:
+            return (imu_roll, imu_pitch)
+
+        dt = 0.0 if self._acc_last_update is None else max(0.0, now - self._acc_last_update)
+        self._acc_last_update = now
+        if self._acc_tilt is None or dt <= 0.0 or \
+                max(abs(n - p) for n, p in zip(raw, self._acc_tilt, strict=False)) > ACC_SNAP_RAD:
+            self._acc_tilt = raw          # first sample, or a real lurch (ACC_SNAP_RAD)
+        else:
+            a = 1.0 - math.exp(-dt / ACC_TILT_TAU_S)
+            self._acc_tilt = tuple(
+                prev + a * (new - prev) for prev, new in zip(self._acc_tilt, raw, strict=False)
+            )
+        if not TILT_FROM_ACCELEROMETER or not self._acc_usable or self._acc_zero is None:
+            return (imu_roll, imu_pitch)
+
+        roll = self._acc_tilt[0] - self._acc_zero[0]
+        pitch = self._acc_tilt[1] - self._acc_zero[1]
+
+        # Cross-check against the InertialUnit's roll while the robot is standing.
+        loaded = bool(fsr) and (float(fsr.get("L", 0.0)) + float(fsr.get("R", 0.0))) > 20.0
+        if loaded and abs(roll - imu_roll) > ACC_DISAGREE_RAD:
+            if self._acc_disagree_since is None:
+                self._acc_disagree_since = now
+            elif (now - self._acc_disagree_since) >= ACC_DISAGREE_S:
+                self._acc_usable = False
+                logger.error(
+                    "The accelerometer and the InertialUnit disagree about ROLL by "
+                    "%.3f rad for %.1fs while the robot stands on its feet. The "
+                    "InertialUnit is trustworthy on roll, so the gravity-derived "
+                    "attitude is wrong (a mounting or sign assumption -- see "
+                    "TILT_FROM_ACCELEROMETER) and is now disabled. Tilt falls back "
+                    "to the InertialUnit, whose PITCH reads half-scale on this "
+                    "proto, so expect sluggish fore/aft balance until this is "
+                    "fixed.", roll - imu_roll, now - self._acc_disagree_since,
+                )
+                return (imu_roll, imu_pitch)
+        else:
+            self._acc_disagree_since = None
+        self._tilt_source = "accel"
+        return (roll, pitch)
 
     def _init_walk_sensors(self) -> None:
         """Enable the gyro/accelerometer and any foot force sensors.
@@ -889,6 +1200,7 @@ class PoseImitationController:
         the stepping gate falls back to the CoM model alone when they are absent.
         """
         self.gyro = None
+        self.accel = None
         self.fsr: dict[str, list[object]] = {"L": [], "R": []}
         for name in (GYRO_NAME, ACCELEROMETER_NAME):
             dev = self.robot.getDevice(name)
@@ -900,6 +1212,8 @@ class PoseImitationController:
                 continue
             if name == GYRO_NAME:
                 self.gyro = dev
+            else:
+                self.accel = dev
         for side, names in FSR_DEVICES.items():
             for name in names:
                 dev = self.robot.getDevice(name)
@@ -996,6 +1310,9 @@ class PoseImitationController:
 
     # ---------------------------------------------------------------- arbiter
     def _update_yaw_servo(self, now: float, robot_yaw: float) -> None:
+        """Feed the heading servo. Only called when HEADING_FROM_IMU -- on this
+        proto the InertialUnit's yaw axis is disabled and what it returns is the
+        pitch channel, so there is no heading to close a loop on."""
         gait = self.gait_cmd or {}
         yaw = gait.get("body_yaw_rad")
         if yaw is None:
@@ -1104,13 +1421,16 @@ class PoseImitationController:
         #     marched at it and reported legs=pose with no error anywhere.
         clip_declined = False
         if self.leg_control == "auto" and not falling:
+            # Without a heading the turn half of the planner is starved on purpose
+            # (error 0, never trustworthy) while forward walking is untouched --
+            # walking needs no heading. See HEADING_FROM_IMU.
             plan = plan_action(
-                yaw_error_rad=self.yaw_servo.error(yaw),
+                yaw_error_rad=self.yaw_servo.error(yaw) if HEADING_FROM_IMU else 0.0,
                 gait=self.gait_cmd,
                 available=self.motion.available,
                 params=LOCOMOTION,
                 turning=self._turning,
-                yaw_trustworthy=self.yaw_servo.stable(),
+                yaw_trustworthy=HEADING_FROM_IMU and self.yaw_servo.stable(),
             )
             self._clip_planned = plan.action or ""
             if plan.action is None:
@@ -1176,8 +1496,11 @@ class PoseImitationController:
             # hip yaw while the (coarse) stepping turn has not fired yet.
             self.leg_mode = "pose"
             self.driver.lower_body_tick(
-                now, torso_rp, fsr=fsr, yaw_bias=self.yaw_servo.error(yaw),
-                tilt_rate=tilt_rate,
+                now, torso_rp, fsr=fsr, tilt_rate=tilt_rate,
+                # No heading, no bias: see HEADING_FROM_IMU. A bias derived from
+                # the pitch channel yaws the legs for no reason, and because the
+                # HipYawPitch axis is canted it tips both soles while doing it.
+                yaw_bias=self.yaw_servo.error(yaw) if HEADING_FROM_IMU else 0.0,
             )
             return
 
@@ -1244,7 +1567,7 @@ class PoseImitationController:
             self.driver.lower_body.reset()
 
     # ---------------------------------------------------------------- logging
-    def _diagnostics(self, roll: float, pitch: float, yaw: float) -> dict[str, object]:
+    def _diagnostics(self, ctl_roll: float, ctl_pitch: float, yaw: float) -> dict[str, object]:
         """One row of controller state for the trajectory log.
 
         Cheap by design -- everything here is already computed for this step,
@@ -1258,14 +1581,21 @@ class PoseImitationController:
         fsr = self._read_fsr() or {}
         raw_roll, raw_pitch, _ = self._imu_rpy()
         zero = self._imu_zero
+        # imu_* is the INERTIAL UNIT's own zeroed reading; ctl_* is what the
+        # controller acted on (see the DIAGNOSTIC_COLUMNS note).
+        roll, pitch = self._corrected_tilt(raw_roll, raw_pitch)
         out: dict[str, object] = {
             "imu_roll": roll, "imu_pitch": pitch, "imu_yaw": yaw,
+            "ctl_roll": ctl_roll, "ctl_pitch": ctl_pitch,
             "imu_roll_raw": raw_roll, "imu_pitch_raw": raw_pitch,
             "imu_zero_roll": None if zero is None else zero[0],
             "imu_zero_pitch": None if zero is None else zero[1],
+            "acc_roll": None if self._acc_tilt is None else self._acc_tilt[0],
+            "acc_pitch": None if self._acc_tilt is None else self._acc_tilt[1],
+            "tilt_source": self._tilt_source,
             "gyro_roll_rate": d_roll, "gyro_pitch_rate": d_pitch,
             "tilt_risk": self._tilt_risk,
-            "predicted_tilt": self._predicted_tilt_rad(roll, pitch),
+            "predicted_tilt": self._predicted_tilt_rad(ctl_roll, ctl_pitch),
             "leg_mode": self.leg_mode,
             "stale": int(bool(self.driver.stats.stale)),
             "lb_mode": m.get("mode"),
@@ -1435,13 +1765,14 @@ class PoseImitationController:
         raw_roll, raw_pitch, yaw = self._imu_rpy()
         fsr = self._read_fsr()
         self._calibrate_imu(now, raw_roll, raw_pitch, fsr)
-        roll, pitch = self._corrected_tilt(raw_roll, raw_pitch)
+        roll, pitch = self._torso_tilt(now, *self._corrected_tilt(raw_roll, raw_pitch), fsr)
         if self._fallen(now, roll, pitch, fsr) and self._recover_from_fall(now):
             return
         self._update_tilt_risk(now, roll, pitch)
         if self.driver.balance is not None:
             self.driver.balance.note_tilt(now, roll, pitch)
-        self._update_yaw_servo(now, yaw)
+        if HEADING_FROM_IMU:
+            self._update_yaw_servo(now, yaw)
         self._drive_legs(now, roll, pitch, yaw, fsr=fsr)
 
         if self.trajectory_log is not None:

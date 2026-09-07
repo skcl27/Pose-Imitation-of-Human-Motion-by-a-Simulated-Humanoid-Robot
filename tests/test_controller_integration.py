@@ -87,6 +87,40 @@ class FakeVector3:
         return list(self.values)
 
 
+class FakeAccelerometer:
+    """Gravity as this NAO's accelerometer would report it.
+
+    Derived from the robot's InertialUnit reading rather than held constant, so
+    the two attitude sources AGREE in the fake world and the controller's real
+    path (gravity for control, the InertialUnit's roll as a cross-check -- see
+    TILT_FROM_ACCELEROMETER) is the one under test. A constant (0, 0, -9.81) made
+    every injected tilt invisible to the accelerometer, which is a fake that
+    passes whatever the controller does.
+
+    Idealised on purpose: the real device's half-scale pitch and yaw leak are a
+    property of the InertialUnit's axis masking, and those are pinned by
+    test_the_inertial_unit_halves_the_pitch_and_leaks_the_heading rather than
+    modelled here -- this fake is for the plumbing.
+    """
+
+    G = 9.81
+
+    def __init__(self, robot):
+        self.robot = robot
+
+    def enable(self, _ms):
+        pass
+
+    def getValues(self):  # noqa: N802
+        roll, pitch = self.robot.imu.rpy[0], self.robot.imu.rpy[1]
+        # World up in torso coordinates...
+        ux = -math.sin(pitch) * self.G
+        uy = math.sin(roll) * math.cos(pitch) * self.G
+        uz = math.cos(roll) * math.cos(pitch) * self.G
+        # ...through the proto's 180 deg mount about x.
+        return [ux, -uy, -uz]
+
+
 class FakeMotion:
     """Stand-in for Webots' Motion: finishes after ``STEPS`` polls.
 
@@ -183,7 +217,7 @@ class FakeRobot:
         self.imu = FakeInertialUnit()
         self.devices["inertial unit"] = self.imu
         self.devices["gyro"] = FakeVector3()
-        self.devices["accelerometer"] = FakeVector3((0.0, 0.0, -9.81))
+        self.devices["accelerometer"] = FakeAccelerometer(self)
         if with_fsr:
             self.devices["LFsr"] = FakeFsr(self, "L")
             self.devices["RFsr"] = FakeFsr(self, "R")
@@ -249,6 +283,12 @@ def controller_module(monkeypatch, tmp_path):
     # locomotion layer, so they opt in; the default itself is asserted by
     # test_the_shipped_default_is_imitation_not_locomotion.
     monkeypatch.setattr(mod, "LEG_CONTROL", "auto")
+    # Likewise the heading: it ships OFF because this proto disables both yaw axes
+    # (see HEADING_FROM_IMU), so turning cannot be closed-loop on the real robot.
+    # The turn tests below are about the servo and the clip planner, which are
+    # correct code that a better sensor would re-enable, so they opt in. The
+    # shipped default is asserted by test_the_shipped_default_has_no_heading_loop.
+    monkeypatch.setattr(mod, "HEADING_FROM_IMU", True)
     monkeypatch.setattr(mod, "MOTION_SEARCH_DIRS_EXTRA", [str(clips)])
     # Clip discovery has to be HERMETIC. Setting MOTION_SEARCH_DIRS_EXTRA alone is
     # not enough: default_motion_search_dirs() also appends $WEBOTS_HOME and eight
@@ -1504,3 +1544,284 @@ def test_the_log_attributes_the_pelvis_shift(harness, tmp_path) -> None:
     diag = c._diagnostics(*c._corrected_tilt(*c._imu_rpy()[:2]), 0.0)
     assert diag["lb_fb_pitch"] is not None
     assert 0.0 <= diag["cop_share_l"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# The sensors, from the proto
+# ---------------------------------------------------------------------------
+def _mangled_imu(yaw: float, pitch: float, roll: float) -> tuple:
+    """What this NAO's InertialUnit reports for a torso at (yaw, pitch, roll).
+
+    Reimplements the two things the proto does to it: the +90 deg mount
+    (``rotation 1 0 0 1.5708``) and ``yAxis FALSE``, which Webots implements by
+    zeroing the world-z component of the attitude's axis-angle axis before
+    deriving roll/pitch/yaw (WbInertialUnit::computeValue), then Webots' own ENU
+    decomposition (src/controller/c/inertial_unit.c).
+    """
+    import numpy as np
+
+    def rot(axis, a):
+        x, y, z = axis
+        c, s, C = math.cos(a), math.sin(a), 1.0 - math.cos(a)
+        return np.array([[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+                         [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+                         [z * x * C - y * s, z * y * C + x * s, c + z * z * C]])
+
+    R = rot((0, 0, 1), yaw) @ rot((0, 1, 0), pitch) @ rot((1, 0, 0), roll) \
+        @ rot((1, 0, 0), math.pi / 2)
+    # axis-angle, world-z component zeroed, renormalised (yAxis FALSE)
+    angle = math.acos(max(-1.0, min(1.0, (np.trace(R) - 1.0) / 2.0)))
+    if angle > 1e-12:
+        ax = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+        ax = ax / (2.0 * math.sin(angle))
+        ax[2] = 0.0
+        if np.linalg.norm(ax) > 1e-12:
+            R = rot(ax / np.linalg.norm(ax), angle)
+    # matrix -> quaternion (x, y, z, w) -> Webots ENU roll/pitch/yaw
+    t = np.trace(R)
+    if t > 0:
+        sq = math.sqrt(t + 1.0) * 2.0
+        q = ((R[2, 1] - R[1, 2]) / sq, (R[0, 2] - R[2, 0]) / sq,
+             (R[1, 0] - R[0, 1]) / sq, 0.25 * sq)
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        sq = math.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2.0
+        qq = [0.0, 0.0, 0.0, 0.0]
+        qq[i] = 0.25 * sq
+        qq[j] = (R[j, i] + R[i, j]) / sq
+        qq[k] = (R[k, i] + R[i, k]) / sq
+        qq[3] = (R[k, j] - R[j, k]) / sq
+        q = tuple(qq)
+    out_roll = math.atan2(2.0 * (q[3] * q[0] + q[1] * q[2]),
+                          1.0 - 2.0 * (q[0] ** 2 + q[1] ** 2))
+    t2 = max(-1.0, min(1.0, 2.0 * (q[3] * q[1] - q[2] * q[0])))
+    out_yaw = math.atan2(2.0 * (q[3] * q[2] + q[0] * q[1]),
+                         1.0 - 2.0 * (q[1] ** 2 + q[2] ** 2))
+    return (out_roll - math.pi / 2, math.asin(t2), out_yaw)
+
+
+def test_the_inertial_unit_halves_the_pitch_and_leaks_the_heading() -> None:
+    """Why the controller takes its attitude from gravity instead.
+
+    This robot's InertialUnit is mounted rolled 90 deg AND has ``yAxis FALSE``.
+    Webots implements the axis mask by zeroing part of the attitude's axis before
+    deriving the angles, which on a rotated sensor corrupts the axes it was not
+    asked to touch: the reported pitch is half the real pitch, and a pure body
+    ROTATION reports as pitch as well -- so pitch and heading are the same number
+    and neither can be trusted.
+
+    Confirmed on 702,719 recorded standing frames: imu_yaw and imu_pitch_raw
+    correlate at +0.998 with slope +1.03, and imu_pitch against the torso pitch
+    implied by the loaded foot's kinematics has slope +0.48.
+    """
+    assert _mangled_imu(0.0, 0.0, 0.0) == pytest.approx((0.0, 0.0, 0.0), abs=1e-9)
+    for b in (0.1, 0.2, 0.4):
+        roll, pitch, yaw = _mangled_imu(0.0, b, 0.0)          # pure torso pitch
+        assert pitch == pytest.approx(b / 2.0, abs=0.01), b    # HALF
+        assert yaw == pytest.approx(b / 2.0, abs=0.01), b      # and leaked to yaw
+        assert abs(roll) < 0.05
+
+        _, pitch_y, yaw_y = _mangled_imu(b, 0.0, 0.0)          # pure torso YAW
+        assert pitch_y == pytest.approx(b / 2.0, abs=0.01), b  # reads as pitch!
+
+        roll_r, pitch_r, _ = _mangled_imu(0.0, 0.0, b)         # pure torso roll
+        assert roll_r == pytest.approx(b, abs=1e-6), b         # roll is honest
+        assert abs(pitch_r) < 1e-6
+
+    # A forward pitch and an equal body rotation are indistinguishable: both
+    # channels read zero for a robot that is genuinely tipped forward 0.1 rad.
+    roll, pitch, yaw = _mangled_imu(0.1, -0.1, 0.0)
+    assert abs(pitch) < 0.01 and abs(yaw) < 0.01
+
+
+def _enabled_gravity_harness(mod, monkeypatch):
+    """A controller with the gravity attitude path switched on (it ships off)."""
+    monkeypatch.setattr(mod, "TILT_FROM_ACCELEROMETER", True)
+    monkeypatch.setattr(mod, "LEG_CONTROL", "pose")
+    monkeypatch.setattr(mod, "UDP_PORT", _free_port())
+    return Harness(mod)
+
+
+def test_gravity_is_measured_and_logged_but_not_acted_on(harness) -> None:
+    """The shipped configuration computes the gravity attitude, logs it, and does
+    NOT control from it -- see test_the_shipped_default_does_not_control_from_gravity
+    for why. It still has to be measured, because it is the only honest witness to
+    the InertialUnit's half-scale pitch."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    assert c.accel is not None
+    assert c._acc_zero is not None, "no gravity zero was learned"
+    assert c._acc_tilt is not None, "gravity was never computed"
+    assert c._tilt_source == "imu", c._tilt_source
+    diag = c._diagnostics(0.0, 0.0, 0.0)
+    assert diag["acc_roll"] is not None and diag["acc_pitch"] is not None
+
+
+def test_gravity_agrees_with_the_inertial_unit_on_roll(controller_module,
+                                                       monkeypatch) -> None:
+    """Roll is the axis the InertialUnit reports honestly, so it is the one that
+    can validate the gravity derivation -- and it does, to a couple of
+    milliradians. Confirmed on the live session of 2026-09-04: with the robot
+    quiet the two channels matched to four decimals."""
+    other = _enabled_gravity_harness(controller_module, monkeypatch)
+    try:
+        c = other.ctl
+        other.spin(120, STANDING, IDLE_GAIT)
+        assert c._tilt_source == "accel", c._tilt_source
+        c.imu.rpy = [c._imu_zero[0] + 0.20, c._imu_zero[1], 0.0]
+        other.spin(40, STANDING, IDLE_GAIT)              # 0.8s >> ACC_TILT_TAU_S
+        roll_acc = c._acc_tilt[0] - c._acc_zero[0]
+        assert roll_acc == pytest.approx(0.20, abs=0.02), roll_acc
+        assert c._acc_usable is True                     # no disagreement latched
+    finally:
+        other.close()
+
+
+def test_a_disagreeing_accelerometer_is_dropped_not_trusted(controller_module,
+                                                            monkeypatch) -> None:
+    """The guard that saved the 2026-09-04 session. The gravity path is derived,
+    not measured, so it is checked against the InertialUnit's roll every step on a
+    robot standing on its feet, and a sustained disagreement abandons it loudly
+    instead of quietly believing it. On that session the disagreement latched
+    after six falls and the robot then stood for 298 s."""
+    other = _enabled_gravity_harness(controller_module, monkeypatch)
+    try:
+        c = other.ctl
+        other.spin(120, STANDING, IDLE_GAIT)
+        assert c._tilt_source == "accel"
+        # Break it: report gravity for a 0.5 rad roll the InertialUnit does not see.
+        broken = c.robot.devices["accelerometer"]
+        broken.getValues = lambda: [0.0, -math.sin(0.5) * 9.81, -math.cos(0.5) * 9.81]
+        steps = int((controller_module.ACC_DISAGREE_S + 0.5) / 0.02)
+        other.spin(steps, STANDING, IDLE_GAIT)
+        assert c._acc_usable is False
+        assert c._tilt_source == "imu"
+        # And the robot is still being controlled, not dropped.
+        assert c.driver.lower_body_meta["mode"] == "double"
+    finally:
+        other.close()
+
+
+def test_the_shipped_default_does_not_control_from_gravity() -> None:
+    """An accelerometer measures gravity PLUS the robot's own acceleration, so
+    using it as an attitude source inside a position loop feeds a second
+    derivative back as a position -- 180 degrees of phase error:
+
+        the loop shifts the pelvis -> the torso accelerates sideways -> the
+        accelerometer reports that as tilt -> the loop shifts further
+
+    Measured in log webots_joint_trajectory_1788521290, ten episodes, nobody in
+    front of the camera in any of them (so the legs were not imitating): with the
+    attitude taken from gravity the robot fell within ~2 s, six times over, median
+    head height 0.19 m; once the cross-check disabled it, the same controller
+    stood for 40 s and then 298 s. Switching this on again needs the gyro fused
+    in (integrate the rate for the fast attitude, correct its drift with gravity
+    over half a second or more), not a longer low-pass.
+    """
+    import os
+
+    path = os.path.join(CONTROLLER_DIR, "pose_imitation_controller.py")
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    for line in source.splitlines():
+        if line.startswith("TILT_FROM_ACCELEROMETER"):
+            assert line.split("=")[1].strip() == "False", line
+            break
+    else:
+        raise AssertionError("TILT_FROM_ACCELEROMETER not found")
+
+
+def test_the_pitch_scale_is_applied_to_pitch_alone(harness) -> None:
+    """The device reports half the real pitch, so IMU_PITCH_SCALE exists to undo
+    that -- and it ships at 1.0, the conservative end, because the only session
+    that ran the loop on a full-scale pitch limit-cycled (see IMU_PITCH_SCALE for
+    the numbers). Whatever it is set to, it must reach the pitch channel and
+    nothing else, and both readings must be logged separately."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    scale = mod_const(harness, "IMU_PITCH_SCALE")
+    assert 1.0 <= scale <= 2.0, "the honest range: half-scale reading, or undone"
+    c.imu.rpy = [c._imu_zero[0], c._imu_zero[1] + 0.10, 0.0]
+    harness.spin(10, STANDING, IDLE_GAIT)
+    imu_roll, imu_pitch = c._corrected_tilt(*c._imu_rpy()[:2])
+    assert imu_pitch == pytest.approx(0.10, abs=1e-6)           # what the device says
+    ctl_roll, ctl_pitch = c._torso_tilt(c.robot.getTime(), imu_roll, imu_pitch, None)
+    assert ctl_pitch == pytest.approx(0.10 * scale, abs=1e-6)   # what is acted on
+    assert ctl_roll == pytest.approx(imu_roll, abs=1e-9)        # roll is untouched
+    # ...and both are in the log, separately: reading a session where the two
+    # differ is impossible if only one of them is recorded.
+    diag = c._diagnostics(ctl_roll, ctl_pitch, 0.0)
+    assert diag["imu_pitch"] == pytest.approx(0.10, abs=1e-6)
+    assert diag["ctl_pitch"] == pytest.approx(0.10 * scale, abs=1e-6)
+
+
+def test_a_recovery_clears_the_balance_correction(harness) -> None:
+    """The balance loop is an integrator, and its state was the one thing that
+    survived a fall reset. The robot came back upright still holding the pelvis
+    shift the old, fallen robot had needed: measured on the first control step of
+    a new episode, HipPitch -0.345 with the centre of mass 40 mm off centre, six
+    times in one session and never lasting three seconds."""
+    c = harness.ctl
+    harness.spin(120, STANDING, IDLE_GAIT)
+    # Drive the loop to a large correction by holding a real backward tilt.
+    c.imu.rpy = [c._imu_zero[0], c._imu_zero[1] - 0.25, 0.0]
+    harness.spin(150, STANDING, IDLE_GAIT)
+    state = c.driver.balance._state
+    assert abs(state["pitch"]) > 0.05, state
+
+    c._reset_for_new_episode()
+    assert c.driver.balance._state["pitch"] == pytest.approx(0.0, abs=1e-9)
+    assert c.driver.balance._state["roll"] == pytest.approx(0.0, abs=1e-9)
+    # ...so the first step of the new episode commands the plain crouch, not the
+    # posture the robot fell in.
+    c.imu.rpy = [c._imu_zero[0], c._imu_zero[1], 0.0]
+    harness.spin(2, STANDING, IDLE_GAIT)
+    assert harness.angle("LHipPitch") == pytest.approx(
+        harness.angle("RHipPitch"), abs=1e-6)
+    assert abs(harness.angle("LHipPitch")) < 0.2, harness.angle("LHipPitch")
+
+
+def test_the_shipped_default_has_no_heading_loop() -> None:
+    """This proto disables the yaw axis on the InertialUnit AND the z axis on the
+    Gyro, so the robot cannot observe its own rotation at all. What the IMU
+    returns in place of a heading is the pitch channel (see
+    test_the_inertial_unit_halves_the_pitch_and_leaks_the_heading), and servoing
+    on that produced a heading "error" while standing still -- median 21 deg on
+    recorded sessions."""
+    import os
+
+    path = os.path.join(CONTROLLER_DIR, "pose_imitation_controller.py")
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    # Read the constant out of the source, not the module: the clip fixture
+    # monkeypatches it on so the turn planner can be tested.
+    for line in source.splitlines():
+        if line.startswith("HEADING_FROM_IMU"):
+            assert line.split("=")[1].strip() == "False", line
+            break
+    else:
+        raise AssertionError("HEADING_FROM_IMU not found")
+
+
+def test_no_hip_yaw_bias_without_a_heading(controller_module, monkeypatch) -> None:
+    """The cost of servoing on a phantom heading was not the turn that never came:
+    it was the hip-yaw bias, whose canted axis pitches the legs as it yaws them.
+    At the 0.112 rad bias recorded in one session the front sole corners dropped
+    10.5 mm, the modelled support polygon collapsed onto the toe line, and the CoM
+    compensation drove the pelvis to its forward clamp on a dead-level robot."""
+    monkeypatch.setattr(controller_module, "HEADING_FROM_IMU", False)
+    monkeypatch.setattr(controller_module, "LEG_CONTROL", "pose")
+    monkeypatch.setattr(controller_module, "UDP_PORT", _free_port())
+    other = Harness(controller_module)
+    try:
+        other.spin(150, STANDING, dict(IDLE_GAIT, body_yaw_rad=0.9))
+        assert other.angle("LHipYawPitch") == pytest.approx(0.0, abs=1e-6)
+        assert other.angle("RHipYawPitch") == pytest.approx(0.0, abs=1e-6)
+        # And the soles are flat, which is what the bias used to cost.
+        p = other.ctl.driver.lower_body.params
+        for side in ("L", "R"):
+            tilt = other.angle(f"{side}HipRoll") + other.angle(f"{side}AnkleRoll")
+            assert abs(tilt) <= p.sole_tilt_budget + 1e-6, (side, tilt)
+    finally:
+        other.close()

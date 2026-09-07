@@ -595,11 +595,16 @@ class NaoPoseDriver:
             if self._last_balance_time is not None:
                 dt = max(0.0, min(0.1, now_s - self._last_balance_time))
             self._last_balance_time = now_s
-        try:
-            from balance import contact_from_fsr
-            contact = contact_from_fsr(fsr)
-        except Exception:  # noqa: BLE001
-            contact = None
+        contact = None
+        # Only while the lower body believes both feet are down -- see the same
+        # rule in lower_body.step. One tick of lag on the mode is immaterial for a
+        # contact mask, and it keeps the loop from fighting a weight transfer.
+        if self._lb_meta.get("mode", "double") == "double":
+            try:
+                from balance import contact_from_fsr
+                contact = contact_from_fsr(fsr)
+            except Exception:  # noqa: BLE001
+                contact = None
         try:
             return self.balance.compute_correction(
                 state, torso_rp, tilt_rate=tilt_rate, dt_s=dt, contact=contact
@@ -706,6 +711,15 @@ class NaoPoseDriver:
             applied += 1
         return applied
 
+    def reset_balance(self) -> None:
+        """Drop the balance loop's carried-over correction (see
+        ``balance.BalanceController.reset``). Call after a fall recovery or a
+        whole-body motion clip: the correction is an integrator, and the robot it
+        described no longer exists."""
+        if self.balance is not None:
+            self.balance.reset()
+        self._last_balance_time = None
+
     def set_lower_body_observation(self, obs: object | None) -> None:
         """Latch a fresh lower-body observation (no-op when the layer is off)."""
         if self.lower_body is not None and obs is not None:
@@ -809,6 +823,9 @@ class NaoPoseDriver:
         """
         if not self.suspended:
             return
+        # A clip has moved the whole body; the balance correction that suited the
+        # pre-clip posture is meaningless against the new one.
+        self.reset_balance()
         reclaimed = sorted(self._suspended)
         self._suspended = set()
         self.reseed_from_measured()

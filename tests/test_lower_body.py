@@ -537,8 +537,23 @@ def test_only_one_visible_leg_is_read_conservatively() -> None:
     # The L-R DIFFERENCE isolates the deviation from everything added same-sign on
     # top (the CoM compensation, and the lean scaling if it fired -- neither of
     # which changes a difference).
+    #
+    # It arrives substantially, but NOT necessarily 1:1, and the reason is worth
+    # stating because it used to be hidden: a one-sided roll is half lean, and the
+    # compensation answers the lean with same-sign pelvis roll, which comes out of
+    # the same ankle range that keeps the sole flat. Once the ankle is at its stop
+    # the hip gives way -- so what is delivered is "as much of the pose as the
+    # robot can strike with both soles on the floor". Measured here: 0.21 of the
+    # 0.35 requested, with both soles inside the 0.05 rad budget. Under the old
+    # 0.15 rad budget the full 0.35 arrived and the robot stood on the edge of its
+    # left foot, which is the posture that preceded every lateral fall in the
+    # 2026-09-03 logs.
     deviation = targets["LHipRoll"] - targets["RHipRoll"]
-    assert deviation == pytest.approx(p.asymmetric_gain * 0.35, abs=0.06), deviation
+    assert deviation > 0.5 * p.asymmetric_gain * 0.35, deviation
+    assert deviation <= p.asymmetric_gain * 0.35 + 0.06, deviation
+    for side in ("L", "R"):
+        tilt = targets[f"{side}HipRoll"] + targets[f"{side}AnkleRoll"]
+        assert abs(tilt) <= p.sole_tilt_budget + 1e-6, (side, tilt)
 
 
 def test_a_lifted_leg_does_not_drag_the_stance_leg_with_it() -> None:
@@ -815,7 +830,12 @@ def test_the_total_pelvis_shift_obeys_one_clamp() -> None:
     targets, meta, _, _ = run(ctl, _leaning(0.45), 3.0, feedback=fb)
     assert abs(meta["com_shift_pitch"] + meta["com_fb_pitch"]) <= p.com_shift_max_pitch + 1e-6
     assert abs(meta["com_shift_roll"] + meta["com_fb_roll"]) <= p.com_shift_max_roll + 1e-6
-    assert abs(meta["com_shift_roll"]) <= 0.05 + 1e-6      # only the room left over
+    # The feed-forward term may only take the room the feedback leaves IN THE SAME
+    # direction; it stays free to move the other way (that is how it gives way).
+    for ff, fb_v, limit in ((meta["com_shift_pitch"], fb[0], p.com_shift_max_pitch),
+                            (meta["com_shift_roll"], fb[1], p.com_shift_max_roll)):
+        if ff * fb_v > 0.0:
+            assert abs(ff) <= limit - abs(fb_v) + 1e-6, (ff, fb_v)
 
 
 def test_the_feed_forward_shift_is_rate_limited() -> None:
@@ -874,11 +894,21 @@ def test_antisymmetric_deviations_are_rate_limited() -> None:
         prev = split
     assert abs(prev) > 0.2                               # and it does arrive
 
-    # The squat (symmetric) is not slowed: one tick, full depth.
+    # The squat is not slowed by the ASYMMETRIC limiter -- it has its own, much
+    # faster one (crouch_rate_limit), so a brisk human squat still arrives.
     ctl2 = LowerBodyController(com_model=NaoCoMModel())
-    ctl2.step(0.02, standing(), measured=rest_state())
-    targets, meta = ctl2.step(0.04, squatting(0.5), measured=rest_state())
+    p2 = ctl2.params
+    state2 = rest_state()
+    t2, prev2 = 0.0, None
+    for _ in range(40):                       # 0.8 s
+        t2 += DT
+        targets, meta = ctl2.step(t2, squatting(0.5), measured=state2)
+        state2.update(targets)
+        if prev2 is not None:
+            assert meta["crouch_u"] - prev2 <= p2.crouch_rate_limit * DT + 1e-9
+        prev2 = meta["crouch_u"]
     assert meta["crouch_u"] == pytest.approx(0.5, abs=1e-6)
+    assert p2.crouch_rate_limit > p2.asym_rate_limit
 
 
 def test_a_lean_request_is_capped_at_max_lean_dev() -> None:

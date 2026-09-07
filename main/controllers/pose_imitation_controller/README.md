@@ -44,7 +44,7 @@ what the arbiter in `pose_imitation_controller._drive_legs` exists to enforce.
 | [`nao_retarget.py`](../../libraries/nao_retarget.py) | landmarks → NAO angles (arms, head, and the closed-form per-leg solve) | ✅ |
 | [`lower_body.py`](../../libraries/lower_body.py) | *may* the robot execute this leg pose? weight-shift / lift sequencer | ✅ |
 | [`gait.py`](../../libraries/gait.py) | in-place march engine (gait command → leg motion) | ✅ |
-| [`balance.py`](../../libraries/balance.py) | model-based CoM balance (FK + link masses + Fibonacci search) | ✅ |
+| [`balance.py`](../../libraries/balance.py) | model-based CoM balance (FK + link masses + Fibonacci search), the support polygon, and the tilt sign conventions | ✅ |
 | [`walk_motion.py`](../../libraries/walk_motion.py) | motion-clip discovery, yaw servo, locomotion planning | ✅ |
 | [`pose_control_utils.py`](../../libraries/pose_control_utils.py) | `NaoPoseDriver`: limits, smoothing, velocity caps, logging | ✅ |
 | `pose_imitation_controller.py` | Webots glue: sockets, devices, motion playback, arbitration | ❌ |
@@ -581,11 +581,119 @@ know.
 
 | Device | Used for |
 |---|---|
-| `inertial unit` | gravity direction for balance **and** the robot's true heading for the turn servo |
-| `gyro` | tilt *rate*, as a lead term in fall detection |
-| `accelerometer` | enabled for completeness |
-| `LFsr`, `RFsr` | per-foot load, confirming a weight transfer before a lift |
+| `inertial unit` | the torso's attitude: **roll** as reported, **pitch** as reported × `IMU_PITCH_SCALE` (the device halves it, but the scale ships at 1.0 — see below). Its yaw is not a heading and is unused |
+| `accelerometer` | gravity, computed and logged every step as the independent witness to that half-scale pitch — but *not* the control source (see below) |
+| `gyro` | tilt *rate*: the lead term in fall detection and in the balance loop (`BalanceParams.tilt_lead_s`). Its z axis is disabled in the proto, so there is no yaw rate |
+| `LFsr`, `RFsr` | per-foot load: confirming a weight transfer before a lift, and masking an unloaded foot out of the support polygon (`balance.contact_from_fsr`) |
 | `<joint>S` | position sensors: achieved angles, stuck-motor detection, trajectory log |
+
+### Why the attitude comes from gravity, not the InertialUnit
+
+Read the proto:
+
+```
+DEF INERTIAL_UNIT InertialUnit { rotation 1 0 0 1.5708   yAxis FALSE }
+DEF GYRO          Gyro         { ...                     zAxis FALSE }
+```
+
+The mount (+90° about x) is only an offset — that is what the learned tilt zero
+handles, and why the raw roll reads +1.571 on an upright robot. **`yAxis FALSE`
+is the problem.** It is meant to switch the yaw output off, and Webots implements
+it by converting the sensor's attitude to axis–angle, zeroing the world-z
+component of the axis, and re-deriving roll/pitch/yaw from the result
+(`WbInertialUnit::computeValue`). On an upright sensor that is harmless. On one
+rolled 90° it corrupts the axes it was never asked to touch. Composing
+`R_world_sensor = R_torso · Rx(π/2)` and running Webots' own ENU decomposition
+through that zeroing gives, for a pure torso pitch *b*, and for a pure body
+rotation *ψ* with no tilt at all:
+
+| Torso really does | Reported roll | Reported pitch | Reported yaw |
+|---|---|---|---|
+| pitch forward *b* | 0 | **b / 2** | **b / 2** |
+| rotate *ψ* | 0 | **ψ / 2** | ψ / 2 |
+| roll right *b* | **b** | 0 | 0 |
+
+So the pitch channel reads **half** the real pitch and cannot be distinguished
+from a body rotation, and the yaw channel is not a heading at all — it is a copy
+of that same half-pitch. Both predictions hold on every recorded session: across
+41 logs `imu_yaw` tracks `imu_pitch_raw` at r ≥ 0.994 with slope ≈ 1.0, and a
+regression of `imu_pitch` on the torso pitch implied by the loaded foot's own
+forward kinematics has slope +0.48. Roll is unaffected (+0.98).
+
+The honest correction is therefore to **double** the pitch on the way in, and
+`IMU_PITCH_SCALE` exists for exactly that — set to **1.0**, deliberately, because
+the one experiment available says this loop is closer to its stability limit than
+to its authority limit. On 2026-09-04 the attitude came from gravity, which
+reports the *full* pitch; that is the same doubling, and the fore/aft loop limit
+cycled — ±0.25 rad of pitch within the first second of each episode, the
+correction pinned at its clamp, the robot down inside three seconds, six episodes
+running. On the half-scale reading the same controller stood still for 900
+seconds. Under-correcting is sluggish and stable; over-correcting is a fall, so
+the loop stays conservative until a session with a human actually in frame shows
+the fore/aft response is too slow. Then raise it once, to 2.0, and watch the
+pitch trace — `analyze_run.py` reports the `acc_pitch`-on-`imu_pitch` slope
+(≈ +2 on quiet frames) as the measurement of how far it can go.
+
+One caveat travels with raising it: the same masking leaks a body rotation into
+this channel one-for-one, so a heading change ψ reads as ψ/2 of pitch and would
+be doubled back to ψ. With the heading loop off the robot no longer yaws itself
+and the measured residual is small (`imu_yaw` within ±0.03 rad p95 while standing
+⇒ ~9 mm of modelled CoM error against a 25 mm deadband).
+
+#### Gravity: measured, logged, and deliberately not acted on
+
+The accelerometer looks like the better sensor, and on paper it is: all three
+axes enabled, a plain 180° mount, and gravity is an absolute reference that needs
+no learned zero and cannot be mistaken for a heading. Webots documents the
+convention (`acceleration = −gravity`; "at rest ... 1 g along the vertical
+axis"), so an upright torso reads `(0, 0, −9.81)` and the attitude is two lines:
+
+```
+u = (a_x, −a_y, −a_z)  =  (−sin θ,  sin φ cos θ,  cos φ cos θ)
+pitch θ = atan2(−u_x, hypot(u_y, u_z))          roll φ = atan2(u_y, u_z)
+```
+
+That derivation is right — with the robot quiet it matches the InertialUnit's
+roll to four decimals. **And controlling from it puts the robot on the floor**,
+because an accelerometer does not measure attitude; it measures gravity *plus the
+robot's own acceleration*, so inside a position loop it feeds a second derivative
+back as a position:
+
+> the loop shifts the pelvis → the torso accelerates sideways → the accelerometer
+> reports that acceleration as tilt → the loop shifts further
+
+Measured, in `webots_joint_trajectory_1788521290` — ten episodes, nobody in front
+of the camera in any of them, so the legs were not imitating anything:
+
+| Episodes | Attitude from | Outcome |
+|---|---|---|
+| 0–6 | gravity | fell within ~2 s, six times over; median head height **0.19 m** |
+| 7–9 | the InertialUnit | stood **40 s** and then **298 s**; head 0.46 m |
+
+The cross-check is what ended that: the roll disagreement latched and the path
+disabled itself (`ACC_DISAGREE_RAD` / `_S`), which is the only reason that session
+produced 298 seconds of standing instead of a tenth reload. So
+`TILT_FROM_ACCELEROMETER` ships **off**, and switching it on needs the standard
+fix rather than a longer filter — integrate the **gyro** for the fast attitude and
+use gravity only to correct its slow drift, with a time constant of half a second
+or more. Both gyro tilt axes are enabled on this proto, so the parts are there.
+
+Meanwhile gravity is still computed and logged every step (`acc_roll`,
+`acc_pitch`), alongside the tilt actually acted on (`ctl_roll`, `ctl_pitch`) and
+the source (`tilt_source`), because it is the only independent measurement of the
+half-scale pitch. `scripts/analyze_run.py` re-runs the yaw-is-pitch test and the
+gravity-vs-InertialUnit regression on every log.
+
+**Turning is therefore off** (`HEADING_FROM_IMU = False`). With the IMU's yaw
+axis and the gyro's z axis both disabled, nothing on this robot observes its own
+rotation, so there is nothing to close the heading loop on. That loop was
+steering on the pitch channel: standing still produced a median 21° heading
+"error", and the hip-yaw bias it commanded tipped both soles — the `HipYawPitch`
+axis is canted 45°, so it pitches the legs as it yaws them — which collapsed the
+modelled support polygon onto the toe line and had the CoM compensation drive the
+pelvis to its forward clamp on a dead-level robot. Re-enable it when there is a
+real heading (a Supervisor read, or a proto with the yaw axes on); the servo and
+clip planner are unchanged and tested.
 
 NAO's foot sensors are 3-axis (`force-3d`) touch sensors, so their value comes
 from **`getValues()`**, not `getValue()`. Reading them as scalars is why an
