@@ -1,0 +1,376 @@
+\documentclass[conference]{IEEEtran}
+
+% ── Encoding & Language ──────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+
+% ── Math & Symbols ───────────────────────────────────────────────────
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% ── Graphics & Figures ───────────────────────────────────────────────
+\usepackage{graphicx}
+\usepackage{float}
+
+% ── Tables ───────────────────────────────────────────────────────────
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+
+% ── Lists ────────────────────────────────────────────────────────────
+\usepackage{enumitem}
+\setlist[itemize]{leftmargin=1.5em}
+
+% ── Code Blocks ──────────────────────────────────────────────────────
+\usepackage{listings}
+\usepackage{xcolor}
+\definecolor{lightgray}{RGB}{245,245,245}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{lightgray},
+  frame=single,
+  breaklines=true
+}
+
+% ── Hyperlinks (load LAST) ───────────────────────────────────────────
+\usepackage[
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=black,
+  citecolor=black,
+  pdftitle={Project Document},
+  pdfauthor={Author Name}
+]{hyperref}
+
+% ── Metadata ─────────────────────────────────────────────────────────
+\title{Pose Imitation of Human Motion by a Simulated Humanoid Robot}
+
+\makeatletter
+\newcommand{\linebreakand}{%
+  \end{@IEEEauthorhalign}
+  \hfill\mbox{}\par
+  \mbox{}\hfill\begin{@IEEEauthorhalign}
+}
+\makeatother
+
+\author{
+  \IEEEauthorblockN{1\textsuperscript{st} Given Name Surname}
+  \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+    \textit{name of organization (of Aff.)}\\
+    City, Country \\
+    email address}
+  \and
+  \IEEEauthorblockN{2\textsuperscript{nd} Given Name Surname}
+  \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+    \textit{name of organization (of Aff.)}\\
+    City, Country \\
+    email address}
+  \and
+  \IEEEauthorblockN{3\textsuperscript{rd} Given Name Surname}
+  \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+    \textit{name of organization (of Aff.)}\\
+    City, Country \\
+    email address}
+  \linebreakand % <------------- \and with a line-break
+  \IEEEauthorblockN{4\textsuperscript{th} Given Name Surname}
+  \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+    \textit{name of organization (of Aff.)}\\
+    City, Country \\
+    email address}
+  \and
+  \IEEEauthorblockN{5\textsuperscript{th} Given Name Surname}
+  \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+    \textit{name of organization (of Aff.)}\\
+    City, Country \\
+    email address}
+}
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{document}
+ 
+\maketitle
+ 
+% ─────────────────────────────────────────────────────────────────────
+% ABSTRACT
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+This paper presents the design and implementation of a markerless visual teleoperation pipeline
+that enables a simulated humanoid robot to imitate the live or recorded motion of a single human
+using only a monocular RGB camera as input. The system processes a video stream through a
+pose estimation module, maps the resulting keypoints to the robot's joint space via a retargeting
+module, and drives the actuators of a simulated humanoid in Webots in near real time. The
+pipeline targets an end-to-end latency of at most 150\,ms and a throughput of at least 20\,FPS
+on commodity hardware. Imitation fidelity is evaluated using per-joint mean absolute error and
+latency measurements. The work is conducted in the context of the CPSM 2026S course at
+Technische Hochschule Mittelhessen under the supervision of M.Sc.\ Severin Stahl.
+\end{abstract}
+ 
+\begin{IEEEkeywords}
+humanoid robot, pose estimation, motion imitation, Webots, teleoperation, MediaPipe, retargeting
+\end{IEEEkeywords}
+ 
+% ─────────────────────────────────────────────────────────────────────
+% I. INTRODUCTION
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+Humanoid robots are a topic of strong scientific interest because they promise to operate in
+environments designed for humans without costly infrastructure modifications. However, bipedal
+locomotion and whole-body action require intelligent control to maintain balance. Recent research
+increasingly leverages machine learning and human-motion imitation to address this challenge
+\cite{ze2025twist}\cite{tao2021visual}.
+ 
+This project explores markerless visual teleoperation of a humanoid robot inside the Webots
+simulation environment. A single human is recorded by a tripod-mounted RGB camera; the captured
+video is processed to extract 2D/3D human pose, mapped to the robot's joint space, and used to
+drive the simulated humanoid's actuators in near real time.
+ 
+\subsection{Purpose}
+This document defines the project scope, system architecture, functional and non-functional
+requirements, tooling, milestones, and acceptance criteria for the Pose Imitation project
+(CPSM 2026S). It serves as the primary reference for all team members and the supervising
+instructor throughout the development process.
+ 
+\subsection{Scope}
+The project considers a single human subject, fully visible in frame, recorded by a
+tripod-mounted static RGB camera. Input may be either a live webcam stream or a pre-recorded
+video file. Pose estimation and retargeting are implemented in Python, and a Webots Python
+controller drives the robot's joints. Basic balance handling sufficient for upper-body and
+slow lower-body imitation is included, along with quantitative and qualitative evaluation of
+imitation fidelity and latency.
+ 
+The following items are explicitly out of scope for the initial release: multi-person tracking,
+dynamic or moving camera viewpoints, hardware deployment on a physical robot, highly dynamic
+motions such as running or jumping, hand and finger-level dexterity, facial expression
+imitation, and reinforcement-learning-based whole-body control. The latter may be considered
+as future work.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% II. PROBLEM STATEMENT
+% ─────────────────────────────────────────────────────────────────────
+\section{Problem Statement}
+Enabling a humanoid robot to imitate human motion in real time is a complex challenge at the
+intersection of computer vision, robotics, and control theory. Existing approaches often rely
+on marker-based motion capture systems or depth sensors, which are expensive and limit
+practical deployment. This project investigates whether a single monocular RGB camera,
+combined with modern pose estimation libraries, can serve as a sufficient input for real-time
+whole-body imitation in a simulated environment.
+ 
+Markerless teleoperation removes the need for specialized hardware and enables intuitive,
+low-cost robot control. Demonstrating this capability in simulation first allows rapid
+iteration before any physical deployment. The project also serves as a practical investigation
+into the limitations of monocular 3D pose estimation for robot control, including depth
+ambiguity, self-occlusion, and latency constraints.
+ 
+The following assumptions and constraints apply throughout the project. The human subject is
+assumed to be fully visible in the camera frame at all times, and the camera is stationary.
+The pipeline must be able to run on a modern laptop CPU, with GPU acceleration treated as
+optional. The overall project timeline is fixed at ten weeks by the CPSM 2026S course schedule.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% III. RELATED WORK
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+Ze et al.\ \cite{ze2025twist} present TWIST, a teleoperated whole-body imitation system that
+drives a humanoid robot from human demonstrations, establishing the viability of
+imitation-based control for complex manipulation and locomotion tasks.
+ 
+Tao et al.\ \cite{tao2021visual} propose a visual perception method based on human pose
+estimation for humanoid robot motion imitation, providing a direct methodological precedent
+for the monocular RGB approach adopted in this project.
+ 
+The present work differs from both references in that it targets a fully simulated environment
+(Webots), uses exclusively open-source library-level pose estimation, and emphasizes
+reproducibility and compatibility with low-cost hardware.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% IV. SYSTEM OVERVIEW
+% ─────────────────────────────────────────────────────────────────────
+\section{System Overview}
+ 
+\subsection{Vision and Stakeholders}
+The goal is to build an end-to-end pipeline in which a simulated humanoid robot in Webots
+imitates the live or recorded motion of a single human using only a monocular video stream
+as input. Three stakeholder groups are involved: the student developers, who are responsible
+for implementation, evaluation, and documentation; the supervising instructor M.Sc.\ Severin
+Stahl, who provides requirements clarification, scientific guidance, and grading; and the
+end user of the demo, who stands in front of the camera and observes the robot's imitation.
+ 
+\subsection{System Architecture}
+The pipeline consists of four sequential stages. The \textbf{Video Input Module} captures
+timestamped frames from a webcam or video file using OpenCV \texttt{VideoCapture} at a
+configurable resolution and frame rate. The \textbf{Pose Estimation Module} extracts per-frame
+2D/3D body keypoints; candidate libraries are MediaPipe Pose (33 landmarks with 3D world
+coordinates), MMPose, and Ultralytics YOLOv8-Pose. Temporal jitter is reduced using a
+One-Euro filter or exponential smoothing. The \textbf{Retargeting Module} converts human
+keypoints into joint angles compatible with the Webots humanoid by computing angles from
+vector geometry between keypoints such as shoulder, elbow, hip, and knee, with optional
+analytical or numerical IK for end-effector targets. Joint limits and rate limits are
+enforced to ensure mechanically feasible commands. Finally, the \textbf{Webots Controller}
+communicates with the simulation via the \texttt{controller} Python API, reads target joint
+angles from the retargeting module, and issues \texttt{setPosition()} commands at each
+control step. An optional simple balance assist using fixed feet or a PD-stabilized torso is
+included for the initial milestones.
+ 
+Regarding inter-process communication, the preferred option is to run the pose pipeline
+inside the Webots controller process when performance allows. If latency becomes a concern,
+the pipeline runs as a separate process streaming joint targets via a local socket, ZeroMQ,
+or shared memory, with the choice determined by runtime benchmarks.
+ 
+A \textbf{Logging and Evaluation} component runs in parallel, recording human keypoints,
+target joint angles, achieved joint angles, and timestamps. Offline metrics include per-joint
+MAE, end-to-end latency, dropped frames, and the simulation-to-real-time ratio.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% V. TECHNOLOGIES AND TOOLS
+% ─────────────────────────────────────────────────────────────────────
+\section{Technologies and Tools}
+The simulator is Webots R2023b or newer. The implementation language is Python 3.10 or newer.
+Core libraries are \texttt{opencv-python} for camera capture and video I/O,
+\texttt{mediapipe} or \texttt{ultralytics} for pose estimation, \texttt{numpy} and
+\texttt{scipy} for numerical computation and IK, \texttt{pyyaml} for configuration parsing,
+and \texttt{matplotlib} for metric plots and analysis. The \texttt{controller} Python module
+shipped with Webots handles simulation communication. Code quality is enforced via
+\texttt{ruff} for linting and \texttt{black} for formatting, with \texttt{pytest} covering
+unit tests for retargeting mathematics. \texttt{pyzmq} is included as an optional dependency
+for inter-process messaging.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% VI. REQUIREMENTS
+% ─────────────────────────────────────────────────────────────────────
+\section{Requirements}
+ 
+\subsection{Functional Requirements}
+The system shall accept a live webcam feed and a recorded video file as input sources,
+selectable via a single YAML or TOML configuration file (FR-1, FR-8). From each input frame,
+the system shall extract human body keypoints (FR-2) and map them to the simulated humanoid's
+joint space (FR-3). The Webots controller shall command the humanoid's motors to follow the
+mapped joint trajectory at each simulation step (FR-4), clipping all commands to the robot's
+mechanical limits (FR-5) and applying temporal smoothing to prevent unsafe oscillations
+(FR-6). All human keypoints and robot joint states shall be logged with timestamps to disk
+(FR-7). The complete system shall be launchable via a single command, \texttt{python run.py}
+(FR-9).
+ 
+\subsection{Non-Functional Requirements}
+End-to-end latency from camera frame to joint command shall not exceed 150\,ms as a goal and
+300\,ms as an acceptable upper bound (NFR-1). The pose estimation pipeline shall sustain at
+least 20\,FPS on a modern laptop CPU or GPU (NFR-2). Upper-body imitation fidelity, measured
+as per-joint MAE on representative test motions, shall remain at or below 10$^{\circ}$
+(NFR-3). The robot shall not fall during standing upper-body imitation in the baseline scenario
+(NFR-4). Reproducibility is ensured via fixed random seeds and pinned dependency versions
+(NFR-5). The codebase shall include type hints, pass \texttt{ruff} and \texttt{black} checks,
+and provide unit tests for retargeting mathematics (NFR-6). The pipeline shall run on macOS
+and Linux with Webots R2023b or newer (NFR-7).
+ 
+% ─────────────────────────────────────────────────────────────────────
+% VII. USER STORIES
+% ─────────────────────────────────────────────────────────────────────
+\section{User Stories}
+\begin{itemize}
+  \item \textit{As a user}, I can stand in front of a webcam and see the simulated humanoid mirror my upper-body motions in Webots in near real time.
+  \item \textit{As a developer}, I can replay a recorded video and have the robot imitate the same motion deterministically for evaluation purposes.
+  \item \textit{As a researcher}, I can log joint trajectories for both the human and the robot and compute imitation-fidelity metrics offline.
+  \item \textit{As a user}, the robot should not fall over during normal standing and upper-body imitation.
+\end{itemize}
+ 
+% ─────────────────────────────────────────────────────────────────────
+% VIII. GOALS AND SUCCESS METRICS
+% ─────────────────────────────────────────────────────────────────────
+\section{Goals and Success Metrics}
+The project aims to deliver a functional end-to-end imitation pipeline within the ten-week
+course timeline, achieve real-time upper-body imitation without robot falls in the baseline
+scenario, provide reproducible quantitative evaluation of latency and imitation fidelity, and
+produce documentation sufficient for an independent developer to reproduce the results.
+ 
+The project is considered complete when all of the following acceptance criteria are met:
+\begin{bracketlist}
+  \item Running a single command launches Webots and the Python pipeline together.
+  \item With a live webcam, the simulated humanoid visibly imitates the user's upper-body motion in real time without falling.
+  \item Replaying a recorded reference video reproduces equivalent robot motion deterministically.
+  \item Quantitative metrics (latency, per-joint MAE) are reported in \texttt{docs/} along with plots.
+  \item The repository contains documentation sufficient for a new developer to reproduce the results.
+\end{bracketlist}
+ 
+% ─────────────────────────────────────────────────────────────────────
+% IX. PROJECT TIMELINE
+% ─────────────────────────────────────────────────────────────────────
+\section{Project Timeline}
+ 
+\begin{table}[H]
+  \centering
+  \caption{Project Milestones}
+  \begin{tabularx}{\columnwidth}{lXl}
+    \toprule
+    \textbf{ID} & \textbf{Milestone / Deliverable} & \textbf{Target} \\
+    \midrule
+    M1 & Environment setup: Webots world loads; controller stub commands one motor. & Week 1--2 \\
+    M2 & Pose estimation prototype: keypoints extracted from webcam/video. & Week 3 \\
+    M3 & Retargeting v1: shoulder/elbow angles drive the robot's arms. & Week 4--5 \\
+    M4 & Real-time integration: live webcam $\rightarrow$ live robot imitation. & Week 6 \\
+    M5 & Lower body and stability: hip/knee/ankle imitation with balance assist. & Week 7--8 \\
+    M6 & Evaluation and logging: metrics, plots, recorded demo videos. & Week 9 \\
+    M7 & Final report and cleanup: documentation and reproducible demo. & Week 10 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+ 
+% ─────────────────────────────────────────────────────────────────────
+% X. RISKS AND MITIGATIONS
+% ─────────────────────────────────────────────────────────────────────
+\section{Risks and Mitigations}
+Several technical risks have been identified. Monocular 3D pose estimation is inherently
+ambiguous due to depth uncertainty and self-occlusion, which may lead to inaccurate
+retargeting. This is mitigated by using MediaPipe World Landmarks and enforcing joint limits.
+Direct joint mapping without balance control may cause the robot to fall; the mitigation is
+to start with feet fixed and add PD torso stabilization before enabling lower-body joints.
+If end-to-end latency exceeds acceptable bounds, the pose estimation pipeline will be moved
+to a separate process, input frames will be downscaled, and a GPU-accelerated model will be
+used. Differences between the Webots humanoid joint structure and the human skeleton will be
+addressed by building and validating an explicit, documented per-joint mapping table. Finally,
+library and Webots version drift is mitigated by pinning all dependency versions in
+\texttt{requirements.txt} and documenting the required Webots release explicitly.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% XI. OPEN QUESTIONS
+% ─────────────────────────────────────────────────────────────────────
+\section{Open Questions}
+The following questions remain open and are to be resolved with the supervising instructor
+prior to the start of implementation. First, regarding the robot model: should the project
+use a built-in Webots humanoid such as NAO or Atlas, or a custom PROTO model? Second, are
+there required reference motions or poses against which imitation fidelity must be evaluated?
+Third, is real-time imitation a hard grading requirement, or is offline replay of a recorded
+video acceptable? Fourth, will a GPU be available for pose estimation, or must the pipeline
+run on CPU only? Fifth, is a stretch goal of multi-camera input of interest to the supervisor?
+ 
+% ─────────────────────────────────────────────────────────────────────
+% XII. CONCLUSION
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+This document has defined the scope, architecture, requirements, and timeline for the Pose
+Imitation project. The proposed pipeline addresses the challenge of markerless humanoid robot
+teleoperation using only a commodity RGB camera, offering a low-cost alternative to
+marker-based motion capture. If the outlined milestones are met, the project will deliver a
+reproducible, quantitatively evaluated demonstration of real-time human-to-robot motion
+imitation in Webots. The open questions identified in Section~XI are to be resolved with the
+supervising instructor before implementation begins.
+ 
+% ─────────────────────────────────────────────────────────────────────
+% REFERENCES
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{9}
+ 
+\bibitem{ze2025twist}
+Z.~Ze et al., ``TWIST: Teleoperated Whole-Body Imitation System,''
+in \textit{Proc.\ Conference on Robot Learning (CoRL)}, 2025.
+[Online]. Available: \url{https://doi.org/10.48550/arXiv.2505.02833}
+ 
+\bibitem{tao2021visual}
+Y.~Tao et al., ``Visual Perception Method Based on Human Pose Estimation for Humanoid
+Robot Imitating Human Motions,'' in \textit{Proc.\ 2nd Int.\ Conf.\ Control, Robotics and
+Intelligent System (CCRIS)}, 2021, pp.~54--61.
+[Online]. Available: \url{https://doi.org/10.1145/3483845.3483867}
+ 
+\end{thebibliography}
+ 
+% ─────────────────────────────────────────────────────────────────────
+\end{document}
